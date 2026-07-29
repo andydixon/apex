@@ -1,0 +1,834 @@
+# Default key bindings for Apex.
+#
+# "primary" is Ctrl on Linux/Windows and Cmd on macOS. Chords are written with
+# a space between steps: "primary+k primary+b". Contexts: global (default),
+# editor, find, overlay, sidebar. Later entries override earlier ones with the
+# same keys and context. User overrides live in <config>/keymap.toml.
+
+[[bindings]]
+keys = "primary+shift+p"
+command = "goto.commands"
+[[bindings]]
+keys = "primary+p"
+command = "goto.anything"
+[[bindings]]
+keys = "primary+g"
+command = "goto.line"
+[[bindings]]
+keys = "primary+r"
+command = "goto.symbol"
+[[bindings]]
+keys = "primary+shift+r"
+command = "goto.project_symbol"
+[[bindings]]
+keys = "f12"
+command = "goto.definition"
+[[bindings]]
+keys = "shift+f12"
+command = "goto.references"
+[[bindings]]
+keys = "alt+minus"
+command = "goto.back"
+[[bindings]]
+keys = "alt+shift+minus"
+command = "goto.forward"
+
+# File
+[[bindings]]
+keys = "primary+n"
+command = "file.new"
+[[bindings]]
+keys = "primary+o"
+command = "file.open"
+[[bindings]]
+keys = "primary+shift+o"
+command = "file.open_folder"
+[[bindings]]
+keys = "primary+s"
+command = "file.save"
+[[bindings]]
+keys = "primary+shift+s"
+command = "file.save_as"
+[[bindings]]
+keys = "primary+alt+s"
+command = "file.save_all"
+[[bindings]]
+keys = "primary+w"
+command = "file.close"
+[[bindings]]
+keys = "primary+shift+t"
+command = "file.reopen_closed"
+[[bindings]]
+keys = "primary+shift+w"
+command = "window.close"
+[[bindings]]
+keys = "primary+shift+n"
+command = "window.new"
+[[bindings]]
+keys = "primary+q"
+command = "app.quit"
+[[bindings]]
+keys = "primary+comma"
+command = "tools.settings"
+[[bindings]]
+keys = "primary+k primary+s"
+command = "tools.shortcuts"
+
+# Edit
+[[bindings]]
+keys = "primary+z"
+command = "edit.undo"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+z"
+command = "edit.redo"
+context = "editor"
+[[bindings]]
+keys = "primary+y"
+command = "edit.redo"
+context = "editor"
+[[bindings]]
+keys = "primary+x"
+command = "edit.cut"
+context = "editor"
+[[bindings]]
+keys = "primary+c"
+command = "edit.copy"
+context = "editor"
+[[bindings]]
+keys = "primary+v"
+command = "edit.paste"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+v"
+command = "edit.paste_indent"
+context = "editor"
+[[bindings]]
+keys = "primary+alt+v"
+command = "edit.paste_history"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+d"
+command = "edit.duplicate"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+k"
+command = "edit.delete_line"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+up"
+command = "edit.move_line_up"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+down"
+command = "edit.move_line_down"
+context = "editor"
+[[bindings]]
+keys = "primary+j"
+command = "edit.join_lines"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+l"
+command = "select.split_lines"
+context = "editor"
+[[bindings]]
+keys = "primary+t"
+command = "edit.transpose"
+context = "editor"
+[[bindings]]
+keys = "f9"
+command = "edit.sort_lines"
+context = "editor"
+[[bindings]]
+keys = "primary+f9"
+command = "edit.sort_lines_ci"
+context = "editor"
+[[bindings]]
+keys = "primary+slash"
+command = "edit.toggle_comment"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+slash"
+command = "edit.toggle_block_comment"
+context = "editor"
+[[bindings]]
+keys = "primary+k primary+u"
+command = "edit.upper_case"
+context = "editor"
+[[bindings]]
+keys = "primary+k primary+l"
+command = "edit.lower_case"
+context = "editor"
+[[bindings]]
+keys = "primary+k primary+t"
+command = "edit.title_case"
+context = "editor"
+[[bindings]]
+keys = "primary+closebracket"
+command = "edit.indent"
+context = "editor"
+[[bindings]]
+keys = "primary+openbracket"
+command = "edit.outdent"
+context = "editor"
+[[bindings]]
+keys = "tab"
+command = "edit.tab"
+context = "editor"
+[[bindings]]
+keys = "shift+tab"
+command = "edit.outdent"
+context = "editor"
+[[bindings]]
+keys = "enter"
+command = "edit.newline"
+context = "editor"
+[[bindings]]
+keys = "shift+enter"
+command = "edit.newline"
+context = "editor"
+[[bindings]]
+keys = "primary+enter"
+command = "edit.newline_below"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+enter"
+command = "edit.newline_above"
+context = "editor"
+[[bindings]]
+keys = "backspace"
+command = "edit.backspace"
+context = "editor"
+[[bindings]]
+keys = "shift+backspace"
+command = "edit.backspace"
+context = "editor"
+[[bindings]]
+keys = "delete"
+command = "edit.delete"
+context = "editor"
+[[bindings]]
+keys = "primary+backspace"
+command = "edit.delete_word_backward"
+context = "editor"
+[[bindings]]
+keys = "primary+delete"
+command = "edit.delete_word_forward"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+backspace"
+command = "edit.delete_to_line_start"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+delete"
+command = "edit.delete_to_line_end"
+context = "editor"
+[[bindings]]
+keys = "insert"
+command = "edit.toggle_overwrite"
+context = "editor"
+[[bindings]]
+keys = "alt+q"
+command = "edit.hard_wrap"
+context = "editor"
+[[bindings]]
+keys = "primary+f2"
+command = "edit.toggle_bookmark"
+context = "editor"
+[[bindings]]
+keys = "f2"
+command = "edit.next_bookmark"
+context = "editor"
+[[bindings]]
+keys = "shift+f2"
+command = "edit.prev_bookmark"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+f2"
+command = "edit.clear_bookmarks"
+context = "editor"
+[[bindings]]
+keys = "primary+space"
+command = "edit.complete"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+i"
+command = "edit.format"
+context = "editor"
+[[bindings]]
+keys = "primary+q"
+command = "macro.record"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+q"
+command = "macro.play"
+context = "editor"
+
+# Cursor movement
+[[bindings]]
+keys = "left"
+command = "cursor.left"
+context = "editor"
+[[bindings]]
+keys = "right"
+command = "cursor.right"
+context = "editor"
+[[bindings]]
+keys = "up"
+command = "cursor.up"
+context = "editor"
+[[bindings]]
+keys = "down"
+command = "cursor.down"
+context = "editor"
+[[bindings]]
+keys = "home"
+command = "cursor.line_start"
+context = "editor"
+[[bindings]]
+keys = "end"
+command = "cursor.line_end"
+context = "editor"
+[[bindings]]
+keys = "pageup"
+command = "cursor.page_up"
+context = "editor"
+[[bindings]]
+keys = "pagedown"
+command = "cursor.page_down"
+context = "editor"
+[[bindings]]
+keys = "shift+left"
+command = "select.left"
+context = "editor"
+[[bindings]]
+keys = "shift+right"
+command = "select.right"
+context = "editor"
+[[bindings]]
+keys = "shift+up"
+command = "select.up"
+context = "editor"
+[[bindings]]
+keys = "shift+down"
+command = "select.down"
+context = "editor"
+[[bindings]]
+keys = "shift+home"
+command = "select.line_start"
+context = "editor"
+[[bindings]]
+keys = "shift+end"
+command = "select.line_end"
+context = "editor"
+[[bindings]]
+keys = "shift+pageup"
+command = "select.page_up"
+context = "editor"
+[[bindings]]
+keys = "shift+pagedown"
+command = "select.page_down"
+context = "editor"
+[[bindings]]
+keys = "primary+a"
+command = "select.all"
+context = "editor"
+[[bindings]]
+keys = "primary+l"
+command = "select.line"
+context = "editor"
+[[bindings]]
+keys = "primary+d"
+command = "select.add_next"
+context = "editor"
+[[bindings]]
+keys = "primary+k primary+d"
+command = "select.skip_next"
+context = "editor"
+[[bindings]]
+keys = "alt+f3"
+command = "select.add_all"
+context = "editor"
+[[bindings]]
+keys = "primary+u"
+command = "select.undo"
+context = "editor"
+[[bindings]]
+keys = "escape"
+command = "select.single"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+m"
+command = "select.brackets"
+context = "editor"
+[[bindings]]
+keys = "primary+m"
+command = "cursor.bracket"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+j"
+command = "select.indentation"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+a"
+command = "select.scope"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+space"
+command = "select.scope"
+context = "editor"
+[[bindings]]
+keys = "primary+alt+shift+a"
+command = "select.shrink"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+alt+up"
+command = "select.column_up"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+alt+down"
+command = "select.column_down"
+context = "editor"
+[[bindings]]
+keys = "alt+shift+up"
+command = "select.add_cursor_above"
+context = "editor"
+[[bindings]]
+keys = "alt+shift+down"
+command = "select.add_cursor_below"
+context = "editor"
+
+# Find
+[[bindings]]
+keys = "primary+f"
+command = "find.show"
+[[bindings]]
+keys = "primary+h"
+command = "find.replace"
+[[bindings]]
+keys = "f3"
+command = "find.next"
+[[bindings]]
+keys = "shift+f3"
+command = "find.prev"
+[[bindings]]
+keys = "primary+f3"
+command = "find.under_cursor"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+f"
+command = "find.in_files"
+[[bindings]]
+keys = "primary+e"
+command = "find.use_selection"
+context = "editor"
+[[bindings]]
+keys = "enter"
+command = "find.next"
+context = "find"
+[[bindings]]
+keys = "shift+enter"
+command = "find.prev"
+context = "find"
+[[bindings]]
+keys = "escape"
+command = "find.close"
+context = "find"
+[[bindings]]
+keys = "alt+r"
+command = "find.toggle_regex"
+context = "find"
+[[bindings]]
+keys = "alt+c"
+command = "find.toggle_case"
+context = "find"
+[[bindings]]
+keys = "alt+w"
+command = "find.toggle_word"
+context = "find"
+[[bindings]]
+keys = "primary+alt+enter"
+command = "find.replace_all"
+context = "find"
+[[bindings]]
+keys = "primary+shift+h"
+command = "find.replace_next"
+context = "find"
+
+# View
+[[bindings]]
+keys = "primary+k primary+b"
+command = "view.toggle_sidebar"
+[[bindings]]
+keys = "primary+k primary+m"
+command = "view.toggle_minimap"
+[[bindings]]
+keys = "primary+k primary+w"
+command = "view.toggle_word_wrap"
+[[bindings]]
+keys = "f11"
+command = "view.fullscreen"
+[[bindings]]
+keys = "shift+f11"
+command = "view.distraction_free"
+[[bindings]]
+keys = "primary+k primary+z"
+command = "view.zen"
+[[bindings]]
+keys = "primary+equals"
+command = "view.zoom_in"
+[[bindings]]
+keys = "primary+shift+equals"
+command = "view.zoom_in"
+[[bindings]]
+keys = "primary+minus"
+command = "view.zoom_out"
+[[bindings]]
+keys = "primary+0"
+command = "view.zoom_reset"
+[[bindings]]
+keys = "primary+shift+openbracket"
+command = "fold.current"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+closebracket"
+command = "fold.unfold"
+context = "editor"
+[[bindings]]
+keys = "primary+k primary+1"
+command = "fold.level1"
+context = "editor"
+[[bindings]]
+keys = "primary+k primary+2"
+command = "fold.level2"
+context = "editor"
+[[bindings]]
+keys = "primary+k primary+3"
+command = "fold.level3"
+context = "editor"
+[[bindings]]
+keys = "primary+k primary+0"
+command = "fold.unfold_all"
+context = "editor"
+[[bindings]]
+keys = "primary+k primary+j"
+command = "fold.unfold_all"
+context = "editor"
+[[bindings]]
+keys = "primary+up"
+command = "view.scroll_up"
+context = "editor"
+[[bindings]]
+keys = "primary+down"
+command = "view.scroll_down"
+context = "editor"
+[[bindings]]
+keys = "primary+k primary+c"
+command = "view.centre_cursor"
+context = "editor"
+[[bindings]]
+keys = "alt+shift+1"
+command = "layout.single"
+[[bindings]]
+keys = "alt+shift+2"
+command = "layout.columns2"
+[[bindings]]
+keys = "alt+shift+3"
+command = "layout.columns3"
+[[bindings]]
+keys = "alt+shift+8"
+command = "layout.rows2"
+[[bindings]]
+keys = "alt+shift+5"
+command = "layout.grid"
+[[bindings]]
+keys = "primary+backslash"
+command = "pane.split_vertical"
+[[bindings]]
+keys = "primary+k primary+right"
+command = "pane.focus_next"
+[[bindings]]
+keys = "primary+k primary+left"
+command = "pane.focus_prev"
+[[bindings]]
+keys = "primary+1"
+command = "tab.1"
+[[bindings]]
+keys = "primary+2"
+command = "tab.2"
+[[bindings]]
+keys = "primary+3"
+command = "tab.3"
+[[bindings]]
+keys = "primary+4"
+command = "tab.4"
+[[bindings]]
+keys = "primary+5"
+command = "tab.5"
+[[bindings]]
+keys = "primary+6"
+command = "tab.6"
+[[bindings]]
+keys = "primary+7"
+command = "tab.7"
+[[bindings]]
+keys = "primary+8"
+command = "tab.8"
+[[bindings]]
+keys = "primary+9"
+command = "tab.9"
+[[bindings]]
+keys = "primary+pagedown"
+command = "tab.next"
+[[bindings]]
+keys = "primary+pageup"
+command = "tab.prev"
+[[bindings]]
+keys = "ctrl+tab"
+command = "tab.next"
+[[bindings]]
+keys = "ctrl+shift+tab"
+command = "tab.prev"
+[[bindings]]
+keys = "primary+shift+pagedown"
+command = "tab.move_right"
+[[bindings]]
+keys = "primary+shift+pageup"
+command = "tab.move_left"
+[[bindings]]
+keys = "f8"
+command = "goto.next_diagnostic"
+[[bindings]]
+keys = "shift+f8"
+command = "goto.prev_diagnostic"
+[[bindings]]
+keys = "primary+period"
+command = "git.next_hunk"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+period"
+command = "git.prev_hunk"
+context = "editor"
+[[bindings]]
+keys = "primary+b"
+command = "build.run"
+[[bindings]]
+keys = "primary+shift+b"
+command = "build.select"
+[[bindings]]
+keys = "primary+shift+c"
+command = "build.cancel"
+[[bindings]]
+keys = "primary+k primary+o"
+command = "panel.output"
+[[bindings]]
+keys = "f7"
+command = "lsp.rename"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+period"
+command = "lsp.code_action"
+context = "editor"
+[[bindings]]
+keys = "primary+k primary+i"
+command = "lsp.hover"
+context = "editor"
+[[bindings]]
+keys = "primary+shift+space"
+command = "lsp.signature"
+context = "editor"
+[[bindings]]
+keys = "primary+k primary+v"
+command = "tools.vim"
+[[bindings]]
+keys = "primary+k primary+e"
+command = "project.reveal_active"
+
+# Platform-specific extras
+[[linux]]
+keys = "ctrl+alt+up"
+command = "select.add_cursor_above"
+context = "editor"
+[[linux]]
+keys = "ctrl+alt+down"
+command = "select.add_cursor_below"
+context = "editor"
+[[windows]]
+keys = "ctrl+alt+up"
+command = "select.add_cursor_above"
+context = "editor"
+[[windows]]
+keys = "ctrl+alt+down"
+command = "select.add_cursor_below"
+context = "editor"
+[[macos]]
+keys = "cmd+left"
+command = "cursor.line_start"
+context = "editor"
+[[macos]]
+keys = "cmd+right"
+command = "cursor.line_end"
+context = "editor"
+[[macos]]
+keys = "cmd+up"
+command = "cursor.doc_start"
+context = "editor"
+[[macos]]
+keys = "cmd+down"
+command = "cursor.doc_end"
+context = "editor"
+[[macos]]
+keys = "cmd+shift+left"
+command = "select.line_start"
+context = "editor"
+[[macos]]
+keys = "cmd+shift+right"
+command = "select.line_end"
+context = "editor"
+[[macos]]
+keys = "cmd+shift+up"
+command = "select.doc_start"
+context = "editor"
+[[macos]]
+keys = "cmd+shift+down"
+command = "select.doc_end"
+context = "editor"
+[[macos]]
+keys = "alt+left"
+command = "cursor.word_left"
+context = "editor"
+[[macos]]
+keys = "alt+right"
+command = "cursor.word_right"
+context = "editor"
+[[macos]]
+keys = "alt+shift+left"
+command = "select.word_left"
+context = "editor"
+[[macos]]
+keys = "alt+shift+right"
+command = "select.word_right"
+context = "editor"
+[[macos]]
+keys = "alt+backspace"
+command = "edit.delete_word_backward"
+context = "editor"
+[[macos]]
+keys = "alt+delete"
+command = "edit.delete_word_forward"
+context = "editor"
+[[macos]]
+keys = "cmd+backspace"
+command = "edit.delete_to_line_start"
+context = "editor"
+[[macos]]
+keys = "cmd+ctrl+f"
+command = "view.fullscreen"
+[[macos]]
+keys = "cmd+ctrl+g"
+command = "select.add_all"
+context = "editor"
+[[macos]]
+keys = "ctrl+shift+up"
+command = "edit.move_line_up"
+context = "editor"
+[[macos]]
+keys = "ctrl+shift+down"
+command = "edit.move_line_down"
+context = "editor"
+[[linux]]
+keys = "ctrl+left"
+command = "cursor.word_left"
+context = "editor"
+[[linux]]
+keys = "ctrl+right"
+command = "cursor.word_right"
+context = "editor"
+[[linux]]
+keys = "ctrl+shift+left"
+command = "select.word_left"
+context = "editor"
+[[linux]]
+keys = "ctrl+shift+right"
+command = "select.word_right"
+context = "editor"
+[[linux]]
+keys = "ctrl+home"
+command = "cursor.doc_start"
+context = "editor"
+[[linux]]
+keys = "ctrl+end"
+command = "cursor.doc_end"
+context = "editor"
+[[linux]]
+keys = "ctrl+shift+home"
+command = "select.doc_start"
+context = "editor"
+[[linux]]
+keys = "ctrl+shift+end"
+command = "select.doc_end"
+context = "editor"
+[[linux]]
+keys = "alt+left"
+command = "cursor.subword_left"
+context = "editor"
+[[linux]]
+keys = "alt+right"
+command = "cursor.subword_right"
+context = "editor"
+[[linux]]
+keys = "alt+shift+left"
+command = "select.subword_left"
+context = "editor"
+[[linux]]
+keys = "alt+shift+right"
+command = "select.subword_right"
+context = "editor"
+[[windows]]
+keys = "ctrl+left"
+command = "cursor.word_left"
+context = "editor"
+[[windows]]
+keys = "ctrl+right"
+command = "cursor.word_right"
+context = "editor"
+[[windows]]
+keys = "ctrl+shift+left"
+command = "select.word_left"
+context = "editor"
+[[windows]]
+keys = "ctrl+shift+right"
+command = "select.word_right"
+context = "editor"
+[[windows]]
+keys = "ctrl+home"
+command = "cursor.doc_start"
+context = "editor"
+[[windows]]
+keys = "ctrl+end"
+command = "cursor.doc_end"
+context = "editor"
+[[windows]]
+keys = "ctrl+shift+home"
+command = "select.doc_start"
+context = "editor"
+[[windows]]
+keys = "ctrl+shift+end"
+command = "select.doc_end"
+context = "editor"
+[[windows]]
+keys = "alt+left"
+command = "cursor.subword_left"
+context = "editor"
+[[windows]]
+keys = "alt+right"
+command = "cursor.subword_right"
+context = "editor"
+[[windows]]
+keys = "alt+shift+left"
+command = "select.subword_left"
+context = "editor"
+[[windows]]
+keys = "alt+shift+right"
+command = "select.subword_right"
+context = "editor"

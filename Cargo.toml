@@ -1,0 +1,72 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/andydixon/apex"
+authors = ["Andy Dixon"]
+
+[workspace.dependencies]
+# internal
+apex-buffer = { path = "crates/apex-buffer" }
+apex-edit = { path = "crates/apex-edit" }
+apex-syntax = { path = "crates/apex-syntax" }
+apex-project = { path = "crates/apex-project" }
+apex-ui = { path = "crates/apex-ui" }
+
+# text
+ropey = "1.6"
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+encoding_rs = "0.8"
+regex = "1.11"
+memchr = "2.7"
+
+# config / serialisation
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+serde_json = "1.0"
+
+# diagnostics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2.0"
+anyhow = "1.0"
+
+# gui
+egui = "0.36.2"
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "wayland", "x11"] }
+
+# platform
+directories = "6.0"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+notify = "8"
+ignore = "0.4"
+nucleo-matcher = "0.3"
+git2 = { version = "0.20", default-features = false }
+tree-sitter = "0.25"
+clap = { version = "4.5", features = ["derive"] }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster"] }
+
+# testing
+proptest = "1.6"
+
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "debuginfo"
+
+[profile.bench]
+inherits = "release"

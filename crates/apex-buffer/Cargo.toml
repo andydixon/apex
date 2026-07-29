@@ -1,0 +1,18 @@
+[package]
+name = "apex-buffer"
+description = "Rope-backed text storage, Unicode position mapping, encodings and line endings for Apex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ropey.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+encoding_rs.workspace = true
+memchr.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

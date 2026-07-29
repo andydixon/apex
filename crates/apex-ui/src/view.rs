@@ -1,0 +1,819 @@
+//! A view onto a document: selections, scroll state and layout caches.
+//!
+//! Views own all per-window editing state; [`apex_edit::Document`] owns the
+//! text and history. Several views may show one document.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use apex_buffer::motion::{self, next_grapheme_boundary, prev_grapheme_boundary};
+use apex_buffer::position::{char_col_to_display_col, display_col_to_char_col, line_end_char, line_len_chars};
+use apex_edit::{DocId, Document, Selection, SelectionSet};
+use egui::Galley;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ViewId(pub u64);
+
+static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
+
+impl ViewId {
+    pub fn next() -> Self {
+        Self(NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub fn egui_id(self) -> egui::Id {
+        egui::Id::new(("apex-view", self.0))
+    }
+}
+
+/// One laid-out document line.
+pub struct LineLayout {
+    pub galley: Arc<Galley>,
+    /// `map[doc_col] = galley char index`, present only when the line contains
+    /// tabs (which are expanded to spaces for layout) or other substituted chars.
+    pub map: Option<Vec<u32>>,
+    pub epoch: u64,
+}
+
+impl LineLayout {
+    #[inline]
+    pub fn to_galley_col(&self, doc_col: usize) -> usize {
+        match &self.map {
+            Some(m) => m.get(doc_col).copied().unwrap_or(*m.last().unwrap_or(&0)) as usize,
+            None => doc_col,
+        }
+    }
+
+    #[inline]
+    pub fn to_doc_col(&self, galley_col: usize) -> usize {
+        match &self.map {
+            Some(m) => match m.binary_search(&(galley_col as u32)) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            },
+            None => galley_col,
+        }
+    }
+
+    /// X offset (galley-local) of a document column.
+    pub fn x_of(&self, doc_col: usize) -> f32 {
+        let g = self.to_galley_col(doc_col);
+        self.galley.pos_from_cursor(egui::text::CCursor { index: egui::text::CharIndex(g), prefer_next_row: false }).min.x
+    }
+
+    pub fn width(&self) -> f32 {
+        self.galley.rect.width()
+    }
+}
+
+/// Cache of laid-out lines keyed by line number. Entries are invalidated by
+/// bumping `epoch` (on any document, font, theme or width change).
+///
+/// ponytail: whole-cache invalidation on every edit; a line-range invalidation
+/// would avoid re-laying ~100 visible lines per keystroke if profiling shows it matters.
+#[derive(Default)]
+pub struct LayoutCache {
+    pub epoch: u64,
+    lines: HashMap<usize, LineLayout>,
+}
+
+impl LayoutCache {
+    pub fn invalidate(&mut self) {
+        self.epoch += 1;
+        if self.lines.len() > 4096 {
+            self.lines.clear();
+        }
+    }
+
+    pub fn get(&self, line: usize) -> Option<&LineLayout> {
+        self.lines.get(&line).filter(|l| l.epoch == self.epoch)
+    }
+
+    pub fn insert(&mut self, line: usize, layout: LineLayout) {
+        self.lines.insert(line, layout);
+    }
+
+    pub fn clear(&mut self) {
+        self.lines.clear();
+    }
+}
+
+/// Mouse drag in progress.
+#[derive(Debug, Clone)]
+pub struct DragState {
+    pub mode: DragMode,
+    /// Selections present before the drag (for add-cursor drags).
+    pub base: Vec<Selection>,
+    /// The anchor selection of this drag (word/line extents for those modes).
+    pub origin: Selection,
+    /// Column mode: display column of the origin.
+    pub origin_display_col: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragMode {
+    Char,
+    Word,
+    Line,
+    Column,
+}
+
+pub struct View {
+    pub id: ViewId,
+    pub doc: DocId,
+    pub sels: SelectionSet,
+    pub seen_revision: u64,
+    pub scroll: egui::Vec2,
+    /// Font-size steps relative to the configured size.
+    pub zoom_steps: i32,
+    pub want_cursor_visible: bool,
+    pub want_centre: bool,
+    pub overwrite: bool,
+    pub word_wrap: Option<bool>,
+    pub cache: LayoutCache,
+    pub drag: Option<DragState>,
+    pub blink_epoch: f64,
+    pub ime_preedit: Option<(String, usize)>,
+    pub lines_per_page: usize,
+    /// Selection sets prior to multi-cursor additions, for "undo selection".
+    pub selection_history: Vec<SelectionSet>,
+    /// Quick Add Next started from a word expansion, so further additions match whole words.
+    pub quick_add_word_mode: bool,
+    pub last_rect: egui::Rect,
+    pub folds: Vec<(usize, usize)>,
+}
+
+impl View {
+    pub fn new(doc: DocId, revision: u64) -> Self {
+        Self {
+            id: ViewId::next(),
+            doc,
+            sels: SelectionSet::default(),
+            seen_revision: revision,
+            scroll: egui::Vec2::ZERO,
+            zoom_steps: 0,
+            want_cursor_visible: true,
+            want_centre: false,
+            overwrite: false,
+            word_wrap: None,
+            cache: LayoutCache::default(),
+            drag: None,
+            blink_epoch: 0.0,
+            ime_preedit: None,
+            lines_per_page: 40,
+            selection_history: Vec::new(),
+            quick_add_word_mode: false,
+            last_rect: egui::Rect::NOTHING,
+            folds: Vec::new(),
+        }
+    }
+
+    /// A second view of the same document with copied selection/scroll state.
+    pub fn duplicate(&self) -> Self {
+        let mut v = Self::new(self.doc, self.seen_revision);
+        v.sels = self.sels.clone();
+        v.scroll = self.scroll;
+        v.zoom_steps = self.zoom_steps;
+        v
+    }
+
+    /// Bring selections up to date with the document and invalidate layout
+    /// caches if the text changed under us.
+    pub fn sync(&mut self, doc: &Document) {
+        if self.seen_revision != doc.revision() {
+            doc.sync_selections(&mut self.sels, self.seen_revision);
+            self.seen_revision = doc.revision();
+            self.cache.invalidate();
+        }
+    }
+
+    pub fn set_selections(&mut self, sels: SelectionSet) {
+        self.sels = sels;
+        self.want_cursor_visible = true;
+        self.quick_add_word_mode = false;
+    }
+
+    pub fn push_selection_history(&mut self) {
+        self.selection_history.push(self.sels.clone());
+        if self.selection_history.len() > 64 {
+            self.selection_history.remove(0);
+        }
+    }
+
+    pub fn primary_line(&self, doc: &Document) -> usize {
+        doc.rope().char_to_line(self.sels.primary().head.min(doc.len_chars()))
+    }
+
+    pub fn primary_position(&self, doc: &Document) -> (usize, usize) {
+        let rope = doc.rope();
+        let head = self.sels.primary().head.min(rope.len_chars());
+        let line = rope.char_to_line(head);
+        (line, head - rope.line_to_char(line))
+    }
+
+    // ----- cursor motion -------------------------------------------------
+
+    pub fn move_cursors(&mut self, doc: &Document, motion: Motion, extend: bool, tab_width: usize) {
+        let rope = doc.rope();
+        let text = doc.slice();
+        let page = self.lines_per_page.max(1);
+        self.sels.transform(|s| {
+            let head = s.head.min(rope.len_chars());
+            let collapse_to = |s: &Selection, start: bool| if !extend && !s.is_empty() { Some(if start { s.start() } else { s.end() }) } else { None };
+            match motion {
+                Motion::Left => {
+                    let p = collapse_to(&s, true).unwrap_or_else(|| prev_grapheme_boundary(text, head));
+                    s.moved_to(p, extend)
+                }
+                Motion::Right => {
+                    let p = collapse_to(&s, false).unwrap_or_else(|| next_grapheme_boundary(text, head));
+                    s.moved_to(p, extend)
+                }
+                Motion::WordLeft => s.moved_to(motion::prev_word_start(text, head), extend),
+                Motion::WordRight => s.moved_to(motion::next_word_end(text, head), extend),
+                Motion::SubwordLeft => s.moved_to(prev_subword(text, head), extend),
+                Motion::SubwordRight => s.moved_to(next_subword(text, head), extend),
+                Motion::Up(n) | Motion::Down(n) => {
+                    let line = rope.char_to_line(head);
+                    let col = head - rope.line_to_char(line);
+                    let goal = s.goal_col.unwrap_or_else(|| char_col_to_display_col(rope.line(line), col, tab_width));
+                    let target = match motion {
+                        Motion::Up(_) => {
+                            if line == 0 {
+                                return s.moved_to(0, extend).with_goal(Some(goal));
+                            }
+                            line.saturating_sub(n)
+                        }
+                        _ => {
+                            let last = rope.len_lines().saturating_sub(1);
+                            if line >= last {
+                                return s.moved_to(rope.len_chars(), extend).with_goal(Some(goal));
+                            }
+                            (line + n).min(last)
+                        }
+                    };
+                    let c = display_col_to_char_col(rope.line(target), goal, tab_width);
+                    s.moved_to(rope.line_to_char(target) + c, extend).with_goal(Some(goal))
+                }
+                Motion::PageUp => {
+                    let line = rope.char_to_line(head);
+                    let col = head - rope.line_to_char(line);
+                    let goal = s.goal_col.unwrap_or_else(|| char_col_to_display_col(rope.line(line), col, tab_width));
+                    let target = line.saturating_sub(page);
+                    let c = display_col_to_char_col(rope.line(target), goal, tab_width);
+                    s.moved_to(rope.line_to_char(target) + c, extend).with_goal(Some(goal))
+                }
+                Motion::PageDown => {
+                    let line = rope.char_to_line(head);
+                    let col = head - rope.line_to_char(line);
+                    let goal = s.goal_col.unwrap_or_else(|| char_col_to_display_col(rope.line(line), col, tab_width));
+                    let target = (line + page).min(rope.len_lines().saturating_sub(1));
+                    let c = display_col_to_char_col(rope.line(target), goal, tab_width);
+                    s.moved_to(rope.line_to_char(target) + c, extend).with_goal(Some(goal))
+                }
+                Motion::LineStart => {
+                    // Smart home: toggle between first non-blank and column 0.
+                    let line = rope.char_to_line(head);
+                    let start = rope.line_to_char(line);
+                    let fnb = start + motion::first_non_blank(rope.line(line));
+                    let p = if head == fnb || fnb == line_end_char(rope, line) { start } else { fnb };
+                    s.moved_to(p, extend)
+                }
+                Motion::LineEnd => s.moved_to(line_end_char(rope, rope.char_to_line(head)), extend),
+                Motion::DocStart => s.moved_to(0, extend),
+                Motion::DocEnd => s.moved_to(rope.len_chars(), extend),
+                Motion::ParagraphUp => s.moved_to(paragraph_boundary(doc, head, false), extend),
+                Motion::ParagraphDown => s.moved_to(paragraph_boundary(doc, head, true), extend),
+            }
+        });
+        self.want_cursor_visible = true;
+        self.quick_add_word_mode = false;
+    }
+
+    /// Expand every selection to whole lines (including the terminator).
+    pub fn select_lines(&mut self, doc: &Document) {
+        let rope = doc.rope();
+        self.sels.transform(|s| {
+            let (a, b) = apex_edit::ops::lines_of(rope, &s);
+            let start = rope.line_to_char(a);
+            let end = if b + 1 < rope.len_lines() { rope.line_to_char(b + 1) } else { rope.len_chars() };
+            // If the selection already covers whole lines, grow by one more line.
+            if s.start() == start && s.end() == end && b + 1 < rope.len_lines() {
+                let end2 = if b + 2 < rope.len_lines() { rope.line_to_char(b + 2) } else { rope.len_chars() };
+                return Selection::new(start, end2);
+            }
+            Selection::new(start, end)
+        });
+        self.want_cursor_visible = true;
+    }
+
+    pub fn select_words(&mut self, doc: &Document) {
+        let text = doc.slice();
+        self.sels.transform(|s| {
+            if s.is_empty() {
+                let (a, b) = motion::word_at(text, s.head);
+                Selection::new(a, b)
+            } else {
+                let (a, _) = motion::word_at(text, s.start());
+                let (_, b) = motion::word_at(text, s.end().saturating_sub(1).max(s.start()));
+                Selection::new(a.min(s.start()), b.max(s.end()))
+            }
+        });
+    }
+
+    pub fn select_all(&mut self, doc: &Document) {
+        self.sels.set_single(Selection::new(0, doc.len_chars()));
+    }
+
+    pub fn select_to_brackets(&mut self, doc: &Document) {
+        let rope = doc.rope();
+        self.sels.transform(|s| match apex_edit::brackets::enclosing_brackets(rope, s.head) {
+            Some((o, c)) => {
+                if s.start() == o + 1 && s.end() == c {
+                    Selection::new(o, c + 1)
+                } else {
+                    Selection::new(o + 1, c)
+                }
+            }
+            None => s,
+        });
+        self.want_cursor_visible = true;
+    }
+
+    pub fn jump_to_bracket(&mut self, doc: &Document, extend: bool) {
+        let rope = doc.rope();
+        self.sels.transform(|s| {
+            let m = apex_edit::brackets::matching_bracket(rope, s.head).or_else(|| apex_edit::brackets::enclosing_brackets(rope, s.head));
+            match m {
+                Some((o, c)) => {
+                    let target = if s.head == o || s.head == o + 1 { c + 1 } else { o };
+                    s.moved_to(target, extend)
+                }
+                None => s,
+            }
+        });
+        self.want_cursor_visible = true;
+    }
+
+    /// Expand to the lines sharing the current indentation level (and their parent line).
+    pub fn select_indentation(&mut self, doc: &Document) {
+        let rope = doc.rope();
+        let indent_of = |line: usize| -> Option<usize> {
+            let l = rope.line(line);
+            if line_len_chars(rope, line) == 0 { None } else { Some(motion::first_non_blank(l)) }
+        };
+        self.sels.transform(|s| {
+            let (first, last) = apex_edit::ops::lines_of(rope, &s);
+            let level = (first..=last).filter_map(indent_of).min().unwrap_or(0);
+            let whole_lines = s.start() == rope.line_to_char(first) && s.end() == line_end_char(rope, last);
+            if whole_lines {
+                // Already a block: grow to the enclosing lines with a smaller indent.
+                let mut a = first;
+                while a > 0 {
+                    a -= 1;
+                    if indent_of(a).is_some_and(|i| i < level) {
+                        break;
+                    }
+                }
+                let mut b = last;
+                while b + 1 < rope.len_lines() {
+                    b += 1;
+                    if indent_of(b).is_some_and(|i| i < level) {
+                        break;
+                    }
+                }
+                while b > a && indent_of(b).is_none() {
+                    b -= 1;
+                }
+                return Selection::new(rope.line_to_char(a), line_end_char(rope, b));
+            }
+            let mut a = first;
+            while a > 0 && indent_of(a - 1).is_none_or(|i| i >= level) {
+                a -= 1;
+            }
+            let mut b = last;
+            while b + 1 < rope.len_lines() && indent_of(b + 1).is_none_or(|i| i >= level) {
+                b += 1;
+            }
+            while b > a && indent_of(b).is_none() {
+                b -= 1;
+            }
+            Selection::new(rope.line_to_char(a), line_end_char(rope, b))
+        });
+        self.want_cursor_visible = true;
+    }
+
+    pub fn select_paragraph(&mut self, doc: &Document) {
+        self.sels.transform(|s| Selection::new(paragraph_boundary(doc, s.start(), false), paragraph_boundary(doc, s.end(), true)));
+    }
+
+    pub fn add_cursor_vertically(&mut self, doc: &Document, down: bool, tab_width: usize) {
+        let rope = doc.rope();
+        self.push_selection_history();
+        let mut new = Vec::new();
+        for s in self.sels.iter() {
+            let line = rope.char_to_line(s.head.min(rope.len_chars()));
+            let target = if down { line + 1 } else { line.wrapping_sub(1) };
+            if target >= rope.len_lines() {
+                continue;
+            }
+            let col = s.head - rope.line_to_char(line);
+            let goal = s.goal_col.unwrap_or_else(|| char_col_to_display_col(rope.line(line), col, tab_width));
+            let c = display_col_to_char_col(rope.line(target), goal, tab_width);
+            new.push(Selection::point(rope.line_to_char(target) + c).with_goal(Some(goal)));
+        }
+        for n in new {
+            self.sels.push_primary(n);
+        }
+        self.want_cursor_visible = true;
+    }
+
+    /// Quick Add Next (Ctrl+D): select the word under the caret, or add the
+    /// next occurrence of the primary selection as a new selection.
+    pub fn add_next_occurrence(&mut self, doc: &Document, skip_current: bool) {
+        let rope = doc.rope();
+        let text = doc.slice();
+        let primary = self.sels.primary();
+        if primary.is_empty() {
+            let (a, b) = motion::word_at(text, primary.head);
+            if a == b {
+                return;
+            }
+            self.push_selection_history();
+            let mut ns = self.sels.clone();
+            ns.transform(|s| if s == primary { Selection::new(a, b) } else { s });
+            self.sels = ns;
+            self.quick_add_word_mode = true;
+            self.want_cursor_visible = true;
+            return;
+        }
+        let needle: String = rope.slice(primary.range()).into();
+        if needle.is_empty() || needle.len() > 10_000 {
+            return;
+        }
+        let whole_word = self.quick_add_word_mode;
+        let search_from = self.sels.iter().map(|s| s.end()).max().unwrap_or(0);
+        let Some((a, b)) = find_occurrence(rope, &needle, search_from, whole_word, &self.sels) else { return };
+        self.push_selection_history();
+        if skip_current {
+            self.sels.remove_primary();
+        }
+        self.sels.push_primary(if primary.is_reversed() { Selection::new(b, a) } else { Selection::new(a, b) });
+        self.want_cursor_visible = true;
+    }
+
+    pub fn add_all_occurrences(&mut self, doc: &Document) {
+        let rope = doc.rope();
+        let text = doc.slice();
+        let primary = self.sels.primary();
+        let (needle, whole_word) = if primary.is_empty() {
+            let (a, b) = motion::word_at(text, primary.head);
+            if a == b {
+                return;
+            }
+            (rope.slice(a..b).to_string(), true)
+        } else {
+            (rope.slice(primary.range()).to_string(), false)
+        };
+        if needle.is_empty() || needle.len() > 10_000 {
+            return;
+        }
+        let hay = rope.to_string();
+        let mut sels = Vec::new();
+        let mut byte = 0;
+        let mut char_pos = 0;
+        let mut limit = 0;
+        while let Some(off) = hay[byte..].find(&needle) {
+            let start_b = byte + off;
+            char_pos += hay[byte..start_b].chars().count();
+            let n = needle.chars().count();
+            let ok = !whole_word || {
+                let (a, b) = motion::word_at(text, char_pos);
+                a == char_pos && b == char_pos + n
+            };
+            if ok {
+                sels.push(Selection::new(char_pos, char_pos + n));
+            }
+            byte = start_b + needle.len();
+            char_pos += n;
+            limit += 1;
+            if limit > 100_000 {
+                break;
+            }
+        }
+        if sels.is_empty() {
+            return;
+        }
+        self.push_selection_history();
+        let primary_idx = sels.iter().position(|s| s.start() == primary.start()).unwrap_or(0);
+        self.sels = SelectionSet::from_vec(sels, primary_idx);
+        self.want_cursor_visible = true;
+    }
+
+    pub fn undo_selection(&mut self) {
+        if let Some(prev) = self.selection_history.pop() {
+            self.sels = prev;
+            self.want_cursor_visible = true;
+        }
+    }
+
+    /// Escape: collapse to the primary cursor only.
+    pub fn single_selection(&mut self) {
+        if self.sels.len() > 1 {
+            self.push_selection_history();
+            self.sels.keep_primary();
+        } else if !self.sels.primary().is_empty() {
+            let p = self.sels.primary();
+            self.sels.set_single(p.collapse());
+        }
+        self.want_cursor_visible = true;
+    }
+
+    pub fn column_select(&mut self, doc: &Document, down: bool, tab_width: usize) {
+        let rope = doc.rope();
+        // Extend the block of cursors by one line in the given direction, or
+        // shrink if the block already extends the other way.
+        let lines: Vec<usize> = self.sels.iter().map(|s| rope.char_to_line(s.head.min(rope.len_chars()))).collect();
+        let (min_l, max_l) = (*lines.iter().min().unwrap_or(&0), *lines.iter().max().unwrap_or(&0));
+        let primary_line = self.primary_line(doc);
+        self.push_selection_history();
+        let goal = {
+            let s = self.sels.primary();
+            let line = rope.char_to_line(s.head.min(rope.len_chars()));
+            s.goal_col.unwrap_or_else(|| char_col_to_display_col(rope.line(line), s.head - rope.line_to_char(line), tab_width))
+        };
+        let anchor_goal = {
+            let s = self.sels.primary();
+            let line = rope.char_to_line(s.anchor.min(rope.len_chars()));
+            char_col_to_display_col(rope.line(line), s.anchor - rope.line_to_char(line), tab_width)
+        };
+        let extend_from = if down { max_l } else { min_l };
+        let shrinking = (down && primary_line == min_l && max_l > min_l) || (!down && primary_line == max_l && max_l > min_l);
+        let target = if shrinking {
+            None
+        } else if down {
+            (extend_from + 1 < rope.len_lines()).then_some(extend_from + 1)
+        } else {
+            extend_from.checked_sub(1)
+        };
+        if shrinking {
+            let remove_line = if down { min_l } else { max_l };
+            let keep: Vec<Selection> = self.sels.iter().copied().filter(|s| rope.char_to_line(s.head.min(rope.len_chars())) != remove_line).collect();
+            if !keep.is_empty() {
+                let p = if down { keep.len() - 1 } else { 0 };
+                self.sels = SelectionSet::from_vec(keep, if down { 0 } else { p });
+            }
+        } else if let Some(t) = target {
+            let line_start = rope.line_to_char(t);
+            let head = line_start + display_col_to_char_col(rope.line(t), goal, tab_width);
+            let anchor = line_start + display_col_to_char_col(rope.line(t), anchor_goal, tab_width);
+            self.sels.push_primary(Selection::new(anchor, head).with_goal(Some(goal)));
+        }
+        self.want_cursor_visible = true;
+    }
+
+    pub fn scroll_lines(&mut self, lines: f32, line_height: f32) {
+        self.scroll.y = (self.scroll.y + lines * line_height).max(0.0);
+    }
+}
+
+/// Find `needle` after `from` (wrapping), skipping ranges already selected.
+fn find_occurrence(rope: &apex_buffer::Rope, needle: &str, from: usize, whole_word: bool, sels: &SelectionSet) -> Option<(usize, usize)> {
+    let text = rope.slice(..);
+    let hay = rope.to_string();
+    let n = needle.chars().count();
+    let from_b = rope.char_to_byte(from.min(rope.len_chars()));
+    let check = |char_pos: usize| -> bool {
+        if sels.iter().any(|s| s.start() == char_pos && s.end() == char_pos + n) {
+            return false;
+        }
+        if whole_word {
+            let (a, b) = motion::word_at(text, char_pos);
+            return a == char_pos && b == char_pos + n;
+        }
+        true
+    };
+    let scan = |range_start: usize, range_end: usize| -> Option<(usize, usize)> {
+        let mut byte = range_start;
+        let mut char_pos = rope.byte_to_char(range_start);
+        while byte < range_end {
+            let off = hay[byte..range_end].find(needle)?;
+            let start_b = byte + off;
+            char_pos += hay[byte..start_b].chars().count();
+            if check(char_pos) {
+                return Some((char_pos, char_pos + n));
+            }
+            byte = start_b + needle.len().max(1);
+            char_pos += n.max(1);
+        }
+        None
+    };
+    scan(from_b, hay.len()).or_else(|| scan(0, from_b.min(hay.len())))
+}
+
+fn paragraph_boundary(doc: &Document, pos: usize, forward: bool) -> usize {
+    let rope = doc.rope();
+    let is_blank = |l: usize| rope.line(l).chars().all(|c| c.is_whitespace());
+    let mut line = rope.char_to_line(pos.min(rope.len_chars()));
+    let last = rope.len_lines().saturating_sub(1);
+    if forward {
+        while line < last && !is_blank(line) {
+            line += 1;
+        }
+        while line < last && is_blank(line) {
+            line += 1;
+        }
+        if line == last && !is_blank(line) {
+            return rope.len_chars();
+        }
+        rope.line_to_char(line)
+    } else {
+        line = line.saturating_sub(1);
+        while line > 0 && is_blank(line) {
+            line -= 1;
+        }
+        while line > 0 && !is_blank(line - 1) {
+            line -= 1;
+        }
+        rope.line_to_char(line)
+    }
+}
+
+/// Subword motion: stops at camelCase humps and underscores inside identifiers.
+fn next_subword(text: apex_buffer::RopeSlice<'_>, pos: usize) -> usize {
+    let len = text.len_chars();
+    let mut prev: Option<char> = None;
+    let mut started = false;
+    for (i, c) in (pos.min(len)..).zip(text.chars_at(pos.min(len))) {
+        let boundary = match prev {
+            None => false,
+            Some(p) => {
+                (p.is_lowercase() && c.is_uppercase())
+                    || (p == '_' && c != '_')
+                    || (c == '_' && p != '_')
+                    || (p.is_alphanumeric() != c.is_alphanumeric())
+                    || (c.is_whitespace() != p.is_whitespace())
+            }
+        };
+        if boundary && started {
+            return i;
+        }
+        if !c.is_whitespace() {
+            started = true;
+        }
+        prev = Some(c);
+    }
+    len
+}
+
+fn prev_subword(text: apex_buffer::RopeSlice<'_>, pos: usize) -> usize {
+    let mut i = pos.min(text.len_chars());
+    let mut it = text.chars_at(i);
+    let mut next: Option<char> = None;
+    let mut started = false;
+    while let Some(c) = it.prev() {
+        let boundary = match next {
+            None => false,
+            Some(nx) => {
+                (c.is_lowercase() && nx.is_uppercase())
+                    || (c == '_' && nx != '_')
+                    || (nx == '_' && c != '_')
+                    || (c.is_alphanumeric() != nx.is_alphanumeric())
+                    || (c.is_whitespace() != nx.is_whitespace())
+            }
+        };
+        if boundary && started {
+            return i;
+        }
+        if !c.is_whitespace() {
+            started = true;
+        }
+        next = Some(c);
+        i -= 1;
+    }
+    0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Motion {
+    Left,
+    Right,
+    Up(usize),
+    Down(usize),
+    WordLeft,
+    WordRight,
+    SubwordLeft,
+    SubwordRight,
+    LineStart,
+    LineEnd,
+    DocStart,
+    DocEnd,
+    PageUp,
+    PageDown,
+    ParagraphUp,
+    ParagraphDown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view_for(doc: &Document) -> View {
+        View::new(doc.id, doc.revision())
+    }
+
+    #[test]
+    fn vertical_motion_keeps_goal_column() {
+        let d = Document::from_text("longer line\nab\nanother long");
+        let mut v = view_for(&d);
+        v.sels.set_single(Selection::point(8));
+        v.move_cursors(&d, Motion::Down(1), false, 4);
+        assert_eq!(v.sels.primary().head, 14); // end of "ab"
+        v.move_cursors(&d, Motion::Down(1), false, 4);
+        assert_eq!(v.sels.primary().head, 15 + 8);
+        v.move_cursors(&d, Motion::Up(1), true, 4);
+        assert_eq!(v.sels.primary(), Selection::new(23, 14).with_goal(Some(8)));
+    }
+
+    #[test]
+    fn smart_home_toggles() {
+        let d = Document::from_text("    x");
+        let mut v = view_for(&d);
+        v.sels.set_single(Selection::point(5));
+        v.move_cursors(&d, Motion::LineStart, false, 4);
+        assert_eq!(v.sels.primary().head, 4);
+        v.move_cursors(&d, Motion::LineStart, false, 4);
+        assert_eq!(v.sels.primary().head, 0);
+        v.move_cursors(&d, Motion::LineStart, false, 4);
+        assert_eq!(v.sels.primary().head, 4);
+    }
+
+    #[test]
+    fn quick_add_next_and_all() {
+        let d = Document::from_text("foo bar foo foobar foo");
+        let mut v = view_for(&d);
+        v.sels.set_single(Selection::point(1));
+        v.add_next_occurrence(&d, false);
+        assert_eq!(v.sels.primary(), Selection::new(0, 3));
+        v.add_next_occurrence(&d, false);
+        assert_eq!(v.sels.len(), 2);
+        assert_eq!(v.sels.primary(), Selection::new(8, 11));
+        v.add_next_occurrence(&d, true); // skip 8..11, take 19..22 (whole word: skips foobar)
+        assert_eq!(v.sels.len(), 2);
+        assert_eq!(v.sels.primary(), Selection::new(19, 22));
+        v.undo_selection();
+        assert_eq!(v.sels.len(), 2);
+        v.sels.set_single(Selection::point(1));
+        v.add_all_occurrences(&d);
+        assert_eq!(v.sels.len(), 3);
+    }
+
+    #[test]
+    fn add_cursor_below_and_column_select() {
+        let d = Document::from_text("abc\nde\nfghij");
+        let mut v = view_for(&d);
+        v.sels.set_single(Selection::point(2));
+        v.add_cursor_vertically(&d, true, 4);
+        assert_eq!(v.sels.iter().map(|s| s.with_goal(None)).collect::<Vec<_>>(), vec![Selection::point(2), Selection::point(6)]);
+        v.sels.set_single(Selection::new(0, 2));
+        v.column_select(&d, true, 4);
+        v.column_select(&d, true, 4);
+        assert_eq!(v.sels.len(), 3);
+        assert_eq!(v.sels.as_slice()[2].with_goal(None), Selection::new(7, 9));
+        v.column_select(&d, false, 4);
+        assert_eq!(v.sels.len(), 2);
+    }
+
+    #[test]
+    fn select_lines_grows() {
+        let d = Document::from_text("a\nb\nc");
+        let mut v = view_for(&d);
+        v.select_lines(&d);
+        assert_eq!(v.sels.primary(), Selection::new(0, 2));
+        v.select_lines(&d);
+        assert_eq!(v.sels.primary(), Selection::new(0, 4));
+    }
+
+    #[test]
+    fn subword_motion() {
+        let r = apex_buffer::Rope::from_str("someCamelCase_snake x");
+        let s = r.slice(..);
+        assert_eq!(next_subword(s, 0), 4);
+        assert_eq!(next_subword(s, 4), 9);
+        assert_eq!(next_subword(s, 9), 13);
+        assert_eq!(prev_subword(s, 13), 9);
+        assert_eq!(prev_subword(s, 4), 0);
+    }
+
+    #[test]
+    fn indentation_selection() {
+        let d = Document::from_text("fn x() {\n    a;\n    b;\n}\n");
+        let mut v = view_for(&d);
+        v.sels.set_single(Selection::point(14));
+        v.select_indentation(&d);
+        assert_eq!(v.sels.primary(), Selection::new(9, 22));
+        v.select_indentation(&d);
+        assert_eq!(v.sels.primary(), Selection::new(0, 24));
+    }
+}

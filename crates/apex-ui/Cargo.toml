@@ -1,0 +1,27 @@
+[package]
+name = "apex-ui"
+description = "egui user interface for Apex: editor widget, panes, palette and settings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apex-buffer.workspace = true
+apex-edit.workspace = true
+apex-project.workspace = true
+egui.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+rfd.workspace = true
+
+encoding_rs.workspace = true
+eframe.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,64 @@
+# High Contrast Light — maximal contrast on pure white.
+name = "High Contrast Light"
+dark = false
+
+[ui]
+background = "#ffffff"
+surface = "#f4f4f4"
+surface_raised = "#ffffff"
+border = "#404040"
+text = "#000000"
+text_muted = "#303030"
+accent = "#0050c8"
+accent_text = "#ffffff"
+tab_active = "#ffffff"
+tab_inactive = "#ebebeb"
+tab_text_active = "#000000"
+tab_text_inactive = "#303030"
+status_bar = "#f0f0f0"
+sidebar = "#ffffff"
+panel = "#ffffff"
+menu = "#ffffff"
+hover = "#d6e4ff"
+selection = "#b3d1ff"
+scrollbar = "#707070"
+scrollbar_hover = "#404040"
+
+[editor]
+background = "#ffffff"
+foreground = "#000000"
+gutter_background = "#ffffff"
+line_number = "#505050"
+line_number_active = "#000000"
+current_line = "#f0f0f0"
+selection = "#b3d1ff"
+selection_inactive = "#d9e6fb"
+caret = "#000000"
+caret_secondary = "#0050c8"
+whitespace = "#909090"
+indent_guide = "#c0c0c0"
+indent_guide_active = "#707070"
+bracket_match = "#0050c8"
+search_match = "#ffe066"
+search_match_current = "#ffb000"
+
+[syntax]
+comment = { fg = "#006400", italic = true }
+keyword = { fg = "#8b008b", bold = true }
+"keyword.control" = { fg = "#8b008b", bold = true }
+operator = "#000000"
+string = "#a31515"
+"string.escape" = "#0050c8"
+number = "#0000ff"
+constant = "#0000ff"
+boolean = "#0000ff"
+type = "#005a9c"
+function = "#5a2d82"
+constructor = "#005a9c"
+variable = "#000000"
+"variable.parameter" = "#202020"
+property = "#000000"
+attribute = "#0000ff"
+tag = "#8b008b"
+punctuation = "#000000"
+error = { fg = "#c00000", underline = true }

@@ -1,0 +1,248 @@
+//! Atomic multi-range replacements with inverse generation and position mapping.
+
+use ropey::Rope;
+use serde::{Deserialize, Serialize};
+
+/// Which side of an edit a position sticks to when it lies at or inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Assoc {
+    /// Position stays before inserted text (left-gravity).
+    Before,
+    /// Position moves after inserted text (right-gravity).
+    After,
+}
+
+/// Replace chars `start..end` with `text`. Coordinates are pre-edit char offsets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Change {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
+impl Change {
+    pub fn insert(at: usize, text: impl Into<String>) -> Self {
+        Self { start: at, end: at, text: text.into() }
+    }
+
+    pub fn delete(start: usize, end: usize) -> Self {
+        Self { start, end, text: String::new() }
+    }
+
+    pub fn replace(start: usize, end: usize, text: impl Into<String>) -> Self {
+        Self { start, end, text: text.into() }
+    }
+
+    #[inline]
+    pub fn new_len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    #[inline]
+    pub fn old_len(&self) -> usize {
+        self.end - self.start
+    }
+
+    pub fn is_noop(&self) -> bool {
+        self.start == self.end && self.text.is_empty()
+    }
+}
+
+/// A sorted, disjoint list of [`Change`]s applied atomically.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transaction {
+    changes: Vec<Change>,
+}
+
+impl Transaction {
+    /// Build a transaction, sorting changes and dropping any that overlap an
+    /// earlier one (deterministic: the earlier-starting change wins). Callers
+    /// producing changes from a normalised [`crate::SelectionSet`] never hit
+    /// the overlap path.
+    pub fn new(mut changes: Vec<Change>) -> Self {
+        changes.retain(|c| !c.is_noop());
+        changes.sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
+        let mut out: Vec<Change> = Vec::with_capacity(changes.len());
+        for c in changes {
+            if let Some(last) = out.last()
+                && c.start < last.end
+            {
+                tracing::warn!(?c, ?last, "dropping overlapping change");
+                continue;
+            }
+            // Two insertions at the same point are fine; keep both in order.
+            out.push(c);
+        }
+        Self { changes: out }
+    }
+
+    pub fn single(change: Change) -> Self {
+        Self::new(vec![change])
+    }
+
+    pub fn changes(&self) -> &[Change] {
+        &self.changes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    /// Clamp all ranges into `rope` (defence against stale transactions).
+    pub fn clamped(mut self, rope: &Rope) -> Self {
+        let n = rope.len_chars();
+        for c in &mut self.changes {
+            c.start = c.start.min(n);
+            c.end = c.end.clamp(c.start, n);
+        }
+        self
+    }
+
+    /// Apply to `rope`, returning the inverse transaction (in post-edit
+    /// coordinates) and the byte-level edits in the order they were applied
+    /// (last-to-first), which is the order a syntax tree must be told about them.
+    pub fn apply(&self, rope: &mut Rope) -> (Transaction, Vec<crate::document::ByteEdit>) {
+        // Prefix deltas so each inverse change can be expressed in post-edit coordinates.
+        let mut prefix = Vec::with_capacity(self.changes.len());
+        let mut acc: isize = 0;
+        for c in &self.changes {
+            prefix.push(acc);
+            acc += c.new_len() as isize - c.old_len() as isize;
+        }
+        let mut inverse = vec![Change::insert(0, ""); self.changes.len()];
+        let mut byte_edits = Vec::with_capacity(self.changes.len());
+        for (i, c) in self.changes.iter().enumerate().rev() {
+            let n = rope.len_chars();
+            let start = c.start.min(n);
+            let end = c.end.clamp(start, n);
+            let start_byte = rope.char_to_byte(start);
+            let old_end_byte = rope.char_to_byte(end);
+            let start_point = point_of(rope, start_byte);
+            let old_end_point = point_of(rope, old_end_byte);
+            let removed: String = rope.slice(start..end).into();
+            rope.remove(start..end);
+            rope.insert(start, &c.text);
+            let new_end_byte = start_byte + c.text.len();
+            let new_end_point = point_of(rope, new_end_byte);
+            let new_start = (start as isize + prefix[i]).max(0) as usize;
+            inverse[i] = Change { start: new_start, end: new_start + c.new_len(), text: removed };
+            byte_edits.push(crate::document::ByteEdit { start_byte, old_end_byte, new_end_byte, start_point, old_end_point, new_end_point });
+        }
+        let inverse = Transaction { changes: inverse };
+        debug_assert!(inverse.changes.windows(2).all(|w| w[0].end <= w[1].start));
+        (inverse, byte_edits)
+    }
+
+    /// Map a pre-edit position to its post-edit equivalent.
+    pub fn map_pos(&self, pos: usize, assoc: Assoc) -> usize {
+        let mut delta: isize = 0;
+        for c in &self.changes {
+            if pos < c.start {
+                break;
+            }
+            let new_len = c.new_len() as isize;
+            let old_len = c.old_len() as isize;
+            if pos == c.start && c.old_len() == 0 {
+                // Insertion exactly at pos.
+                match assoc {
+                    Assoc::Before => break,
+                    Assoc::After => {
+                        delta += new_len;
+                        continue;
+                    }
+                }
+            }
+            if pos < c.end || (pos == c.end && c.old_len() > 0) {
+                if pos == c.end {
+                    // At the end of a replaced range: after the new text.
+                    delta += new_len - old_len;
+                    continue;
+                }
+                // Inside the replaced range.
+                let base = (c.start as isize + delta) as usize;
+                return match assoc {
+                    Assoc::Before => base,
+                    Assoc::After => base + c.new_len(),
+                };
+            }
+            delta += new_len - old_len;
+        }
+        ((pos as isize) + delta).max(0) as usize
+    }
+
+    /// Total change in char count after applying.
+    pub fn len_delta(&self) -> isize {
+        self.changes.iter().map(|c| c.new_len() as isize - c.old_len() as isize).sum()
+    }
+
+    /// Byte size of the stored text (for history memory accounting).
+    pub fn text_bytes(&self) -> usize {
+        self.changes.iter().map(|c| c.text.len()).sum()
+    }
+
+    /// Char range touched by the transaction in post-edit coordinates, if any.
+    pub fn touched_range_after(&self) -> Option<std::ops::Range<usize>> {
+        let first = self.changes.first()?;
+        let last = self.changes.last()?;
+        let end = self.map_pos(last.end, Assoc::After);
+        Some(first.start..end.max(first.start))
+    }
+}
+
+fn point_of(rope: &Rope, byte: usize) -> (usize, usize) {
+    let byte = byte.min(rope.len_bytes());
+    let line = rope.byte_to_line(byte);
+    (line, byte - rope.line_to_byte(line))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_and_invert() {
+        let mut r = Rope::from_str("hello world");
+        let tx = Transaction::new(vec![Change::replace(0, 5, "HELLO"), Change::insert(11, "!"), Change::delete(5, 6)]);
+        let (inv, edits) = tx.apply(&mut r);
+        assert_eq!(r.to_string(), "HELLOworld!");
+        assert_eq!(edits.len(), 3);
+        let (redo, _) = inv.apply(&mut r);
+        assert_eq!(r.to_string(), "hello world");
+        assert_eq!(redo.changes().len(), 3);
+    }
+
+    #[test]
+    fn map_positions() {
+        let tx = Transaction::new(vec![Change::insert(2, "XX"), Change::delete(5, 8), Change::replace(10, 12, "Y")]);
+        assert_eq!(tx.map_pos(0, Assoc::After), 0);
+        assert_eq!(tx.map_pos(2, Assoc::Before), 2);
+        assert_eq!(tx.map_pos(2, Assoc::After), 4);
+        assert_eq!(tx.map_pos(3, Assoc::After), 5);
+        assert_eq!(tx.map_pos(6, Assoc::Before), 7);
+        assert_eq!(tx.map_pos(6, Assoc::After), 7);
+        assert_eq!(tx.map_pos(8, Assoc::Before), 7);
+        assert_eq!(tx.map_pos(9, Assoc::Before), 8);
+        assert_eq!(tx.map_pos(11, Assoc::Before), 9);
+        assert_eq!(tx.map_pos(11, Assoc::After), 10);
+        assert_eq!(tx.map_pos(12, Assoc::Before), 10);
+        assert_eq!(tx.map_pos(20, Assoc::Before), 18);
+    }
+
+    #[test]
+    fn overlapping_changes_are_dropped_deterministically() {
+        let tx = Transaction::new(vec![Change::delete(0, 5), Change::delete(3, 8), Change::delete(5, 6)]);
+        assert_eq!(tx.changes().len(), 2);
+        assert_eq!(tx.changes()[1].start, 5);
+    }
+
+    #[test]
+    fn byte_edits_have_points() {
+        let mut r = Rope::from_str("ab\ncd");
+        let tx = Transaction::single(Change::insert(4, "X\nY"));
+        let (_, e) = tx.apply(&mut r);
+        assert_eq!(e[0].start_byte, 4);
+        assert_eq!(e[0].start_point, (1, 1));
+        assert_eq!(e[0].new_end_byte, 7);
+        assert_eq!(e[0].new_end_point, (2, 1));
+    }
+}

@@ -1,0 +1,66 @@
+# High Contrast Dark — WCAG AAA foreground contrast on pure black.
+name = "High Contrast Dark"
+dark = true
+
+[ui]
+background = "#000000"
+surface = "#0a0a0a"
+surface_raised = "#161616"
+border = "#6f6f6f"
+text = "#ffffff"
+text_muted = "#c0c0c0"
+accent = "#4fc1ff"
+accent_text = "#000000"
+tab_active = "#000000"
+tab_inactive = "#0a0a0a"
+tab_text_active = "#ffffff"
+tab_text_inactive = "#c0c0c0"
+status_bar = "#000000"
+sidebar = "#000000"
+panel = "#000000"
+menu = "#101010"
+hover = "#2a2a2a"
+selection = "#1f4f8f"
+scrollbar = "#808080"
+scrollbar_hover = "#b0b0b0"
+
+[editor]
+background = "#000000"
+foreground = "#ffffff"
+gutter_background = "#000000"
+line_number = "#a0a0a0"
+line_number_active = "#ffffff"
+current_line = "#141414"
+selection = "#1f4f8f"
+selection_inactive = "#2a3a50"
+caret = "#ffff00"
+caret_secondary = "#ffd700"
+whitespace = "#707070"
+indent_guide = "#404040"
+indent_guide_active = "#808080"
+ruler = "#404040"
+bracket_match = "#ffff00"
+search_match = "#7a5c00"
+search_match_current = "#c89b00"
+word_highlight = "#2a2a2a"
+
+[syntax]
+comment = { fg = "#9cdcfe", italic = true }
+keyword = { fg = "#ff80ff", bold = true }
+"keyword.control" = { fg = "#ff80ff", bold = true }
+operator = "#ffffff"
+string = "#7fff7f"
+"string.escape" = "#ffd700"
+number = "#ffd700"
+constant = "#ffd700"
+boolean = "#ffd700"
+type = "#4fc1ff"
+function = "#ffff80"
+constructor = "#4fc1ff"
+variable = "#ffffff"
+"variable.parameter" = "#e0e0e0"
+property = "#ffffff"
+attribute = "#ffd700"
+tag = "#ff80ff"
+punctuation = "#ffffff"
+error = { fg = "#ff5555", underline = true }

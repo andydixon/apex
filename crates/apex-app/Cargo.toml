@@ -1,0 +1,21 @@
+[package]
+name = "apex-app"
+description = "The Apex text editor application binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+default-run = "apex"
+
+[[bin]]
+name = "apex"
+path = "src/main.rs"
+
+[dependencies]
+apex-ui.workspace = true
+apex-project.workspace = true
+eframe.workspace = true
+egui.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

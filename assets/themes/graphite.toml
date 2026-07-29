@@ -1,0 +1,53 @@
+# Graphite — low-saturation grey scheme for long sessions.
+name = "Graphite"
+dark = true
+
+[ui]
+background = "#202124"
+surface = "#26272b"
+surface_raised = "#2e3034"
+border = "#141517"
+text = "#cfd2d6"
+text_muted = "#858a92"
+accent = "#8ab4f8"
+tab_active = "#232528"
+tab_inactive = "#26272b"
+status_bar = "#1d1e21"
+sidebar = "#232528"
+panel = "#232528"
+menu = "#2a2c30"
+hover = "#34363b"
+selection = "#3d4552"
+
+[editor]
+background = "#232528"
+foreground = "#cfd2d6"
+gutter_background = "#232528"
+line_number = "#5a5f66"
+line_number_active = "#a3a8b0"
+current_line = "#282a2e"
+selection = "#3d4552"
+selection_inactive = "#30343a"
+caret = "#e8eaed"
+whitespace = "#3c4046"
+indent_guide = "#2f3237"
+indent_guide_active = "#42464c"
+bracket_match = "#8ab4f8"
+
+[syntax]
+comment = { fg = "#767c85", italic = true }
+keyword = "#b4b9c2"
+"keyword.control" = "#c8ccd4"
+operator = "#9aa0a8"
+string = "#a8c7a1"
+number = "#d1b58a"
+constant = "#d1b58a"
+type = "#c2b7d8"
+function = "#9ec1e6"
+variable = "#cfd2d6"
+"variable.parameter" = "#bfc4cc"
+property = "#cfd2d6"
+attribute = "#b4b9c2"
+tag = "#c2b7d8"
+punctuation = "#8f959d"
+"markup.heading" = { fg = "#9ec1e6", bold = true }
