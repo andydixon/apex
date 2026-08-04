@@ -237,6 +237,9 @@ pub fn input(ui: &mut Ui, rect: Rect, view: &mut View, doc: &Document, style: &E
     let geo = geometry(rect, doc, style);
     let id = view.id.egui_id();
     let response = ui.interact(rect, id, Sense::click_and_drag());
+    // egui clears focus for ids that do not declare interest every frame.
+    let layer = ui.layer_id();
+    ui.memory_mut(|m| m.interested_in_focus(id, layer));
     let has_focus = ui.memory(|m| m.has_focus(id));
     ui.memory_mut(|m| m.set_focus_lock_filter(id, egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true }));
     let rope = doc.rope();
@@ -731,7 +734,7 @@ pub fn paint(ui: &mut Ui, rect: Rect, view: &mut View, doc: &Document, style: &E
     }
 
     // Vertical scrollbar.
-    if style.settings.scrollbars && geo.content_height > geo.text.height() {
+    if style.settings.scrollbars && geo.total_lines as f32 * lh > geo.text.height() {
         let track = Rect::from_min_max(pos2(geo.text.max.x, rect.min.y), rect.max);
         let frac_visible = (geo.text.height() / geo.content_height).clamp(0.02, 1.0);
         let thumb_h = (frac_visible * track.height()).max(20.0);

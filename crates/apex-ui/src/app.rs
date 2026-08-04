@@ -2365,9 +2365,9 @@ impl ApexApp {
                 };
                 toggle(ui, &mut self.find.options.regex, ".*", "Regular expression (Alt+R)");
                 toggle(ui, &mut self.find.options.case_sensitive, "Aa", "Case sensitive (Alt+C)");
-                toggle(ui, &mut self.find.options.whole_word, "“”", "Whole word (Alt+W)");
+                toggle(ui, &mut self.find.options.whole_word, "Word", "Whole word (Alt+W)");
                 let mut in_sel = self.find.options.in_range.is_some();
-                if ui.selectable_label(in_sel, "≡").on_hover_text("In selection").clicked() {
+                if ui.selectable_label(in_sel, "In selection").clicked() {
                     in_sel = !in_sel;
                     self.find.options.in_range = if in_sel {
                         self.active_ids().map(|(v, _)| self.views[&v].sels.primary()).filter(|s| !s.is_empty()).map(|s| (s.start(), s.end()))
@@ -2394,7 +2394,7 @@ impl ApexApp {
                 };
                 ui.label(count_text);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("✕").clicked() {
+                    if ui.button("×").clicked() {
                         self.queue.push_back((Command::CloseFind, None));
                     }
                     if ui.selectable_label(self.find.replace_open, "Replace").clicked() {
@@ -2873,7 +2873,9 @@ impl eframe::App for ApexApp {
 
         // Global key handling for non-editor contexts (menus, find bar).
         let editor_focused = self.active_view_id().is_some_and(|v| ctx.memory(|m| m.has_focus(v.egui_id())));
-        let find_focused = self.find_has_focus(&ctx);
+        // egui drops a text field's focus on Escape before we run, so treat the
+        // find bar as focused whenever it is open and the editor is not.
+        let find_focused = self.find.open && !editor_focused && self.dialog.is_none();
         if !editor_focused {
             let active_ctx =
                 if find_focused { vec![crate::keymap::Context::Find, crate::keymap::Context::Global] } else { vec![crate::keymap::Context::Global] };
@@ -2885,6 +2887,9 @@ impl eframe::App for ApexApp {
                         let plain = !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.mac_cmd;
                         if !(plain && find_focused && !matches!(key, egui::Key::Enter | egui::Key::Escape | egui::Key::F3)) {
                             self.queue.push_back((c, arg));
+                            // Stop the text field from also receiving the key's character (Alt+R → "r").
+                            let name = key.symbol_or_name().to_string();
+                            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t.eq_ignore_ascii_case(&name))));
                         }
                     }
                 }
