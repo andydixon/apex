@@ -10,6 +10,7 @@ license.workspace = true
 apex-buffer.workspace = true
 apex-edit.workspace = true
 apex-project.workspace = true
+apex-syntax.workspace = true
 egui.workspace = true
 serde.workspace = true
 toml.workspace = true

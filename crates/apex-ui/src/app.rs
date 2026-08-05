@@ -18,6 +18,7 @@ use crate::settings::{Settings, SettingsIssue};
 use crate::theme::Theme;
 use crate::view::{Motion, View, ViewId};
 use crate::workspace::{Axis, Layout, Pane, PaneId};
+use apex_syntax::SyntaxState;
 
 /// Options passed from the command line.
 #[derive(Debug, Clone, Default)]
@@ -109,6 +110,8 @@ pub struct ApexApp {
     last_focus_check: Instant,
     pub fullscreen: bool,
     distraction_free: bool,
+    syntax: HashMap<DocId, SyntaxState>,
+    pending_repaint: bool,
 }
 
 const MAX_RECENT: usize = 30;
@@ -160,6 +163,8 @@ impl ApexApp {
             last_focus_check: Instant::now(),
             fullscreen: false,
             distraction_free: false,
+            syntax: HashMap::new(),
+            pending_repaint: false,
         };
         app.load_recent();
         for (path, line, col) in &args.files {
@@ -353,6 +358,9 @@ impl ApexApp {
             pane.remove(vid);
         }
         let doc_still_viewed = self.views.values().any(|v| v.doc == view.doc);
+        if !doc_still_viewed {
+            self.syntax.remove(&view.doc);
+        }
         if !doc_still_viewed
             && let Some(doc) = self.docs.remove(&view.doc)
             && let Some(p) = doc.path
@@ -1141,9 +1149,49 @@ impl ApexApp {
                 let v = view!();
                 self.with_view(v, |view, doc| view.select_words(doc));
             }
-            Command::SelectBrackets | Command::SelectScope => {
+            Command::SelectBrackets => {
                 let v = view!();
                 self.with_view(v, |view, doc| view.select_to_brackets(doc));
+            }
+            Command::SelectScope => {
+                let (v, d) = match active {
+                    Some(a) => a,
+                    None => return,
+                };
+                self.ensure_syntax(d);
+                let Some(doc) = self.docs.get(&d) else { return };
+                let rope = doc.rope();
+                let ranges_of = |st: &SyntaxState, sel: &Selection| -> Option<Selection> {
+                    let byte = rope.char_to_byte(sel.head.min(rope.len_chars()));
+                    for (a, b) in st.enclosing_ranges(byte) {
+                        let (ca, cb) = (rope.byte_to_char(a), rope.byte_to_char(b));
+                        if ca < sel.start() || cb > sel.end() {
+                            return Some(Selection::new(ca, cb));
+                        }
+                    }
+                    None
+                };
+                if let Some(st) = self.syntax.get(&d).filter(|st| st.has_tree()) {
+                    let mut ns = self.views[&v].sels.clone();
+                    ns.transform(|sel| ranges_of(st, &sel).unwrap_or(sel));
+                    if let Some(view) = self.views.get_mut(&v) {
+                        view.push_selection_history();
+                        view.set_selections(ns);
+                    }
+                } else {
+                    self.with_view(v, |view, doc| view.select_to_brackets(doc));
+                }
+            }
+            Command::SetLanguage => {
+                if let (Some((_, d)), Some(id)) = (active, arg) {
+                    if let Some(doc) = self.docs.get_mut(&d) {
+                        doc.language_override = if id == "auto" { None } else { Some(id) };
+                    }
+                    self.syntax.remove(&d);
+                    for v in self.views.values_mut().filter(|v| v.doc == d) {
+                        v.cache.invalidate();
+                    }
+                }
             }
             Command::SelectIndentation => {
                 let v = view!();
@@ -1507,30 +1555,78 @@ impl ApexApp {
         self.docs.get(&d).map(|doc| doc.indent).unwrap_or_else(|| self.settings.indent())
     }
 
-    fn comment_prefix(&self, d: DocId) -> String {
-        let ext =
-            self.docs.get(&d).and_then(|doc| doc.path.as_ref()).and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        match ext.as_str() {
-            "py" | "rb" | "sh" | "bash" | "zsh" | "yaml" | "yml" | "toml" | "pl" | "ps1" | "r" | "cmake" | "mk" | "dockerfile" | "conf" | "ini" | "cfg" => "# ",
-            "lua" | "sql" | "hs" => "-- ",
-            "lisp" | "el" | "clj" | "scm" => "; ",
-            "tex" | "m" => "% ",
-            "vim" => "\" ",
-            "bat" => "REM ",
-            _ => "// ",
+    /// The language for a document: explicit override, else detection.
+    fn language_of(&self, d: DocId) -> &'static apex_syntax::LanguageDef {
+        let Some(doc) = self.docs.get(&d) else { return apex_syntax::lookup("plain").expect("registered") };
+        if let Some(l) = doc.language_override.as_deref().and_then(apex_syntax::lookup) {
+            return l;
         }
-        .to_string()
+        let first: String = doc.rope().line(0).chars().take(200).collect();
+        apex_syntax::detect(doc.path.as_deref(), &first)
+    }
+
+    /// Create the syntax state for a document if it does not exist yet.
+    fn ensure_syntax(&mut self, d: DocId) {
+        if self.syntax.contains_key(&d) {
+            return;
+        }
+        let lang = self.language_of(d);
+        if let Some(doc) = self.docs.get_mut(&d) {
+            let st = SyntaxState::new(lang, doc, std::time::Duration::from_millis(12));
+            self.syntax.insert(d, st);
+        }
+    }
+
+    fn comment_prefix(&self, d: DocId) -> String {
+        let lang = self.language_of(d);
+        lang.line_comment.map(str::to_string).unwrap_or_else(|| "// ".into())
     }
 
     fn block_comment(&self, d: DocId) -> (String, String) {
-        let ext =
-            self.docs.get(&d).and_then(|doc| doc.path.as_ref()).and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        match ext.as_str() {
-            "html" | "xml" | "svg" | "md" | "vue" => ("<!--".into(), "-->".into()),
-            "py" => ("\"\"\"".into(), "\"\"\"".into()),
-            "lua" | "hs" => ("--[[".into(), "]]".into()),
-            _ => ("/*".into(), "*/".into()),
+        let lang = self.language_of(d);
+        let (o, c) = lang.block_comment.unwrap_or(("/*", "*/"));
+        (o.into(), c.into())
+    }
+
+    /// Highlight spans for the lines `first..last`, as the editor widget wants them.
+    fn highlight_lines(&mut self, d: DocId, first: usize, last: usize) -> HashMap<usize, Vec<(usize, usize, crate::theme::SyntaxStyle)>> {
+        self.ensure_syntax(d);
+        let mut out = HashMap::new();
+        let Some(st) = self.syntax.get_mut(&d) else { return out };
+        let Some(doc) = self.docs.get_mut(&d) else { return out };
+        let changed = st.update(doc, std::time::Duration::from_millis(8));
+        if changed {
+            for v in self.views.values_mut().filter(|v| v.doc == d) {
+                v.cache.invalidate();
+            }
         }
+        let muted = self.settings.muted_syntax || self.settings.low_distraction;
+        let fg = self.theme.editor.foreground;
+        for line in first..last {
+            let spans: Vec<(usize, usize, crate::theme::SyntaxStyle)> = st
+                .spans_for_line(doc, line)
+                .iter()
+                .filter_map(|sp| {
+                    let mut style = self.theme.syntax_style(sp.scope)?;
+                    if muted {
+                        style.fg = egui::Color32::from_rgb(
+                            (style.fg.r() as u16 + fg.r() as u16 * 2) as u8 / 3,
+                            (style.fg.g() as u16 + fg.g() as u16 * 2) as u8 / 3,
+                            (style.fg.b() as u16 + fg.b() as u16 * 2) as u8 / 3,
+                        );
+                    }
+                    Some((sp.start, sp.end, style))
+                })
+                .collect();
+            if !spans.is_empty() {
+                out.insert(line, spans);
+            }
+        }
+        if st.is_parsing_in_background() {
+            // Poll again soon so highlights appear when the parse finishes.
+            self.pending_repaint = true;
+        }
+        out
     }
 
     fn current_dir(&self) -> Option<PathBuf> {
@@ -2259,7 +2355,7 @@ impl ApexApp {
             right.push(doc.indent.label());
             right.push(doc.encoding.label());
             right.push(if doc.mixed_line_endings { format!("{} (mixed)", doc.line_ending.label()) } else { doc.line_ending.label().to_string() });
-            right.push(doc.language_override.clone().unwrap_or_else(|| language_name_for(doc.path.as_deref())));
+            right.push(if doc.language_override.as_deref() == Some("hex") { "Hex".to_string() } else { self.language_of(d).name.to_string() });
             if doc.read_only {
                 right.push("Read-only".into());
             }
@@ -2327,7 +2423,19 @@ impl ApexApp {
                 }
             }
             _ => {
-                ui.label("Syntax selection arrives with the language milestone");
+                ui.label("Set syntax");
+                if ui.button("Auto-detect").clicked() {
+                    q.push((Command::SetLanguage, Some("auto".into())));
+                    ui.close();
+                }
+                egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                    for l in apex_syntax::languages().iter().filter(|l| l.id != "markdown_inline" && l.id != "regex") {
+                        if ui.button(l.name).clicked() {
+                            q.push((Command::SetLanguage, Some(l.id.to_string())));
+                            ui.close();
+                        }
+                    }
+                });
             }
         }
     }
@@ -2748,11 +2856,23 @@ impl ApexApp {
             }
         }
         // The view may have been closed by a command.
+        let Some(did) = self.views.get(&vid).map(|v| v.doc) else { return };
+        let (first, last) = {
+            let Some(view) = self.views.get_mut(&vid) else { return };
+            let Some(doc) = self.docs.get(&did) else { return };
+            view.sync(doc);
+            editor::scroll_to_cursor(inner, view, doc, &style);
+            let geo = editor::geometry(inner, doc, &style);
+            let first = geo.first_visible_line(view.scroll.y);
+            (first, (first + geo.visible_line_count()).min(geo.total_lines))
+        };
+        let spans = self.highlight_lines(did, first, last);
+        let highlight = move |line: usize| spans.get(&line).cloned().unwrap_or_default();
         if let Some(view) = self.views.get_mut(&vid)
-            && let Some(doc) = self.docs.get(&view.doc)
+            && let Some(doc) = self.docs.get(&did)
         {
             view.sync(doc);
-            editor::paint(&mut ui, inner, view, doc, &style, None);
+            editor::paint(&mut ui, inner, view, doc, &style, Some(&highlight));
         }
     }
 
@@ -2947,6 +3067,9 @@ impl eframe::App for ApexApp {
         self.show_dialogs(&ctx);
         self.show_editor_context_menu(&ctx);
         self.update_title(&ctx);
+        if std::mem::take(&mut self.pending_repaint) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         if self.dialog.is_none() && !self.find.open && ctx.memory(|m| m.focused()).is_none() {
             self.focus_active_editor(&ctx);
         }
@@ -2974,42 +3097,6 @@ fn parse_line_col(s: &str) -> Option<(usize, usize)> {
     let line = it.next()?.trim().parse().ok()?;
     let col = it.next().and_then(|c| c.trim().parse().ok()).unwrap_or(1);
     Some((line, col))
-}
-
-fn language_name_for(path: Option<&Path>) -> String {
-    let ext = path.and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    match ext.as_str() {
-        "rs" => "Rust",
-        "py" => "Python",
-        "js" | "mjs" | "cjs" => "JavaScript",
-        "ts" => "TypeScript",
-        "tsx" => "TSX",
-        "jsx" => "JSX",
-        "json" => "JSON",
-        "toml" => "TOML",
-        "yaml" | "yml" => "YAML",
-        "md" | "markdown" => "Markdown",
-        "html" | "htm" => "HTML",
-        "css" => "CSS",
-        "scss" => "SCSS",
-        "c" | "h" => "C",
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "C++",
-        "go" => "Go",
-        "java" => "Java",
-        "kt" => "Kotlin",
-        "swift" => "Swift",
-        "cs" => "C#",
-        "php" => "PHP",
-        "rb" => "Ruby",
-        "lua" => "Lua",
-        "sh" | "bash" | "zsh" => "Shell",
-        "ps1" => "PowerShell",
-        "sql" => "SQL",
-        "xml" | "svg" => "XML",
-        "diff" | "patch" => "Diff",
-        _ => "Plain Text",
-    }
-    .to_string()
 }
 
 fn local_datetime_string() -> String {

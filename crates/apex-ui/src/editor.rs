@@ -476,6 +476,39 @@ fn scrollbar_jump(geo: &Geometry, view: &mut View, y: f32) {
     view.scroll.y = (frac * geo.content_height - visible * frac).clamp(0.0, geo.max_scroll_y());
 }
 
+/// Adjust the scroll offset so the primary caret is visible (or centred).
+/// Uses display columns for the x estimate so no text layout is needed.
+pub fn scroll_to_cursor(rect: Rect, view: &mut View, doc: &Document, style: &EditorStyle) {
+    if !(view.want_cursor_visible || view.want_centre) {
+        return;
+    }
+    let geo = geometry(rect, doc, style);
+    let rope = doc.rope();
+    let lh = geo.line_height;
+    let head = view.sels.primary().head.min(rope.len_chars());
+    let line = rope.char_to_line(head);
+    let top = line as f32 * lh;
+    let margin = if view.want_centre { geo.text.height() / 2.0 - lh / 2.0 } else { lh };
+    if view.want_centre {
+        view.scroll.y = top - margin;
+    } else if top - lh < view.scroll.y {
+        view.scroll.y = (top - margin).max(0.0);
+    } else if top + lh * 2.0 > view.scroll.y + geo.text.height() {
+        view.scroll.y = top + lh * 2.0 - geo.text.height();
+    }
+    let col = head - rope.line_to_char(line);
+    let x = char_col_to_display_col(rope.line(line), col, style.settings.tab_width) as f32 * style.char_width;
+    if x < view.scroll.x + style.char_width {
+        view.scroll.x = (x - style.char_width * 4.0).max(0.0);
+    } else if x > view.scroll.x + geo.text.width() - TEXT_PAD * 2.0 - style.char_width {
+        view.scroll.x = x - geo.text.width() + TEXT_PAD * 2.0 + style.char_width * 4.0;
+    }
+    view.scroll.y = view.scroll.y.clamp(0.0, geo.max_scroll_y());
+    view.scroll.x = view.scroll.x.max(0.0);
+    view.want_cursor_visible = false;
+    view.want_centre = false;
+}
+
 /// Paint the view. Returns the geometry used (for the status bar etc.).
 pub fn paint(ui: &mut Ui, rect: Rect, view: &mut View, doc: &Document, style: &EditorStyle, highlight: Option<&HighlightFn>) -> Geometry {
     let geo = geometry(rect, doc, style);
@@ -488,29 +521,7 @@ pub fn paint(ui: &mut Ui, rect: Rect, view: &mut View, doc: &Document, style: &E
     view.lines_per_page = ((geo.text.height() / lh).floor() as usize).max(1);
     view.last_rect = rect;
 
-    // Scroll to cursor before computing visible range.
-    if view.want_cursor_visible || view.want_centre {
-        let head = view.sels.primary().head.min(rope.len_chars());
-        let line = rope.char_to_line(head);
-        let top = line as f32 * lh;
-        let margin = if view.want_centre { geo.text.height() / 2.0 - lh / 2.0 } else { lh };
-        if view.want_centre {
-            view.scroll.y = top - margin;
-        } else if top - lh < view.scroll.y {
-            view.scroll.y = (top - margin).max(0.0);
-        } else if top + lh * 2.0 > view.scroll.y + geo.text.height() {
-            view.scroll.y = top + lh * 2.0 - geo.text.height();
-        }
-        let col = head - rope.line_to_char(line);
-        let x = layout_line(ui, view, doc, line, style, highlight).x_of(col);
-        if x < view.scroll.x + style.char_width {
-            view.scroll.x = (x - style.char_width * 4.0).max(0.0);
-        } else if x > view.scroll.x + geo.text.width() - TEXT_PAD * 2.0 - style.char_width {
-            view.scroll.x = x - geo.text.width() + TEXT_PAD * 2.0 + style.char_width * 4.0;
-        }
-        view.want_cursor_visible = false;
-        view.want_centre = false;
-    }
+    scroll_to_cursor(rect, view, doc, style);
     view.scroll.y = view.scroll.y.clamp(0.0, geo.max_scroll_y());
     view.scroll.x = view.scroll.x.max(0.0);
 
