@@ -19,6 +19,9 @@ regex.workspace = true
 ignore.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
+notify.workspace = true
+globset = "0.4"
+encoding_rs.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

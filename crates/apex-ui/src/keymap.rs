@@ -66,10 +66,10 @@ impl fmt::Display for KeyPress {
 
 fn key_label(k: Key) -> &'static str {
     match k {
-        Key::ArrowUp => "↑",
-        Key::ArrowDown => "↓",
-        Key::ArrowLeft => "←",
-        Key::ArrowRight => "→",
+        Key::ArrowUp => "Up",
+        Key::ArrowDown => "Down",
+        Key::ArrowLeft => "Left",
+        Key::ArrowRight => "Right",
         Key::Enter => "Enter",
         Key::Space => "Space",
         Key::Backspace => "Backspace",

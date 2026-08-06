@@ -30,7 +30,7 @@ telemetry, no account and no network dependency.
 
 ## Building
 
-Requirements: stable Rust 1.88 or newer (edition 2024). On Linux you also need
+Requirements: stable Rust 1.91 or newer (edition 2024). On Linux you also need
 the usual windowing development packages:
 
 ```sh

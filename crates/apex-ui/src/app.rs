@@ -28,7 +28,7 @@ pub struct StartupArgs {
 }
 
 #[derive(Debug, Clone)]
-enum Dialog {
+pub(crate) enum Dialog {
     /// Ask about unsaved changes before running `then`.
     ConfirmClose {
         views: Vec<ViewId>,
@@ -48,16 +48,24 @@ enum Dialog {
     },
     About,
     Issues(Vec<SettingsIssue>),
+    ConfirmDelete(PathBuf),
+    ConfirmReplaceInFiles,
+    Prompt {
+        title: String,
+        text: String,
+        kind: crate::workspace_ui::PromptKind,
+    },
+    Recovery(Vec<apex_project::session::RecoveryEntry>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum AfterClose {
+pub(crate) enum AfterClose {
     CloseViews,
     Quit,
 }
 
 #[derive(Debug, Default)]
-struct FindState {
+pub(crate) struct FindState {
     open: bool,
     replace_open: bool,
     needle: String,
@@ -73,7 +81,7 @@ struct FindState {
 }
 
 #[derive(Debug, Clone)]
-struct ClosedTab {
+pub(crate) struct ClosedTab {
     path: PathBuf,
     sels: SelectionSet,
     scroll: egui::Vec2,
@@ -82,36 +90,60 @@ struct ClosedTab {
 pub struct ApexApp {
     pub settings: Settings,
     pub theme: Theme,
-    themes: Vec<Theme>,
+    pub(crate) themes: Vec<Theme>,
     pub keymap: Keymap,
-    docs: HashMap<DocId, Document>,
-    views: HashMap<ViewId, View>,
-    panes: HashMap<PaneId, Pane>,
-    layout: Layout,
-    active_pane: PaneId,
-    next_pane_id: u64,
-    recent_files: VecDeque<PathBuf>,
-    closed_tabs: Vec<ClosedTab>,
-    status: Option<(String, Instant, bool)>,
-    dialog: Option<Dialog>,
-    queue: VecDeque<(Command, Option<String>)>,
-    untitled_counter: u32,
-    clipboard_history: VecDeque<String>,
+    pub(crate) docs: HashMap<DocId, Document>,
+    pub(crate) views: HashMap<ViewId, View>,
+    pub(crate) panes: HashMap<PaneId, Pane>,
+    pub(crate) layout: Layout,
+    pub(crate) active_pane: PaneId,
+    pub(crate) next_pane_id: u64,
+    pub(crate) recent_files: VecDeque<PathBuf>,
+    pub(crate) closed_tabs: Vec<ClosedTab>,
+    pub(crate) status: Option<(String, Instant, bool)>,
+    pub(crate) dialog: Option<Dialog>,
+    pub(crate) queue: VecDeque<(Command, Option<String>)>,
+    pub(crate) untitled_counter: u32,
+    pub(crate) clipboard_history: VecDeque<String>,
     /// Text last copied via a whole-line copy (no selection), for line-paste.
-    line_clipboard: Option<String>,
-    pending_paste_mode: Option<String>,
-    find: FindState,
-    font_zoom: i32,
-    quit_confirmed: bool,
-    settings_issues: Vec<SettingsIssue>,
-    fonts_applied: bool,
-    config_dir: PathBuf,
-    context_menu_at: Option<(ViewId, egui::Pos2)>,
-    last_focus_check: Instant,
+    pub(crate) line_clipboard: Option<String>,
+    pub(crate) pending_paste_mode: Option<String>,
+    pub(crate) find: FindState,
+    pub(crate) font_zoom: i32,
+    pub(crate) quit_confirmed: bool,
+    pub(crate) settings_issues: Vec<SettingsIssue>,
+    pub(crate) fonts_applied: bool,
+    pub(crate) config_dir: PathBuf,
+    pub(crate) context_menu_at: Option<(ViewId, egui::Pos2)>,
+    pub(crate) last_focus_check: Instant,
     pub fullscreen: bool,
-    distraction_free: bool,
-    syntax: HashMap<DocId, SyntaxState>,
-    pending_repaint: bool,
+    pub(crate) distraction_free: bool,
+    pub(crate) syntax: HashMap<DocId, SyntaxState>,
+    pub(crate) pending_repaint: bool,
+    pub(crate) roots: Vec<PathBuf>,
+    pub(crate) project_file: Option<PathBuf>,
+    pub(crate) sidebar: crate::sidebar::Sidebar,
+    pub(crate) index: apex_project::index::FileIndex,
+    pub(crate) index_scan: Option<apex_project::index::IndexScan>,
+    pub(crate) watcher: Option<apex_project::watch::FsWatcher>,
+    pub(crate) rescan_at: Option<Instant>,
+    pub(crate) palette: crate::palette::Palette,
+    pub(crate) palette_preview: Option<ViewId>,
+    pub(crate) fif: crate::find_in_files::FindInFiles,
+    pub(crate) panel_open: bool,
+    pub(crate) recent_commands: VecDeque<Command>,
+    pub(crate) recent_projects: VecDeque<PathBuf>,
+    pub(crate) jumps: Vec<(DocId, SelectionSet)>,
+    pub(crate) jump_pos: usize,
+    pub(crate) recovery_ids: HashMap<DocId, (String, u64)>,
+    pub(crate) last_recovery: Instant,
+    pub(crate) last_session_save: Instant,
+    pub(crate) macro_recording: Option<Vec<crate::workspace_ui::MacroStep>>,
+    pub(crate) last_macro: Vec<crate::workspace_ui::MacroStep>,
+    pub(crate) macros: std::collections::BTreeMap<String, Vec<crate::workspace_ui::MacroStep>>,
+    pub(crate) symbols: crate::symbol_index::ProjectSymbols,
+    pub(crate) symbol_scan: Option<crate::symbol_index::SymbolScan>,
+    pub(crate) dragging_tab: Option<(ViewId, PaneId)>,
 }
 
 const MAX_RECENT: usize = 30;
@@ -165,8 +197,41 @@ impl ApexApp {
             distraction_free: false,
             syntax: HashMap::new(),
             pending_repaint: false,
+            roots: Vec::new(),
+            project_file: None,
+            sidebar: crate::sidebar::Sidebar::new(Default::default()),
+            index: Default::default(),
+            index_scan: None,
+            watcher: None,
+            rescan_at: None,
+            palette: Default::default(),
+            palette_preview: None,
+            fif: Default::default(),
+            panel_open: false,
+            recent_commands: VecDeque::new(),
+            recent_projects: VecDeque::new(),
+            jumps: Vec::new(),
+            jump_pos: 0,
+            recovery_ids: HashMap::new(),
+            last_recovery: Instant::now(),
+            last_session_save: Instant::now(),
+            macro_recording: None,
+            last_macro: Vec::new(),
+            macros: Default::default(),
+            symbols: Default::default(),
+            symbol_scan: None,
+            dragging_tab: None,
         };
         app.load_recent();
+        app.load_macros();
+        if app.settings.restore_session
+            && let Some(session) = apex_project::session::Session::load()
+        {
+            app.restore_session(session);
+        }
+        for folder in &args.folders {
+            app.add_root(folder);
+        }
         for (path, line, col) in &args.files {
             if let Some(v) = app.open_path(path)
                 && let Some(l) = line
@@ -179,11 +244,13 @@ impl ApexApp {
         }
         if !app.settings_issues.is_empty() {
             app.dialog = Some(Dialog::Issues(app.settings_issues.clone()));
+        } else {
+            app.startup_recovery_check();
         }
         app
     }
 
-    fn pick_theme(themes: &[Theme], name: &str, config_dir: &Path) -> Theme {
+    pub(crate) fn pick_theme(themes: &[Theme], name: &str, config_dir: &Path) -> Theme {
         // User themes in <config>/themes/*.toml may add or override.
         let mut all: Vec<Theme> = themes.to_vec();
         if let Ok(rd) = std::fs::read_dir(config_dir.join("themes")) {
@@ -208,16 +275,16 @@ impl ApexApp {
 
     // ----- documents and views ------------------------------------------
 
-    fn active_view_id(&self) -> Option<ViewId> {
+    pub(crate) fn active_view_id(&self) -> Option<ViewId> {
         self.panes.get(&self.active_pane)?.active_view()
     }
 
-    fn active_ids(&self) -> Option<(ViewId, DocId)> {
+    pub(crate) fn active_ids(&self) -> Option<(ViewId, DocId)> {
         let v = self.active_view_id()?;
         Some((v, self.views.get(&v)?.doc))
     }
 
-    fn new_untitled(&mut self) -> ViewId {
+    pub(crate) fn new_untitled(&mut self) -> ViewId {
         self.untitled_counter += 1;
         let mut doc = Document::empty();
         doc.untitled_index = Some(self.untitled_counter);
@@ -232,7 +299,7 @@ impl ApexApp {
         self.add_document(doc)
     }
 
-    fn add_document(&mut self, doc: Document) -> ViewId {
+    pub(crate) fn add_document(&mut self, doc: Document) -> ViewId {
         let id = doc.id;
         let rev = doc.revision();
         self.docs.insert(id, doc);
@@ -248,7 +315,8 @@ impl ApexApp {
     pub fn open_path(&mut self, path: &Path) -> Option<ViewId> {
         let path = normalise_path(path);
         if path.is_dir() {
-            self.set_status(format!("{} is a folder (folder support arrives with the sidebar)", path.display()), true);
+            self.add_root(&path);
+            self.settings.sidebar = true;
             return None;
         }
         // Already open?
@@ -314,7 +382,7 @@ impl ApexApp {
 
     /// Opening a file into a window whose only tab is an empty untitled
     /// document replaces that tab.
-    fn replace_pristine_untitled(&mut self, keep: ViewId) {
+    pub(crate) fn replace_pristine_untitled(&mut self, keep: ViewId) {
         let pane = self.panes.get(&self.active_pane).cloned().unwrap_or_default();
         if pane.tabs.len() != 2 {
             return;
@@ -328,7 +396,7 @@ impl ApexApp {
         }
     }
 
-    fn focus_view(&mut self, vid: ViewId) {
+    pub(crate) fn focus_view(&mut self, vid: ViewId) {
         for (pid, pane) in &mut self.panes {
             if pane.tabs.contains(&vid) {
                 pane.activate(vid);
@@ -341,7 +409,7 @@ impl ApexApp {
         }
     }
 
-    fn goto_line_col(&mut self, vid: ViewId, line: usize, col: usize) {
+    pub(crate) fn goto_line_col(&mut self, vid: ViewId, line: usize, col: usize) {
         let Some(view) = self.views.get_mut(&vid) else { return };
         let Some(doc) = self.docs.get(&view.doc) else { return };
         let rope = doc.rope();
@@ -352,7 +420,7 @@ impl ApexApp {
         view.want_centre = true;
     }
 
-    fn close_view_now(&mut self, vid: ViewId) {
+    pub(crate) fn close_view_now(&mut self, vid: ViewId) {
         let Some(view) = self.views.remove(&vid) else { return };
         for pane in self.panes.values_mut() {
             pane.remove(vid);
@@ -360,6 +428,7 @@ impl ApexApp {
         let doc_still_viewed = self.views.values().any(|v| v.doc == view.doc);
         if !doc_still_viewed {
             self.syntax.remove(&view.doc);
+            self.forget_recovery(view.doc);
         }
         if !doc_still_viewed
             && let Some(doc) = self.docs.remove(&view.doc)
@@ -373,7 +442,7 @@ impl ApexApp {
     }
 
     /// Close views, prompting for each dirty document.
-    fn request_close(&mut self, views: Vec<ViewId>, then: AfterClose) {
+    pub(crate) fn request_close(&mut self, views: Vec<ViewId>, then: AfterClose) {
         let dirty: Vec<ViewId> = views
             .iter()
             .copied()
@@ -395,7 +464,7 @@ impl ApexApp {
         }
     }
 
-    fn finish_close(&mut self, views: Vec<ViewId>, then: AfterClose) {
+    pub(crate) fn finish_close(&mut self, views: Vec<ViewId>, then: AfterClose) {
         for v in views {
             self.close_view_now(v);
         }
@@ -420,17 +489,17 @@ impl ApexApp {
         self.status = Some((msg, Instant::now(), is_error));
     }
 
-    fn recent_path(&self) -> PathBuf {
+    pub(crate) fn recent_path(&self) -> PathBuf {
         apex_project::paths::data_dir().join("recent.txt")
     }
 
-    fn load_recent(&mut self) {
+    pub(crate) fn load_recent(&mut self) {
         if let Ok(s) = std::fs::read_to_string(self.recent_path()) {
             self.recent_files = s.lines().filter(|l| !l.is_empty()).map(PathBuf::from).take(MAX_RECENT).collect();
         }
     }
 
-    fn push_recent(&mut self, path: &Path) {
+    pub(crate) fn push_recent(&mut self, path: &Path) {
         self.recent_files.retain(|p| p != path);
         self.recent_files.push_front(path.to_path_buf());
         self.recent_files.truncate(MAX_RECENT);
@@ -444,7 +513,7 @@ impl ApexApp {
 
     // ----- saving ---------------------------------------------------------
 
-    fn save_view(&mut self, vid: ViewId, force: bool) -> bool {
+    pub(crate) fn save_view(&mut self, vid: ViewId, force: bool) -> bool {
         let Some(view) = self.views.get(&vid) else { return false };
         let did = view.doc;
         let Some(doc) = self.docs.get(&did) else { return false };
@@ -467,6 +536,7 @@ impl ApexApp {
                 doc.mark_saved();
                 doc.read_only = false;
                 let enc = doc.encoding;
+                self.forget_recovery(did);
                 let msg = if lossy {
                     format!("Saved {} (some characters could not be encoded as {enc} and were replaced)", path.display())
                 } else {
@@ -486,7 +556,7 @@ impl ApexApp {
         }
     }
 
-    fn save_view_as(&mut self, vid: ViewId) -> bool {
+    pub(crate) fn save_view_as(&mut self, vid: ViewId) -> bool {
         let Some(view) = self.views.get(&vid) else { return false };
         let did = view.doc;
         let Some(doc) = self.docs.get(&did) else { return false };
@@ -521,7 +591,7 @@ impl ApexApp {
     // ----- editing ----------------------------------------------------------
 
     /// Run an editing operation on a view and apply its result.
-    fn run_edit(&mut self, vid: ViewId, f: impl FnOnce(&Document, &SelectionSet) -> Option<EditResult>) -> bool {
+    pub(crate) fn run_edit(&mut self, vid: ViewId, f: impl FnOnce(&Document, &SelectionSet) -> Option<EditResult>) -> bool {
         let Some(view) = self.views.get_mut(&vid) else { return false };
         let Some(doc) = self.docs.get_mut(&view.doc) else { return false };
         view.sync(doc);
@@ -541,20 +611,22 @@ impl ApexApp {
             view.cache.invalidate();
             view.want_cursor_visible = true;
             view.quick_add_word_mode = false;
+            self.make_permanent(vid);
             true
         } else {
             false
         }
     }
 
-    fn with_view<R>(&mut self, vid: ViewId, f: impl FnOnce(&mut View, &Document) -> R) -> Option<R> {
+    pub(crate) fn with_view<R>(&mut self, vid: ViewId, f: impl FnOnce(&mut View, &Document) -> R) -> Option<R> {
         let view = self.views.get_mut(&vid)?;
         let doc = self.docs.get(&view.doc)?;
         view.sync(doc);
         Some(f(view, doc))
     }
 
-    fn insert_text(&mut self, vid: ViewId, text: &str) {
+    pub(crate) fn insert_text(&mut self, vid: ViewId, text: &str) {
+        self.record_step(crate::workspace_ui::MacroStep::Insert(text.to_string()));
         let opts = InsertOptions {
             auto_pair: self.settings.auto_pair,
             auto_indent: self.settings.auto_indent,
@@ -563,7 +635,7 @@ impl ApexApp {
         self.run_edit(vid, |d, s| ops::insert_text(d, s, text, opts));
     }
 
-    fn copy_selection(&mut self, ctx: &egui::Context, vid: ViewId, cut: bool) {
+    pub(crate) fn copy_selection(&mut self, ctx: &egui::Context, vid: ViewId, cut: bool) {
         let Some(view) = self.views.get(&vid) else { return };
         let Some(doc) = self.docs.get(&view.doc) else { return };
         let rope = doc.rope();
@@ -602,7 +674,7 @@ impl ApexApp {
         }
     }
 
-    fn paste_text(&mut self, vid: ViewId, text: String, indent: bool) {
+    pub(crate) fn paste_text(&mut self, vid: ViewId, text: String, indent: bool) {
         let is_line = self.line_clipboard.as_deref() == Some(text.as_str());
         if is_line && self.views.get(&vid).is_some_and(|v| v.sels.iter().all(|s| s.is_empty())) {
             // Paste whole lines above the caret line, keeping the caret put.
@@ -667,7 +739,13 @@ impl ApexApp {
         self.queue.push_back((cmd, None));
     }
 
-    fn execute(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) {
+    pub(crate) fn execute(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) {
+        if cmd.is_recordable() {
+            self.record_step(crate::workspace_ui::MacroStep::Command(cmd, arg.clone()));
+        }
+        if self.execute_workspace(ctx, cmd, arg.clone()) {
+            return;
+        }
         let active = self.active_ids();
         let tab_width = self.settings.tab_width;
         macro_rules! view {
@@ -701,7 +779,6 @@ impl ApexApp {
                     }
                 }
             }
-            Command::OpenFolder | Command::AddFolder => self.set_status("Folder workspaces arrive in the next milestone".into(), false),
             Command::OpenRecent => {
                 if let Some(a) = arg {
                     self.open_path(Path::new(&a));
@@ -1551,12 +1628,12 @@ impl ApexApp {
         }
     }
 
-    fn doc_indent(&self, d: DocId) -> apex_edit::IndentSettings {
+    pub(crate) fn doc_indent(&self, d: DocId) -> apex_edit::IndentSettings {
         self.docs.get(&d).map(|doc| doc.indent).unwrap_or_else(|| self.settings.indent())
     }
 
     /// The language for a document: explicit override, else detection.
-    fn language_of(&self, d: DocId) -> &'static apex_syntax::LanguageDef {
+    pub(crate) fn language_of(&self, d: DocId) -> &'static apex_syntax::LanguageDef {
         let Some(doc) = self.docs.get(&d) else { return apex_syntax::lookup("plain").expect("registered") };
         if let Some(l) = doc.language_override.as_deref().and_then(apex_syntax::lookup) {
             return l;
@@ -1566,7 +1643,7 @@ impl ApexApp {
     }
 
     /// Create the syntax state for a document if it does not exist yet.
-    fn ensure_syntax(&mut self, d: DocId) {
+    pub(crate) fn ensure_syntax(&mut self, d: DocId) {
         if self.syntax.contains_key(&d) {
             return;
         }
@@ -1577,19 +1654,19 @@ impl ApexApp {
         }
     }
 
-    fn comment_prefix(&self, d: DocId) -> String {
+    pub(crate) fn comment_prefix(&self, d: DocId) -> String {
         let lang = self.language_of(d);
         lang.line_comment.map(str::to_string).unwrap_or_else(|| "// ".into())
     }
 
-    fn block_comment(&self, d: DocId) -> (String, String) {
+    pub(crate) fn block_comment(&self, d: DocId) -> (String, String) {
         let lang = self.language_of(d);
         let (o, c) = lang.block_comment.unwrap_or(("/*", "*/"));
         (o.into(), c.into())
     }
 
     /// Highlight spans for the lines `first..last`, as the editor widget wants them.
-    fn highlight_lines(&mut self, d: DocId, first: usize, last: usize) -> HashMap<usize, Vec<(usize, usize, crate::theme::SyntaxStyle)>> {
+    pub(crate) fn highlight_lines(&mut self, d: DocId, first: usize, last: usize) -> HashMap<usize, Vec<(usize, usize, crate::theme::SyntaxStyle)>> {
         self.ensure_syntax(d);
         let mut out = HashMap::new();
         let Some(st) = self.syntax.get_mut(&d) else { return out };
@@ -1629,11 +1706,11 @@ impl ApexApp {
         out
     }
 
-    fn current_dir(&self) -> Option<PathBuf> {
+    pub(crate) fn current_dir(&self) -> Option<PathBuf> {
         self.active_ids().and_then(|(_, d)| self.docs.get(&d)).and_then(|d| d.path.as_ref()).and_then(|p| p.parent().map(Path::to_path_buf))
     }
 
-    fn reload_view(&mut self, vid: ViewId, encoding: Option<Encoding>) {
+    pub(crate) fn reload_view(&mut self, vid: ViewId, encoding: Option<Encoding>) {
         let Some(view) = self.views.get(&vid) else { return };
         let did = view.doc;
         let Some(path) = self.docs.get(&did).and_then(|d| d.path.clone()) else { return };
@@ -1660,30 +1737,30 @@ impl ApexApp {
         }
     }
 
-    fn invalidate_all_layouts(&mut self) {
+    pub(crate) fn invalidate_all_layouts(&mut self) {
         for v in self.views.values_mut() {
             v.cache.invalidate();
             v.cache.clear();
         }
     }
 
-    fn set_zoom(&mut self, steps: i32) {
+    pub(crate) fn set_zoom(&mut self, steps: i32) {
         self.font_zoom = steps.clamp(-8, 40);
         self.invalidate_all_layouts();
     }
 
-    fn set_ui_scale(&mut self, ctx: &egui::Context, scale: f32) {
+    pub(crate) fn set_ui_scale(&mut self, ctx: &egui::Context, scale: f32) {
         self.settings.ui_scale = scale.clamp(0.5, 3.0);
         ctx.set_zoom_factor(self.settings.ui_scale);
         self.invalidate_all_layouts();
     }
 
-    fn line_height(&self, ctx: &egui::Context) -> f32 {
+    pub(crate) fn line_height(&self, ctx: &egui::Context) -> f32 {
         let font = editor::font_for(&self.settings, self.font_zoom);
         editor::metrics(ctx, &font, self.settings.line_height).0
     }
 
-    fn focus_active_editor(&self, ctx: &egui::Context) {
+    pub(crate) fn focus_active_editor(&self, ctx: &egui::Context) {
         if let Some(v) = self.active_view_id() {
             ctx.memory_mut(|m| m.request_focus(v.egui_id()));
         }
@@ -1691,14 +1768,14 @@ impl ApexApp {
 
     // ----- panes ---------------------------------------------------------
 
-    fn new_pane(&mut self) -> PaneId {
+    pub(crate) fn new_pane(&mut self) -> PaneId {
         let id = PaneId(self.next_pane_id);
         self.next_pane_id += 1;
         self.panes.insert(id, Pane::default());
         id
     }
 
-    fn split_active(&mut self, axis: Axis) {
+    pub(crate) fn split_active(&mut self, axis: Axis) {
         let new = self.new_pane();
         let active = self.active_pane;
         if self.layout.split_leaf(active, new, axis) {
@@ -1713,7 +1790,7 @@ impl ApexApp {
         }
     }
 
-    fn set_layout_count(&mut self, count: usize, axis: Axis, grid: bool) {
+    pub(crate) fn set_layout_count(&mut self, count: usize, axis: Axis, grid: bool) {
         // Collapse to a single pane first, moving every tab into it.
         let ids = self.layout.pane_ids();
         let keep = ids[0];
@@ -1762,7 +1839,7 @@ impl ApexApp {
         }
     }
 
-    fn close_pane(&mut self, pane: PaneId) {
+    pub(crate) fn close_pane(&mut self, pane: PaneId) {
         if self.layout.pane_ids().len() <= 1 {
             return;
         }
@@ -1786,7 +1863,7 @@ impl ApexApp {
         }
     }
 
-    fn move_view_to_pane(&mut self, v: ViewId, target: PaneId) {
+    pub(crate) fn move_view_to_pane(&mut self, v: ViewId, target: PaneId) {
         for p in self.panes.values_mut() {
             p.remove(v);
         }
@@ -1796,11 +1873,11 @@ impl ApexApp {
 
     // ----- find -----------------------------------------------------------
 
-    fn find_has_focus(&self, ctx: &egui::Context) -> bool {
+    pub(crate) fn find_has_focus(&self, ctx: &egui::Context) -> bool {
         ctx.memory(|m| m.focused()).is_some_and(|id| id == egui::Id::new("apex-find-needle") || id == egui::Id::new("apex-find-replace"))
     }
 
-    fn update_matches(&mut self) {
+    pub(crate) fn update_matches(&mut self) {
         let Some((_, d)) = self.active_ids() else { return };
         let Some(doc) = self.docs.get(&d) else { return };
         let key = (d, doc.revision(), self.find.needle.clone(), self.find.options);
@@ -1820,7 +1897,7 @@ impl ApexApp {
         }
     }
 
-    fn find_step(&mut self, forward: bool) {
+    pub(crate) fn find_step(&mut self, forward: bool) {
         self.update_matches();
         let Some((v, _)) = self.active_ids() else { return };
         if self.find.matches.is_empty() {
@@ -1848,7 +1925,7 @@ impl ApexApp {
         }
     }
 
-    fn replace_next(&mut self) {
+    pub(crate) fn replace_next(&mut self) {
         self.update_matches();
         let Some((v, _)) = self.active_ids() else { return };
         let sel = self.views[&v].sels.primary();
@@ -1871,7 +1948,7 @@ impl ApexApp {
         self.find_step(true);
     }
 
-    fn replace_all(&mut self) {
+    pub(crate) fn replace_all(&mut self) {
         self.update_matches();
         let Some((v, _)) = self.active_ids() else { return };
         if self.find.matches.is_empty() {
@@ -1903,7 +1980,7 @@ impl ApexApp {
 
     // ----- external changes -------------------------------------------------
 
-    fn check_external_changes(&mut self) {
+    pub(crate) fn check_external_changes(&mut self) {
         let ids: Vec<DocId> = self.docs.keys().copied().collect();
         for d in ids {
             let doc = self.docs.get_mut(&d).expect("doc");
@@ -1936,7 +2013,7 @@ impl ApexApp {
 
     // ----- UI ---------------------------------------------------------------
 
-    fn show_menu_bar(&mut self, ui: &mut Ui) {
+    pub(crate) fn show_menu_bar(&mut self, ui: &mut Ui) {
         let km = &self.keymap;
         let item = |ui: &mut Ui, queue: &mut VecDeque<(Command, Option<String>)>, cmd: Command| {
             let b = egui::Button::new(cmd.name()).shortcut_text(km.shortcut_for(cmd).unwrap_or_default());
@@ -2119,6 +2196,8 @@ impl ApexApp {
                 ] {
                     item(ui, &mut q, c);
                 }
+                ui.separator();
+                item(ui, &mut q, Command::FindInFiles);
             });
             ui.menu_button("View", |ui| {
                 ui.menu_button("Layout", |ui| {
@@ -2173,6 +2252,11 @@ impl ApexApp {
             });
             ui.menu_button("Goto", |ui| {
                 for c in [
+                    Command::GotoAnything,
+                    Command::GotoSymbol,
+                    Command::GotoSymbolInProject,
+                    Command::NavigateBack,
+                    Command::NavigateForward,
                     Command::GotoLine,
                     Command::NextTab,
                     Command::PrevTab,
@@ -2184,8 +2268,42 @@ impl ApexApp {
                     item(ui, &mut q, c);
                 }
             });
+            ui.menu_button("Project", |ui| {
+                for c in [
+                    Command::OpenFolder,
+                    Command::AddFolder,
+                    Command::RemoveFolder,
+                    Command::CloseProject,
+                    Command::RefreshExplorer,
+                    Command::RevealActiveFile,
+                    Command::NewFileInFolder,
+                    Command::NewFolder,
+                ] {
+                    item(ui, &mut q, c);
+                }
+                ui.separator();
+                for c in [Command::OpenProject, Command::SaveProject, Command::RecentProjects, Command::OpenProjectSettings] {
+                    item(ui, &mut q, c);
+                }
+                ui.separator();
+                for c in [Command::RenameFile, Command::DuplicateFile, Command::DeleteFile] {
+                    item(ui, &mut q, c);
+                }
+            });
             ui.menu_button("Tools", |ui| {
-                for c in [Command::Settings, Command::OpenKeymapFile, Command::WordCount] {
+                for c in [
+                    Command::CommandPalette,
+                    Command::Settings,
+                    Command::OpenKeymapFile,
+                    Command::KeyboardShortcuts,
+                    Command::WordCount,
+                    Command::ShowRecovery,
+                    Command::ShowClipboardHistory,
+                ] {
+                    item(ui, &mut q, c);
+                }
+                ui.separator();
+                for c in [Command::RecordMacro, Command::PlayMacro, Command::SaveMacro, Command::RunNamedMacro] {
                     item(ui, &mut q, c);
                 }
             });
@@ -2196,7 +2314,7 @@ impl ApexApp {
         self.queue = q;
     }
 
-    fn show_tabs(&mut self, ui: &mut Ui, pane_id: PaneId) {
+    pub(crate) fn show_tabs(&mut self, ui: &mut Ui, pane_id: PaneId) {
         let theme = self.theme.clone();
         let Some(pane) = self.panes.get(&pane_id) else { return };
         let tabs = pane.tabs.clone();
@@ -2251,7 +2369,10 @@ impl ApexApp {
                 continue;
             }
             let id = ui.id().with(("tab", vid.0));
-            let resp = ui.interact(rect, id, egui::Sense::click());
+            let resp = ui.interact(rect, id, egui::Sense::click_and_drag());
+            if resp.drag_started() {
+                self.dragging_tab = Some((*vid, pane_id));
+            }
             let is_active = i == active;
             let bg = if is_active {
                 theme.ui.tab_active
@@ -2265,7 +2386,14 @@ impl ApexApp {
                 painter.rect_filled(Rect::from_min_size(rect.min, vec2(w, 2.0)), 0.0, theme.ui.accent);
             }
             painter.vline(rect.max.x - 0.5, rect.y_range(), egui::Stroke::new(1.0, theme.ui.border));
-            let colour = if is_active { theme.ui.tab_text_active } else { theme.ui.tab_text_inactive };
+            let preview = self.tab_is_preview(*vid);
+            let colour = if preview {
+                theme.ui.text_muted
+            } else if is_active {
+                theme.ui.tab_text_active
+            } else {
+                theme.ui.tab_text_inactive
+            };
             let mut title = doc.title();
             if pinned.contains(vid) {
                 title = format!("📌 {title}");
@@ -2311,6 +2439,65 @@ impl ApexApp {
                 }
             });
         }
+        // Drop a dragged tab onto this bar: reorder within the pane or move between panes.
+        if let Some((dragged, from)) = self.dragging_tab {
+            let pointer = ui.input(|i| i.pointer.interact_pos());
+            let released = ui.input(|i| i.pointer.primary_released());
+            if let Some(p) = pointer {
+                if bar_rect.contains(p) {
+                    // Insertion marker.
+                    let mut ix = bar_rect.min.x - tab_scroll;
+                    let mut insert_at = tabs.len();
+                    for (i, w) in widths.iter().enumerate() {
+                        if p.x < ix + w / 2.0 {
+                            insert_at = i;
+                            break;
+                        }
+                        ix += w;
+                    }
+                    let marker_x = bar_rect.min.x - tab_scroll + widths.iter().take(insert_at).sum::<f32>();
+                    painter.rect_filled(Rect::from_min_size(pos2(marker_x - 1.0, bar_rect.min.y + 4.0), vec2(2.0, bar_h - 8.0)), 1.0, theme.ui.accent);
+                    if released {
+                        let title = self.views.get(&dragged).and_then(|v| self.docs.get(&v.doc)).map(|d| d.title()).unwrap_or_default();
+                        let _ = title;
+                        if from == pane_id {
+                            if let Some(pane) = self.panes.get_mut(&pane_id)
+                                && let Some(cur) = pane.tabs.iter().position(|t| *t == dragged)
+                            {
+                                let target = if insert_at > cur { insert_at - 1 } else { insert_at };
+                                let t = pane.tabs.remove(cur);
+                                let target = target.min(pane.tabs.len());
+                                pane.tabs.insert(target, t);
+                                pane.active = target;
+                            }
+                        } else {
+                            for pane in self.panes.values_mut() {
+                                pane.remove(dragged);
+                            }
+                            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                                let at = insert_at.min(pane.tabs.len());
+                                pane.tabs.insert(at, dragged);
+                                pane.active = at;
+                            }
+                            self.active_pane = pane_id;
+                        }
+                        self.dragging_tab = None;
+                    }
+                } else if released {
+                    // Released somewhere else: a later pane may claim it this frame; otherwise it is cleared at frame end.
+                }
+                if self.dragging_tab.is_some() {
+                    let title = self.views.get(&dragged).and_then(|v| self.docs.get(&v.doc)).map(|d| d.title()).unwrap_or_default();
+                    ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tab-drag"))).text(
+                        p + vec2(12.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        title,
+                        font.clone(),
+                        theme.ui.text,
+                    );
+                }
+            }
+        }
         if let Some(v) = to_activate {
             self.active_pane = pane_id;
             self.focus_view(v);
@@ -2327,7 +2514,7 @@ impl ApexApp {
         }
     }
 
-    fn show_status_bar(&mut self, ui: &mut Ui) {
+    pub(crate) fn show_status_bar(&mut self, ui: &mut Ui) {
         let theme = self.theme.clone();
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), egui::Sense::hover());
         ui.painter().rect_filled(rect, 0.0, theme.ui.status_bar);
@@ -2395,7 +2582,7 @@ impl ApexApp {
         }
     }
 
-    fn status_item_menu(ui: &mut Ui, index: usize, q: &mut Vec<(Command, Option<String>)>) {
+    pub(crate) fn status_item_menu(ui: &mut Ui, index: usize, q: &mut Vec<(Command, Option<String>)>) {
         match index {
             0 => {
                 for c in [Command::ConvertIndentToSpaces, Command::ConvertIndentToTabs] {
@@ -2440,7 +2627,7 @@ impl ApexApp {
         }
     }
 
-    fn show_find_bar(&mut self, ui: &mut Ui) {
+    pub(crate) fn show_find_bar(&mut self, ui: &mut Ui) {
         let theme = self.theme.clone();
         egui::Frame::new().fill(theme.ui.panel).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -2533,9 +2720,13 @@ impl ApexApp {
         });
     }
 
-    fn show_dialogs(&mut self, ctx: &egui::Context) {
+    pub(crate) fn show_dialogs(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.dialog.clone() else { return };
         let mut close = false;
+        if matches!(dialog, Dialog::ConfirmDelete(_) | Dialog::ConfirmReplaceInFiles | Dialog::Prompt { .. } | Dialog::Recovery(_)) {
+            self.show_workspace_dialog(ctx, dialog);
+            return;
+        }
         match dialog {
             Dialog::ConfirmClose { views, then, index } => {
                 let Some(&vid) = views.get(index) else {
@@ -2721,6 +2912,7 @@ impl ApexApp {
                     close = true;
                 }
             }
+            Dialog::ConfirmDelete(_) | Dialog::ConfirmReplaceInFiles | Dialog::Prompt { .. } | Dialog::Recovery(_) => {}
             Dialog::Issues(issues) => {
                 let r = egui::Modal::new(egui::Id::new("issues")).show(ctx, |ui| {
                     ui.set_width(520.0);
@@ -2743,7 +2935,7 @@ impl ApexApp {
         }
     }
 
-    fn show_editor_context_menu(&mut self, ctx: &egui::Context) {
+    pub(crate) fn show_editor_context_menu(&mut self, ctx: &egui::Context) {
         let Some((vid, pos)) = self.context_menu_at else { return };
         let id = egui::Id::new(("editor-context", vid.0));
         let mut cmd = None;
@@ -2782,7 +2974,7 @@ impl ApexApp {
         }
     }
 
-    fn show_pane(&mut self, ui: &mut Ui, pane_id: PaneId, rect: Rect) {
+    pub(crate) fn show_pane(&mut self, ui: &mut Ui, pane_id: PaneId, rect: Rect) {
         let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
         ui.set_clip_rect(rect);
         let mut inner = rect;
@@ -2876,7 +3068,7 @@ impl ApexApp {
         }
     }
 
-    fn show_layout(&mut self, ui: &mut Ui, layout: Layout, rect: Rect, path: Vec<usize>) {
+    pub(crate) fn show_layout(&mut self, ui: &mut Ui, layout: Layout, rect: Rect, path: Vec<usize>) {
         match layout {
             Layout::Leaf(p) => self.show_pane(ui, p, rect),
             Layout::Split { axis, children, fractions } => {
@@ -2932,7 +3124,7 @@ impl ApexApp {
         }
     }
 
-    fn update_title(&self, ctx: &egui::Context) {
+    pub(crate) fn update_title(&self, ctx: &egui::Context) {
         let title = match self.active_ids() {
             Some((_, d)) => {
                 let doc = &self.docs[&d];
@@ -2952,7 +3144,7 @@ impl ApexApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
 
-    fn apply_fonts(&mut self, ctx: &egui::Context) {
+    pub(crate) fn apply_fonts(&mut self, ctx: &egui::Context) {
         if self.fonts_applied {
             return;
         }
@@ -2992,7 +3184,7 @@ impl eframe::App for ApexApp {
         self.apply_fonts(&ctx);
 
         // Global key handling for non-editor contexts (menus, find bar).
-        let editor_focused = self.active_view_id().is_some_and(|v| ctx.memory(|m| m.has_focus(v.egui_id())));
+        let editor_focused = self.active_view_id().is_some_and(|v| ctx.memory(|m| m.has_focus(v.egui_id()))) || self.palette.open;
         // egui drops a text field's focus on Escape before we run, so treat the
         // find bar as focused whenever it is open and the editor is not.
         let find_focused = self.find.open && !editor_focused && self.dialog.is_none();
@@ -3028,11 +3220,18 @@ impl eframe::App for ApexApp {
             }
         }
         if self.quit_confirmed {
+            self.save_session();
+            self.write_recovery_snapshots();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        self.poll_background(&ctx);
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         for p in dropped {
-            self.open_path(&p);
+            if p.is_dir() {
+                self.add_root(&p);
+            } else {
+                self.open_path(&p);
+            }
         }
 
         while let Some((c, arg)) = self.queue.pop_front() {
@@ -3055,6 +3254,31 @@ impl eframe::App for ApexApp {
                 self.show_find_bar(ui);
             });
         }
+        if self.panel_open && !self.distraction_free {
+            let panel_bg = self.theme.ui.panel;
+            egui::Panel::bottom("apex-panel")
+                .resizable(true)
+                .default_size(260.0)
+                .min_size(120.0)
+                .frame(egui::Frame::new().fill(panel_bg).inner_margin(egui::Margin::symmetric(8, 6)))
+                .show(ui, |ui| {
+                    self.show_bottom_panel(ui);
+                });
+        }
+        if self.settings.sidebar && !self.distraction_free {
+            let sidebar_bg = self.theme.ui.sidebar;
+            let width = self.sidebar.width;
+            let resp = egui::Panel::left("apex-sidebar")
+                .resizable(true)
+                .default_size(width)
+                .min_size(120.0)
+                .max_size(800.0)
+                .frame(egui::Frame::new().fill(sidebar_bg))
+                .show(ui, |ui| {
+                    self.show_sidebar(ui);
+                });
+            self.sidebar.width = resp.response.rect.width();
+        }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme_bg)).show(ui, |ui| {
             let rect = ui.available_rect_before_wrap();
             let layout = self.layout.clone();
@@ -3064,13 +3288,17 @@ impl eframe::App for ApexApp {
             self.execute(&ctx, c, arg);
             ctx.request_repaint();
         }
+        if self.dragging_tab.is_some() && ctx.input(|i| i.pointer.primary_released() || !i.pointer.any_down()) {
+            self.dragging_tab = None;
+        }
+        self.show_palette(&ctx);
         self.show_dialogs(&ctx);
         self.show_editor_context_menu(&ctx);
         self.update_title(&ctx);
         if std::mem::take(&mut self.pending_repaint) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
-        if self.dialog.is_none() && !self.find.open && ctx.memory(|m| m.focused()).is_none() {
+        if self.dialog.is_none() && !self.find.open && !self.palette.open && ctx.memory(|m| m.focused()).is_none() {
             self.focus_active_editor(&ctx);
         }
     }
@@ -3081,7 +3309,7 @@ impl eframe::App for ApexApp {
     }
 }
 
-fn normalise_path(p: &Path) -> PathBuf {
+pub(crate) fn normalise_path(p: &Path) -> PathBuf {
     let abs = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().map(|d| d.join(p)).unwrap_or_else(|_| p.to_path_buf()) };
     // Canonicalise the parent only, so a not-yet-existing file keeps its name
     // and symlinked files keep their link path (we write through links).
@@ -3091,7 +3319,7 @@ fn normalise_path(p: &Path) -> PathBuf {
     }
 }
 
-fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+pub(crate) fn parse_line_col(s: &str) -> Option<(usize, usize)> {
     let s = s.trim().trim_start_matches(':');
     let mut it = s.split(':');
     let line = it.next()?.trim().parse().ok()?;
@@ -3171,7 +3399,7 @@ fn hex_preview(bytes: &[u8]) -> String {
     out
 }
 
-fn reveal_in_file_manager(path: &Path) {
+pub(crate) fn reveal_in_file_manager(path: &Path) {
     #[cfg(target_os = "linux")]
     let cmd = std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn();
     #[cfg(target_os = "macos")]
@@ -3190,7 +3418,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_line_col() {
+    pub(crate) fn parses_line_col() {
         assert_eq!(parse_line_col("12"), Some((12, 1)));
         assert_eq!(parse_line_col("12:8"), Some((12, 8)));
         assert_eq!(parse_line_col(":7"), Some((7, 1)));
@@ -3198,13 +3426,13 @@ mod tests {
     }
 
     #[test]
-    fn civil_date() {
+    pub(crate) fn civil_date() {
         assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
         assert_eq!(civil_from_unix(1_700_000_000), (2023, 11, 14, 22, 13, 20));
     }
 
     #[test]
-    fn hex_preview_shape() {
+    pub(crate) fn hex_preview_shape() {
         let p = hex_preview(b"ABC\x00\xff");
         assert!(p.contains("41 42 43 00 ff"));
         assert!(p.contains("|ABC..|"));

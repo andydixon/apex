@@ -14,9 +14,18 @@ trap 'kill $APID 2>/dev/null; kill $XPID 2>/dev/null' EXIT
 sleep 1
 "$ROOT/target/debug/apex" "$FILE" > "$OUT.log" 2>&1 &
 APID=$!
-sleep 5
-WID=$(xdotool search --name "Apex" | head -1)
-xdotool windowfocus --sync "$WID"; sleep 0.3
+# Wait for the window to be mapped (slow under software rendering), then focus it:
+# without a window manager the X window must be focused explicitly.
+WID=""
+for _ in $(seq 1 60); do
+  WID=$( (xdotool search --onlyvisible --name "Apex" 2>/dev/null || true) | head -1)
+  [ -n "$WID" ] && break
+  sleep 0.5
+done
+[ -n "$WID" ] || { echo "Apex window did not appear"; exit 1; }
+sleep 1
+xdotool windowfocus --sync "$WID" 2>/dev/null || { sleep 1; xdotool windowfocus --sync "$WID"; }
+sleep 0.3
 for k in "$@"; do xdotool key --delay 80 "$k"; sleep 0.4; done
 sleep 0.6
 import -window root "$OUT"

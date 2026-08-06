@@ -17,6 +17,9 @@ toml.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 rfd.workspace = true
+nucleo-matcher.workspace = true
+crossbeam-channel.workspace = true
+serde_json.workspace = true
 
 encoding_rs.workspace = true
 eframe.workspace = true
