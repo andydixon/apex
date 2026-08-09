@@ -55,9 +55,9 @@ Updated: after Milestones 4–7 (workspace, navigation, search, language feature
 | Zoom, UI scale, line numbers, relative numbers, current line, rulers, indent guides, whitespace | I | |
 | Bracket matching highlight | V | text-based |
 | Distraction-free / zen / low-distraction modes | P | layout only |
-| Minimap | – | next |
-| Word wrap | – | next |
-| Code folding | P | regions computed (`apex-syntax::fold`), gutter UI next |
+| Minimap (token colours, viewport, click/drag, selection/search/git markers) | I | throttled rebuild |
+| Word wrap (visual-row caret motion, per-view toggle) | I | |
+| Code folding (syntax/indent regions, gutter controls, fold current/all/levels/comments) | I | selections never edit hidden text |
 | Sidebar / project explorer (lazy tree, filter, follow active, inline rename, context menu) | I | |
 | Preview tabs (single click), permanent on edit or double click | I | |
 | Tab drag to reorder and between panes | I | |

@@ -3336,15 +3336,15 @@ impl eframe::App for ApexApp {
                 if find_focused { vec![crate::keymap::Context::Find, crate::keymap::Context::Global] } else { vec![crate::keymap::Context::Global] };
             let events = ctx.input(|i| i.events.clone());
             for ev in events {
-                if let egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } = ev {
-                    if let crate::keymap::Dispatch::Command(c, arg) = self.keymap.dispatch_event(key, physical_key, modifiers, &active_ctx) {
-                        let plain = !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.mac_cmd;
-                        if !(plain && find_focused && !matches!(key, egui::Key::Enter | egui::Key::Escape | egui::Key::F3)) {
-                            self.queue.push_back((c, arg));
-                            // Stop the text field from also receiving the key's character (Alt+R → "r").
-                            let name = key.symbol_or_name().to_string();
-                            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t.eq_ignore_ascii_case(&name))));
-                        }
+                if let egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } = ev
+                    && let crate::keymap::Dispatch::Command(c, arg) = self.keymap.dispatch_event(key, physical_key, modifiers, &active_ctx)
+                {
+                    let plain = !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.mac_cmd;
+                    if !(plain && find_focused && !matches!(key, egui::Key::Enter | egui::Key::Escape | egui::Key::F3)) {
+                        self.queue.push_back((c, arg));
+                        // Stop the text field from also receiving the key's character (Alt+R → "r").
+                        let name = key.symbol_or_name().to_string();
+                        ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t.eq_ignore_ascii_case(&name))));
                     }
                 }
             }
