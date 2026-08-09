@@ -106,6 +106,10 @@ pub enum KeyParseError {
     Empty,
 }
 
+pub fn is_modifier_key(k: Key) -> bool {
+    matches!(k, Key::ShiftLeft | Key::ShiftRight | Key::ControlLeft | Key::ControlRight | Key::AltLeft | Key::AltRight | Key::SuperLeft | Key::SuperRight)
+}
+
 /// Parse `"ctrl+shift+p"` or a chord like `"ctrl+k ctrl+b"`.
 pub fn parse_chord(s: &str) -> Result<Chord, KeyParseError> {
     let mut presses = Vec::new();
@@ -328,6 +332,10 @@ impl Keymap {
     /// Feed a key press. `active` lists the contexts currently in effect, most
     /// specific first (e.g. `[Editor, Global]`).
     pub fn dispatch(&mut self, press: KeyPress, active: &[Context]) -> Dispatch {
+        // A modifier key on its own never binds and must not reset a pending chord.
+        if is_modifier_key(press.key) {
+            return Dispatch::Unbound;
+        }
         self.pending.push(press);
         let seq = self.pending.clone();
         // Exact match in the most specific context first.
@@ -343,6 +351,19 @@ impl Keymap {
         }
         self.pending.clear();
         Dispatch::Unbound
+    }
+
+    /// Dispatch a key event, falling back to the physical key when the logical
+    /// key (which changes with Shift and layouts, e.g. `{` for Shift+`[`) is unbound.
+    pub fn dispatch_event(&mut self, key: Key, physical: Option<Key>, modifiers: Modifiers, active: &[Context]) -> Dispatch {
+        let d = self.dispatch(KeyPress::from_egui(key, modifiers), active);
+        if d != Dispatch::Unbound {
+            return d;
+        }
+        match physical {
+            Some(p) if p != key && !is_modifier_key(p) => self.dispatch(KeyPress::from_egui(p, modifiers), active),
+            _ => Dispatch::Unbound,
+        }
     }
 
     pub fn pending(&self) -> &[KeyPress] {
@@ -408,6 +429,11 @@ mod tests {
         );
         let k = |s: &str| parse_press(s).unwrap();
         assert_eq!(km.dispatch(k("ctrl+k"), &[Context::Editor, Context::Global]), Dispatch::Pending);
+        // The physical modifier press between chord steps must not reset the chord.
+        assert_eq!(
+            km.dispatch(KeyPress { key: Key::ControlLeft, ctrl: true, alt: false, shift: false, cmd: false }, &[Context::Editor, Context::Global]),
+            Dispatch::Unbound
+        );
         assert_eq!(km.dispatch(k("ctrl+b"), &[Context::Editor, Context::Global]), Dispatch::Command(Command::ToggleSidebar, None));
         assert_eq!(km.dispatch(k("ctrl+s"), &[Context::Editor, Context::Global]), Dispatch::Command(Command::Save, None));
         assert_eq!(km.dispatch(k("ctrl+s"), &[Context::Find, Context::Global]), Dispatch::Unbound);

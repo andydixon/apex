@@ -14,7 +14,7 @@ so work can resume cleanly in a new session.
   key map.
 * Documents: `ARCHITECTURE.md`, `FEATURE_MATRIX.md`, this file.
 
-## Milestone 1 — Functional editor (in progress)
+## Milestone 1 — Functional editor (complete)
 
 Implemented:
 
@@ -38,8 +38,23 @@ cargo test -p apex-edit       38 passed
 cargo test -p apex-project     4 passed
 ```
 
-Next step: finish the first full workspace build (`cargo build`), fix any
-compile errors in `apex-ui`/`apex-app`, run `cargo test --workspace`,
-`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt`, then
-launch the editor against a real file for a manual smoke test (see
-`docs/development/manual-smoke-test.md`) and commit.
+Verified by the scripted Xvfb smoke test (`tests/visual/smoke.sh`): typing,
+undo, quick-add, column selection, find with regex error, split panes, atomic
+save; screenshots reviewed.
+
+## Milestones 2–7 (largely complete; see FEATURE_MATRIX.md)
+
+* Property tests for undo/redo, position mapping, grapheme safety, encodings.
+* Syntax: `apex-syntax` with 30 grammars, injections, folding regions, symbols;
+  all grammars load and their queries compile in a test.
+* Workspace: file explorer, index, watcher, sessions, recovery, Find in Files,
+  project files; palette and Goto Anything; macros; jump history.
+
+Test counts at this point: 109 passing (`cargo test --workspace`); clippy clean
+with `-D warnings`; `cargo fmt --check` clean.
+
+Screenshots reviewed: Rust and Markdown highlighting, sidebar with the repo
+open, Goto Anything with preview, command palette, Find in Files results.
+
+Next step: Milestone 3 leftovers (word wrap, folding gutter UI, minimap), then
+Git (Milestone 8), build tasks and LSP (Milestone 9).

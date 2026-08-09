@@ -30,10 +30,16 @@ impl ViewId {
 /// One laid-out document line.
 pub struct LineLayout {
     pub galley: Arc<Galley>,
+    /// Number of visual rows (1 unless soft-wrapped).
+    pub rows: usize,
     /// `map[doc_col] = galley char index`, present only when the line contains
     /// tabs (which are expanded to spaces for layout) or other substituted chars.
     pub map: Option<Vec<u32>>,
     pub epoch: u64,
+    /// Built with syntax colours (a plain layout is replaced once colours are available).
+    pub highlighted: bool,
+    /// Wrap width the layout was produced for (`None` = no wrapping).
+    pub wrap_width: Option<f32>,
 }
 
 impl LineLayout {
@@ -136,13 +142,24 @@ pub struct View {
     pub blink_epoch: f64,
     pub ime_preedit: Option<(String, usize)>,
     pub lines_per_page: usize,
+    /// First document line at the top of the viewport and the visual row within it.
+    pub top_line: usize,
+    pub top_row: usize,
+    /// Sub-row pixel offset accumulated from smooth scrolling.
+    pub scroll_remainder: f32,
+    /// Folded regions as char anchors `(start_of_first_line, start_of_last_line)`;
+    /// lines strictly between are hidden. Kept in document order.
+    pub fold_anchors: Vec<(usize, usize)>,
     /// Selection sets prior to multi-cursor additions, for "undo selection".
     pub selection_history: Vec<SelectionSet>,
     /// Quick Add Next started from a word expansion, so further additions match whole words.
     pub quick_add_word_mode: bool,
     pub last_rect: egui::Rect,
-    pub folds: Vec<(usize, usize)>,
+    /// Cached minimap shapes: (key, shapes, built at, epoch).
+    pub minimap_cache: Option<(MinimapKey, Vec<egui::Shape>, std::time::Instant, u64)>,
 }
+
+pub type MinimapKey = (u64, usize, usize, usize, bool);
 
 impl View {
     pub fn new(doc: DocId, revision: u64) -> Self {
@@ -162,10 +179,14 @@ impl View {
             blink_epoch: 0.0,
             ime_preedit: None,
             lines_per_page: 40,
+            top_line: 0,
+            top_row: 0,
+            scroll_remainder: 0.0,
+            fold_anchors: Vec::new(),
             selection_history: Vec::new(),
             quick_add_word_mode: false,
             last_rect: egui::Rect::NOTHING,
-            folds: Vec::new(),
+            minimap_cache: None,
         }
     }
 
@@ -174,6 +195,9 @@ impl View {
         let mut v = Self::new(self.doc, self.seen_revision);
         v.sels = self.sels.clone();
         v.scroll = self.scroll;
+        v.top_line = self.top_line;
+        v.top_row = self.top_row;
+        v.fold_anchors = self.fold_anchors.clone();
         v.zoom_steps = self.zoom_steps;
         v
     }
@@ -183,8 +207,111 @@ impl View {
     pub fn sync(&mut self, doc: &Document) {
         if self.seen_revision != doc.revision() {
             doc.sync_selections(&mut self.sels, self.seen_revision);
+            let mut flat: Vec<usize> = self.fold_anchors.iter().flat_map(|(a, b)| [*a, *b]).collect();
+            doc.sync_positions(&mut flat, self.seen_revision);
+            let rope = doc.rope();
+            self.fold_anchors = flat
+                .chunks(2)
+                .map(|c| (rope.line_to_char(rope.char_to_line(c[0])), rope.line_to_char(rope.char_to_line(c[1]))))
+                .filter(|(a, b)| rope.char_to_line(*b) > rope.char_to_line(*a) + 1)
+                .collect();
             self.seen_revision = doc.revision();
             self.cache.invalidate();
+        }
+        // A caret inside a folded region unfolds it (never edit hidden text).
+        if !self.fold_anchors.is_empty() {
+            let rope = doc.rope();
+            let heads: Vec<usize> = self.sels.iter().flat_map(|s| [s.head, s.anchor]).collect();
+            self.fold_anchors.retain(|(a, b)| {
+                let (la, lb) = (rope.char_to_line(*a), rope.char_to_line(*b));
+                !heads.iter().any(|h| {
+                    let l = rope.char_to_line((*h).min(rope.len_chars()));
+                    l > la && l < lb
+                })
+            });
+        }
+    }
+
+    // ----- folding ----------------------------------------------------------
+
+    /// Folded regions as `(start_line, end_line)`; lines in between are hidden.
+    pub fn folds(&self, doc: &Document) -> Vec<(usize, usize)> {
+        let rope = doc.rope();
+        self.fold_anchors.iter().map(|(a, b)| (rope.char_to_line((*a).min(rope.len_chars())), rope.char_to_line((*b).min(rope.len_chars())))).collect()
+    }
+
+    pub fn is_line_hidden(&self, doc: &Document, line: usize) -> bool {
+        self.folds(doc).iter().any(|(a, b)| line > *a && line < *b)
+    }
+
+    pub fn fold_at(&self, doc: &Document, line: usize) -> Option<(usize, usize)> {
+        self.folds(doc).into_iter().find(|(a, _)| *a == line)
+    }
+
+    pub fn fold(&mut self, doc: &Document, start: usize, end: usize) {
+        if end <= start + 1 {
+            return;
+        }
+        let rope = doc.rope();
+        let a = rope.line_to_char(start.min(rope.len_lines().saturating_sub(1)));
+        let b = rope.line_to_char(end.min(rope.len_lines().saturating_sub(1)));
+        // Drop nested folds inside the new one; keep others.
+        self.fold_anchors.retain(|(x, y)| !(*x >= a && *y <= b));
+        if !self.fold_anchors.iter().any(|(x, _)| *x == a) {
+            self.fold_anchors.push((a, b));
+            self.fold_anchors.sort_unstable();
+        }
+        // Move carets out of the hidden region.
+        self.sels.transform(|s| {
+            let l = rope.char_to_line(s.head.min(rope.len_chars()));
+            if l > start && l < end { Selection::point(a) } else { s }
+        });
+        self.cache.invalidate();
+    }
+
+    pub fn unfold(&mut self, doc: &Document, line: usize) -> bool {
+        let rope = doc.rope();
+        let before = self.fold_anchors.len();
+        self.fold_anchors.retain(|(a, b)| {
+            let (la, lb) = (rope.char_to_line(*a), rope.char_to_line(*b));
+            !(line >= la && line <= lb)
+        });
+        if before != self.fold_anchors.len() {
+            self.cache.invalidate();
+        }
+        before != self.fold_anchors.len()
+    }
+
+    pub fn unfold_all(&mut self) {
+        self.fold_anchors.clear();
+        self.cache.invalidate();
+    }
+
+    /// Next visible (non-hidden) line after `line`, if any.
+    pub fn next_visible_line(&self, doc: &Document, line: usize) -> Option<usize> {
+        let n = doc.len_lines();
+        let folds = self.folds(doc);
+        let mut l = line + 1;
+        while l < n {
+            match folds.iter().find(|(a, b)| l > *a && l < *b) {
+                Some((_, b)) => l = *b,
+                None => return Some(l),
+            }
+        }
+        None
+    }
+
+    pub fn prev_visible_line(&self, doc: &Document, line: usize) -> Option<usize> {
+        if line == 0 {
+            return None;
+        }
+        let folds = self.folds(doc);
+        let mut l = line - 1;
+        loop {
+            match folds.iter().find(|(a, b)| l > *a && l < *b) {
+                Some((a, _)) => l = *a,
+                None => return Some(l),
+            }
         }
     }
 
@@ -218,6 +345,30 @@ impl View {
         let rope = doc.rope();
         let text = doc.slice();
         let page = self.lines_per_page.max(1);
+        let folds = self.folds(doc);
+        let n_lines = rope.len_lines();
+        let next_visible = |l: usize| -> Option<usize> {
+            let mut l = l + 1;
+            while l < n_lines {
+                match folds.iter().find(|(a, b)| l > *a && l < *b) {
+                    Some((_, b)) => l = *b,
+                    None => return Some(l),
+                }
+            }
+            None
+        };
+        let prev_visible = |l: usize| -> Option<usize> {
+            if l == 0 {
+                return None;
+            }
+            let mut l = l - 1;
+            loop {
+                match folds.iter().find(|(a, b)| l > *a && l < *b) {
+                    Some((a, _)) => l = *a,
+                    None => return Some(l),
+                }
+            }
+        };
         self.sels.transform(|s| {
             let head = s.head.min(rope.len_chars());
             let collapse_to = |s: &Selection, start: bool| if !extend && !s.is_empty() { Some(if start { s.start() } else { s.end() }) } else { None };
@@ -238,21 +389,20 @@ impl View {
                     let line = rope.char_to_line(head);
                     let col = head - rope.line_to_char(line);
                     let goal = s.goal_col.unwrap_or_else(|| char_col_to_display_col(rope.line(line), col, tab_width));
-                    let target = match motion {
-                        Motion::Up(_) => {
-                            if line == 0 {
-                                return s.moved_to(0, extend).with_goal(Some(goal));
-                            }
-                            line.saturating_sub(n)
+                    let mut target = line;
+                    for _ in 0..n {
+                        let step = if matches!(motion, Motion::Up(_)) { prev_visible(target) } else { next_visible(target) };
+                        match step {
+                            Some(t) => target = t,
+                            None => break,
                         }
-                        _ => {
-                            let last = rope.len_lines().saturating_sub(1);
-                            if line >= last {
-                                return s.moved_to(rope.len_chars(), extend).with_goal(Some(goal));
-                            }
-                            (line + n).min(last)
-                        }
-                    };
+                    }
+                    if target == line {
+                        return match motion {
+                            Motion::Up(_) => s.moved_to(0, extend).with_goal(Some(goal)),
+                            _ => s.moved_to(rope.len_chars(), extend).with_goal(Some(goal)),
+                        };
+                    }
                     let c = display_col_to_char_col(rope.line(target), goal, tab_width);
                     s.moved_to(rope.line_to_char(target) + c, extend).with_goal(Some(goal))
                 }
@@ -573,8 +723,9 @@ impl View {
         self.want_cursor_visible = true;
     }
 
+    /// Scroll by whole rows (negative = up). Wrapped rows are handled by the editor widget.
     pub fn scroll_lines(&mut self, lines: f32, line_height: f32) {
-        self.scroll.y = (self.scroll.y + lines * line_height).max(0.0);
+        self.scroll_remainder += lines * line_height;
     }
 }
 

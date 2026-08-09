@@ -1082,7 +1082,7 @@ impl ApexApp {
                         path: doc.path.clone(),
                         recovery_id: self.recovery_ids.get(&doc.id).map(|(id, _)| id.clone()),
                         sels: view.sels.clone(),
-                        scroll: (view.scroll.x, view.scroll.y),
+                        scroll: (view.scroll.x, view.top_line as f32),
                         pinned: pane.pinned.contains(v),
                         language: doc.language_override.clone(),
                     })
@@ -1194,7 +1194,8 @@ impl ApexApp {
                         if let Some(doc) = self.docs.get(&view.doc) {
                             view.sels.clamp(doc.rope());
                         }
-                        view.scroll = egui::vec2(t.scroll.0, t.scroll.1);
+                        view.scroll = egui::vec2(t.scroll.0, 0.0);
+                        view.top_line = t.scroll.1.max(0.0) as usize;
                         view.want_cursor_visible = false;
                     }
                     if let Some(doc) = self.views.get(&v).and_then(|view| self.docs.get_mut(&view.doc)) {
@@ -1580,7 +1581,7 @@ impl ApexApp {
                     ui.label(&title);
                     let resp = ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY));
                     resp.request_focus();
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         accept = true;
                     }
                     ui.horizontal(|ui| {

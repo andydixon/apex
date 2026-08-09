@@ -144,6 +144,8 @@ pub struct ApexApp {
     pub(crate) symbols: crate::symbol_index::ProjectSymbols,
     pub(crate) symbol_scan: Option<crate::symbol_index::SymbolScan>,
     pub(crate) dragging_tab: Option<(ViewId, PaneId)>,
+    pub(crate) fold_cache: HashMap<DocId, (u64, Vec<(usize, usize)>)>,
+    pub(crate) hover_pos: Option<(ViewId, usize)>,
 }
 
 const MAX_RECENT: usize = 30;
@@ -221,6 +223,8 @@ impl ApexApp {
             symbols: Default::default(),
             symbol_scan: None,
             dragging_tab: None,
+            fold_cache: HashMap::new(),
+            hover_pos: None,
         };
         app.load_recent();
         app.load_macros();
@@ -1456,6 +1460,18 @@ impl ApexApp {
                     self.execute(ctx, Command::SelectTheme, Some(n));
                 }
             }
+            Command::FoldCurrent
+            | Command::UnfoldCurrent
+            | Command::FoldAll
+            | Command::UnfoldAll
+            | Command::FoldLevel1
+            | Command::FoldLevel2
+            | Command::FoldLevel3
+            | Command::FoldComments
+            | Command::ToggleFold => {
+                let line = arg.as_deref().and_then(|a| a.parse::<usize>().ok());
+                self.fold_command(cmd, line);
+            }
             Command::ScrollLineUp | Command::ScrollLineDown => {
                 let v = view!();
                 let lh = self.line_height(ctx);
@@ -1665,45 +1681,113 @@ impl ApexApp {
         (o.into(), c.into())
     }
 
-    /// Highlight spans for the lines `first..last`, as the editor widget wants them.
-    pub(crate) fn highlight_lines(&mut self, d: DocId, first: usize, last: usize) -> HashMap<usize, Vec<(usize, usize, crate::theme::SyntaxStyle)>> {
+    /// Advance the syntax state for a document (apply pending edits, poll
+    /// background parses) and invalidate view layouts if colours changed.
+    pub(crate) fn syntax_tick(&mut self, d: DocId) {
         self.ensure_syntax(d);
-        let mut out = HashMap::new();
-        let Some(st) = self.syntax.get_mut(&d) else { return out };
-        let Some(doc) = self.docs.get_mut(&d) else { return out };
-        let changed = st.update(doc, std::time::Duration::from_millis(8));
-        if changed {
+        let Some(st) = self.syntax.get_mut(&d) else { return };
+        let Some(doc) = self.docs.get_mut(&d) else { return };
+        if st.update(doc, std::time::Duration::from_millis(8)) {
             for v in self.views.values_mut().filter(|v| v.doc == d) {
                 v.cache.invalidate();
             }
-        }
-        let muted = self.settings.muted_syntax || self.settings.low_distraction;
-        let fg = self.theme.editor.foreground;
-        for line in first..last {
-            let spans: Vec<(usize, usize, crate::theme::SyntaxStyle)> = st
-                .spans_for_line(doc, line)
-                .iter()
-                .filter_map(|sp| {
-                    let mut style = self.theme.syntax_style(sp.scope)?;
-                    if muted {
-                        style.fg = egui::Color32::from_rgb(
-                            (style.fg.r() as u16 + fg.r() as u16 * 2) as u8 / 3,
-                            (style.fg.g() as u16 + fg.g() as u16 * 2) as u8 / 3,
-                            (style.fg.b() as u16 + fg.b() as u16 * 2) as u8 / 3,
-                        );
-                    }
-                    Some((sp.start, sp.end, style))
-                })
-                .collect();
-            if !spans.is_empty() {
-                out.insert(line, spans);
-            }
+            self.fold_cache.remove(&d);
         }
         if st.is_parsing_in_background() {
-            // Poll again soon so highlights appear when the parse finishes.
             self.pending_repaint = true;
         }
-        out
+    }
+
+    /// Fold regions for a document (syntax tree if available, else indentation).
+    pub(crate) fn fold_regions_for(&mut self, d: DocId) -> Vec<(usize, usize)> {
+        let Some(doc) = self.docs.get(&d) else { return Vec::new() };
+        if let Some((rev, regions)) = self.fold_cache.get(&d)
+            && *rev == doc.revision()
+        {
+            return regions.clone();
+        }
+        if doc.len_lines() > 200_000 {
+            return Vec::new();
+        }
+        let regions: Vec<(usize, usize)> = match self.syntax.get(&d).filter(|st| st.has_tree()) {
+            Some(st) => apex_syntax::fold::syntax_folds(st, doc.rope()).into_iter().map(|r| (r.start, r.end)).collect(),
+            None => apex_syntax::fold::indent_folds(doc.rope(), self.settings.tab_width).into_iter().map(|r| (r.start, r.end)).collect(),
+        };
+        self.fold_cache.insert(d, (doc.revision(), regions.clone()));
+        regions
+    }
+
+    /// Fold regions with their nesting depth.
+    pub(crate) fn fold_regions_with_depth(&mut self, d: DocId) -> Vec<(usize, usize, u16)> {
+        let Some(doc) = self.docs.get(&d) else { return Vec::new() };
+        match self.syntax.get(&d).filter(|st| st.has_tree()) {
+            Some(st) => apex_syntax::fold::syntax_folds(st, doc.rope()).into_iter().map(|r| (r.start, r.end, r.depth)).collect(),
+            None => apex_syntax::fold::indent_folds(doc.rope(), self.settings.tab_width).into_iter().map(|r| (r.start, r.end, r.depth)).collect(),
+        }
+    }
+
+    pub(crate) fn fold_command(&mut self, cmd: Command, arg: Option<usize>) {
+        let Some((v, d)) = self.active_ids() else { return };
+        self.ensure_syntax(d);
+        let regions = self.fold_regions_for(d);
+        let with_depth = self.fold_regions_with_depth(d);
+        let line = arg.unwrap_or_else(|| self.views[&v].primary_line(&self.docs[&d]));
+        let lang = self.language_of(d);
+        let Some(doc) = self.docs.get(&d) else { return };
+        let Some(view) = self.views.get_mut(&v) else { return };
+        match cmd {
+            Command::FoldCurrent => {
+                // Innermost region containing the caret line.
+                if let Some((a, b)) = regions.iter().filter(|(a, b)| line >= *a && line <= *b).min_by_key(|(a, b)| b - a) {
+                    view.fold(doc, *a, *b);
+                }
+            }
+            Command::UnfoldCurrent => {
+                view.unfold(doc, line);
+            }
+            Command::ToggleFold => {
+                if view.fold_at(doc, line).is_some() {
+                    view.unfold(doc, line);
+                } else if let Some((a, b)) = regions.iter().find(|(a, _)| *a == line) {
+                    view.fold(doc, *a, *b);
+                }
+            }
+            Command::FoldAll => {
+                for (a, b, depth) in &with_depth {
+                    if *depth == 0 {
+                        view.fold(doc, *a, *b);
+                    }
+                }
+            }
+            Command::FoldLevel1 | Command::FoldLevel2 | Command::FoldLevel3 => {
+                let level = match cmd {
+                    Command::FoldLevel1 => 0,
+                    Command::FoldLevel2 => 1,
+                    _ => 2,
+                };
+                view.unfold_all();
+                for (a, b, depth) in &with_depth {
+                    if *depth == level {
+                        view.fold(doc, *a, *b);
+                    }
+                }
+            }
+            Command::FoldComments => {
+                let rope = doc.rope();
+                for (a, b) in &regions {
+                    let text = doc.line_text(*a);
+                    let t = text.trim_start();
+                    let is_comment =
+                        lang.line_comment.is_some_and(|c| t.starts_with(c.trim_end())) || lang.block_comment.is_some_and(|(o, _)| t.starts_with(o));
+                    if is_comment && *b < rope.len_lines() {
+                        view.fold(doc, *a, *b);
+                    }
+                }
+            }
+            Command::UnfoldAll => view.unfold_all(),
+            _ => {}
+        }
+        view.want_cursor_visible = true;
     }
 
     pub(crate) fn current_dir(&self) -> Option<PathBuf> {
@@ -1730,6 +1814,7 @@ impl ApexApp {
                 for v in self.views.values_mut().filter(|v| v.doc == did) {
                     v.cache.invalidate();
                 }
+                self.forget_recovery(did);
                 self.set_status(format!("Reloaded {} as {}", path.display(), l.encoding), false);
             }
             Ok(_) => self.set_status("File is binary; reopen it to view the preview".into(), true),
@@ -2880,7 +2965,7 @@ impl ApexApp {
                     ui.label("Go to line (or line:column)");
                     let resp = ui.add(egui::TextEdit::singleline(&mut text).hint_text("e.g. 120 or 120:8").desired_width(f32::INFINITY));
                     resp.request_focus();
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         go = true;
                     }
                     changed = resp.changed();
@@ -3007,11 +3092,21 @@ impl ApexApp {
             inner = Rect::from_min_max(pos2(cx - width / 2.0 - 60.0, inner.min.y), pos2(cx + width / 2.0, inner.max.y));
         }
         let focused = pane_id == self.active_pane;
+        let Some(did) = self.views.get(&vid).map(|v| v.doc) else { return };
         let matches: Vec<std::ops::Range<usize>> =
-            if self.find.open && self.find.rev.as_ref().is_some_and(|r| r.0 == self.views[&vid].doc) { self.find.matches.clone() } else { Vec::new() };
+            if self.find.open && self.find.rev.as_ref().is_some_and(|r| r.0 == did) { self.find.matches.clone() } else { Vec::new() };
         let current_match = self.find.current;
         let settings = self.settings.clone();
         let theme = self.theme.clone();
+        self.syntax_tick(did);
+        let fold_regions = self.fold_regions_for(did);
+        let git_marks = self.git_marks_for(did);
+        let diagnostics = self.diagnostics_for(did);
+        let (wrap, large) = {
+            let view = &self.views[&vid];
+            let doc = &self.docs[&did];
+            (view.word_wrap.unwrap_or(self.settings.word_wrap) && !doc.large_file, doc.large_file)
+        };
         let style = EditorStyle {
             theme: &theme,
             settings: &settings,
@@ -3021,14 +3116,21 @@ impl ApexApp {
             focused,
             matches: &matches,
             current_match,
-            git_marks: &[],
+            git_marks: &git_marks,
+            diagnostics: &diagnostics,
+            fold_regions: &fold_regions,
+            wrap,
+            large_file: large,
         };
+        let muted = settings.muted_syntax || settings.low_distraction;
         let mut actions = Vec::new();
         {
+            let Some(doc) = self.docs.get(&did) else { return };
+            let syntax_cell = std::cell::RefCell::new(self.syntax.get_mut(&did));
+            let highlight = make_highlight(&syntax_cell, doc, &theme, muted);
             let view = self.views.get_mut(&vid).expect("view");
-            let doc = self.docs.get(&view.doc).expect("doc");
             view.sync(doc);
-            editor::input(&mut ui, inner, view, doc, &style, &mut self.keymap, &mut actions);
+            editor::input(&mut ui, inner, view, doc, &style, &mut self.keymap, Some(&highlight), &mut actions);
         }
         for a in actions {
             match a {
@@ -3041,31 +3143,44 @@ impl ApexApp {
                 Action::Command(c, arg) => self.execute(ui.ctx(), c, arg),
                 Action::Dropped(paths) => {
                     for p in paths {
-                        self.open_path(&p);
+                        if p.is_dir() {
+                            self.add_root(&p);
+                        } else {
+                            self.open_path(&p);
+                        }
                     }
                 }
                 Action::ContextMenu(p) => self.context_menu_at = Some((vid, p)),
+                Action::ToggleFold(line) => {
+                    self.active_pane = pane_id;
+                    self.fold_command(Command::ToggleFold, Some(line));
+                }
+                Action::Hover(pos) => self.hover_pos = pos.map(|p| (vid, p)),
             }
         }
-        // The view may have been closed by a command.
-        let Some(did) = self.views.get(&vid).map(|v| v.doc) else { return };
-        let (first, last) = {
-            let Some(view) = self.views.get_mut(&vid) else { return };
-            let Some(doc) = self.docs.get(&did) else { return };
-            view.sync(doc);
-            editor::scroll_to_cursor(inner, view, doc, &style);
-            let geo = editor::geometry(inner, doc, &style);
-            let first = geo.first_visible_line(view.scroll.y);
-            (first, (first + geo.visible_line_count()).min(geo.total_lines))
-        };
-        let spans = self.highlight_lines(did, first, last);
-        let highlight = move |line: usize| spans.get(&line).cloned().unwrap_or_default();
-        if let Some(view) = self.views.get_mut(&vid)
-            && let Some(doc) = self.docs.get(&did)
-        {
-            view.sync(doc);
-            editor::paint(&mut ui, inner, view, doc, &style, Some(&highlight));
+        // The view may have been closed by a command; the document may have changed.
+        if !self.views.contains_key(&vid) || !self.docs.contains_key(&did) {
+            return;
         }
+        self.syntax_tick(did);
+        let fold_regions = self.fold_regions_for(did);
+        let style = EditorStyle { fold_regions: &fold_regions, ..style };
+        let doc = self.docs.get(&did).expect("doc");
+        let syntax_cell = std::cell::RefCell::new(self.syntax.get_mut(&did));
+        let highlight = make_highlight(&syntax_cell, doc, &theme, muted);
+        let view = self.views.get_mut(&vid).expect("view");
+        view.sync(doc);
+        editor::paint(&mut ui, inner, view, doc, &style, Some(&highlight));
+    }
+
+    /// Git gutter marks for a document (filled by the Git integration).
+    pub(crate) fn git_marks_for(&self, _d: DocId) -> Vec<(usize, u8)> {
+        Vec::new()
+    }
+
+    /// Diagnostic underlines for a document (filled by the LSP integration).
+    pub(crate) fn diagnostics_for(&self, _d: DocId) -> Vec<(usize, usize, u8)> {
+        Vec::new()
     }
 
     pub(crate) fn show_layout(&mut self, ui: &mut Ui, layout: Layout, rect: Rect, path: Vec<usize>) {
@@ -3165,6 +3280,34 @@ impl ApexApp {
     }
 }
 
+/// Build the lazy per-line highlighter used by the editor widget.
+fn make_highlight<'a>(
+    syntax: &'a std::cell::RefCell<Option<&'a mut SyntaxState>>,
+    doc: &'a Document,
+    theme: &'a Theme,
+    muted: bool,
+) -> impl Fn(usize) -> Vec<(usize, usize, crate::theme::SyntaxStyle)> + 'a {
+    move |line: usize| {
+        let mut guard = syntax.borrow_mut();
+        let Some(st) = guard.as_mut() else { return Vec::new() };
+        let fg = theme.editor.foreground;
+        st.spans_for_line(doc, line)
+            .iter()
+            .filter_map(|sp| {
+                let mut style = theme.syntax_style(sp.scope)?;
+                if muted {
+                    style.fg = egui::Color32::from_rgb(
+                        ((style.fg.r() as u16 + fg.r() as u16 * 2) / 3) as u8,
+                        ((style.fg.g() as u16 + fg.g() as u16 * 2) / 3) as u8,
+                        ((style.fg.b() as u16 + fg.b() as u16 * 2) / 3) as u8,
+                    );
+                }
+                Some((sp.start, sp.end, style))
+            })
+            .collect()
+    }
+}
+
 fn set_fractions(layout: &mut Layout, path: &[usize], fracs: Vec<f32>) {
     let mut node = layout;
     for &i in path {
@@ -3193,9 +3336,8 @@ impl eframe::App for ApexApp {
                 if find_focused { vec![crate::keymap::Context::Find, crate::keymap::Context::Global] } else { vec![crate::keymap::Context::Global] };
             let events = ctx.input(|i| i.events.clone());
             for ev in events {
-                if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
-                    let press = crate::keymap::KeyPress::from_egui(key, modifiers);
-                    if let crate::keymap::Dispatch::Command(c, arg) = self.keymap.dispatch(press, &active_ctx) {
+                if let egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } = ev {
+                    if let crate::keymap::Dispatch::Command(c, arg) = self.keymap.dispatch_event(key, physical_key, modifiers, &active_ctx) {
                         let plain = !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.mac_cmd;
                         if !(plain && find_focused && !matches!(key, egui::Key::Enter | egui::Key::Escape | egui::Key::F3)) {
                             self.queue.push_back((c, arg));

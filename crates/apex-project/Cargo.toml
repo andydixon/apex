@@ -22,6 +22,8 @@ parking_lot.workspace = true
 notify.workspace = true
 globset = "0.4"
 encoding_rs.workspace = true
+git2.workspace = true
+similar = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

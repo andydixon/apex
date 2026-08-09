@@ -319,6 +319,27 @@ impl Document {
         covered
     }
 
+    /// Remap arbitrary char positions recorded at `seen_revision` (fold anchors etc.).
+    pub fn sync_positions(&self, positions: &mut [usize], seen_revision: u64) {
+        if seen_revision == self.revision {
+            return;
+        }
+        let covered = self.recent.front().is_some_and(|(rev, _)| *rev <= seen_revision + 1);
+        if covered {
+            for (rev, tx) in &self.recent {
+                if *rev > seen_revision {
+                    for p in positions.iter_mut() {
+                        *p = tx.map_pos(*p, Assoc::Before);
+                    }
+                }
+            }
+        }
+        let n = self.rope.len_chars();
+        for p in positions.iter_mut() {
+            *p = (*p).min(n);
+        }
+    }
+
     pub fn bookmarks(&self) -> &[usize] {
         &self.bookmarks
     }
