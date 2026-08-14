@@ -50,6 +50,21 @@ pub(crate) enum Dialog {
     Issues(Vec<SettingsIssue>),
     ConfirmDelete(PathBuf),
     ConfirmReplaceInFiles,
+    Info {
+        title: String,
+        body: String,
+    },
+    ConfirmRevertHunk {
+        view: ViewId,
+        hunk_start: usize,
+        hunk_end: usize,
+        old_start: usize,
+        old_end: usize,
+    },
+    Trust {
+        root: PathBuf,
+        then: Option<(Command, Option<String>)>,
+    },
     Prompt {
         title: String,
         text: String,
@@ -146,6 +161,11 @@ pub struct ApexApp {
     pub(crate) dragging_tab: Option<(ViewId, PaneId)>,
     pub(crate) fold_cache: HashMap<DocId, (u64, Vec<(usize, usize)>)>,
     pub(crate) hover_pos: Option<(ViewId, usize)>,
+    pub(crate) git: crate::git_ui::GitUi,
+    pub(crate) tasks: crate::tasks_ui::TasksUi,
+    pub(crate) trust: crate::tasks_ui::TrustStore,
+    pub(crate) panel_tab: crate::tasks_ui::PanelTab,
+    pub(crate) last_git_tick: Instant,
 }
 
 const MAX_RECENT: usize = 30;
@@ -225,6 +245,11 @@ impl ApexApp {
             dragging_tab: None,
             fold_cache: HashMap::new(),
             hover_pos: None,
+            git: Default::default(),
+            tasks: Default::default(),
+            trust: Default::default(),
+            panel_tab: Default::default(),
+            last_git_tick: Instant::now(),
         };
         app.load_recent();
         app.load_macros();
@@ -541,6 +566,7 @@ impl ApexApp {
                 doc.read_only = false;
                 let enc = doc.encoding;
                 self.forget_recovery(did);
+                self.git_mark_dirty();
                 let msg = if lossy {
                     format!("Saved {} (some characters could not be encoded as {enc} and were replaced)", path.display())
                 } else {
@@ -747,7 +773,7 @@ impl ApexApp {
         if cmd.is_recordable() {
             self.record_step(crate::workspace_ui::MacroStep::Command(cmd, arg.clone()));
         }
-        if self.execute_workspace(ctx, cmd, arg.clone()) {
+        if self.git_command(ctx, cmd) || self.tasks_command(ctx, cmd, arg.clone()) || self.execute_workspace(ctx, cmd, arg.clone()) {
             return;
         }
         let active = self.active_ids();
@@ -2635,6 +2661,20 @@ impl ApexApp {
                 right.push(format!("{}pt", self.settings.font_size + self.font_zoom as f32));
             }
         }
+        if let Some(b) = self.git_branch_label() {
+            right.insert(0, format!("git: {b}"));
+        }
+        let problems = self.all_problems();
+        let errors = problems.iter().filter(|p| p.is_error).count();
+        if !problems.is_empty() {
+            right.insert(0, format!("{errors} errors, {} warnings", problems.len() - errors));
+        }
+        if self.tasks.running.is_some() {
+            left.push_str("    Running task…");
+        }
+        if self.macro_recording.is_some() {
+            left.push_str("    ● REC");
+        }
         let painter = ui.painter_at(rect);
         let mut x = rect.min.x + 12.0;
         let status_colour = theme.ui.text_muted;
@@ -2659,7 +2699,21 @@ impl ApexApp {
                 painter.rect_filled(r, 0.0, theme.ui.hover);
             }
             painter.galley(pos2(rx - w, rect.center().y - g.rect.height() / 2.0), g, status_colour);
-            resp.context_menu(|ui| Self::status_item_menu(ui, i, &mut q));
+            let kind = if item.starts_with("Spaces") || item.starts_with("Tabs") {
+                0
+            } else if apex_buffer::Encoding::from_label(item).is_some() || item.starts_with("UTF") {
+                1
+            } else if LineEnding::from_label(item.split(' ').next().unwrap_or("")).is_some() {
+                2
+            } else if item.starts_with('⎇') {
+                4
+            } else if item.contains('✗') {
+                5
+            } else {
+                3
+            };
+            let _ = i;
+            resp.context_menu(|ui| Self::status_item_menu(ui, kind, &mut q));
             rx -= w + 20.0;
         }
         for c in q {
@@ -2690,6 +2744,29 @@ impl ApexApp {
                 for le in [LineEnding::Lf, LineEnding::CrLf, LineEnding::Cr] {
                     if ui.button(le.label()).clicked() {
                         q.push((Command::SetLineEnding, Some(le.label().into())));
+                        ui.close();
+                    }
+                }
+            }
+            4 => {
+                for c in [
+                    Command::GitStatusPanel,
+                    Command::NextChange,
+                    Command::PrevChange,
+                    Command::CompareWithIndex,
+                    Command::CompareWithHead,
+                    Command::FileHistory,
+                ] {
+                    if ui.button(c.name()).clicked() {
+                        q.push((c, None));
+                        ui.close();
+                    }
+                }
+            }
+            5 => {
+                for c in [Command::ShowProblems, Command::NextDiagnostic, Command::PrevDiagnostic] {
+                    if ui.button(c.name()).clicked() {
+                        q.push((c, None));
                         ui.close();
                     }
                 }
@@ -2808,7 +2885,16 @@ impl ApexApp {
     pub(crate) fn show_dialogs(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.dialog.clone() else { return };
         let mut close = false;
-        if matches!(dialog, Dialog::ConfirmDelete(_) | Dialog::ConfirmReplaceInFiles | Dialog::Prompt { .. } | Dialog::Recovery(_)) {
+        if matches!(
+            dialog,
+            Dialog::ConfirmDelete(_)
+                | Dialog::ConfirmReplaceInFiles
+                | Dialog::Prompt { .. }
+                | Dialog::Recovery(_)
+                | Dialog::Info { .. }
+                | Dialog::ConfirmRevertHunk { .. }
+                | Dialog::Trust { .. }
+        ) {
             self.show_workspace_dialog(ctx, dialog);
             return;
         }
@@ -2997,7 +3083,13 @@ impl ApexApp {
                     close = true;
                 }
             }
-            Dialog::ConfirmDelete(_) | Dialog::ConfirmReplaceInFiles | Dialog::Prompt { .. } | Dialog::Recovery(_) => {}
+            Dialog::ConfirmDelete(_)
+            | Dialog::ConfirmReplaceInFiles
+            | Dialog::Prompt { .. }
+            | Dialog::Recovery(_)
+            | Dialog::Info { .. }
+            | Dialog::ConfirmRevertHunk { .. }
+            | Dialog::Trust { .. } => {}
             Dialog::Issues(issues) => {
                 let r = egui::Modal::new(egui::Id::new("issues")).show(ctx, |ui| {
                     ui.set_width(520.0);
@@ -3173,8 +3265,13 @@ impl ApexApp {
         editor::paint(&mut ui, inner, view, doc, &style, Some(&highlight));
     }
 
-    /// Git gutter marks for a document (filled by the Git integration).
-    pub(crate) fn git_marks_for(&self, _d: DocId) -> Vec<(usize, u8)> {
+    /// Git gutter marks for a document.
+    pub(crate) fn git_marks_for(&mut self, d: DocId) -> Vec<(usize, u8)> {
+        self.git_marks(d)
+    }
+
+    /// Problems from language servers (filled by the LSP integration).
+    pub(crate) fn lsp_problems(&self) -> Vec<apex_project::tasks::Problem> {
         Vec::new()
     }
 

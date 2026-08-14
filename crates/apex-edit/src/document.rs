@@ -120,6 +120,8 @@ pub struct Document {
     marks: BTreeMap<String, usize>,
     /// Untitled documents get a stable display name.
     pub untitled_index: Option<u32>,
+    /// Display name for scratch buffers (diff views, history) with no path.
+    pub scratch_title: Option<String>,
 }
 
 impl Document {
@@ -155,6 +157,7 @@ impl Document {
             bookmarks: Vec::new(),
             marks: BTreeMap::new(),
             untitled_index: None,
+            scratch_title: None,
         }
     }
 
@@ -209,6 +212,9 @@ impl Document {
 
     /// Display name: file name or "Untitled N".
     pub fn title(&self) -> String {
+        if let Some(t) = &self.scratch_title {
+            return t.clone();
+        }
         match &self.path {
             Some(p) => p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string()),
             None => match self.untitled_index {

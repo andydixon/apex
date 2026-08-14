@@ -180,6 +180,7 @@ impl ApexApp {
                 }
                 self.rescan_at = Some(Instant::now() + Duration::from_millis(1500));
                 self.check_external_changes();
+                self.git_mark_dirty();
                 repaint = true;
             } else if w.has_pending() {
                 repaint = true;
@@ -192,6 +193,18 @@ impl ApexApp {
         if self.fif.poll() {
             repaint = true;
         }
+        if self.git_poll() {
+            repaint = true;
+        }
+        if self.git.has_repos() && self.last_git_tick.elapsed() >= Duration::from_secs(4) {
+            self.last_git_tick = Instant::now();
+            self.git_mark_dirty_status_only();
+            repaint = true;
+        }
+        if self.tasks_poll() {
+            repaint = true;
+        }
+        self.tasks_refresh();
         if self.last_recovery.elapsed() >= Duration::from_millis(self.settings.recovery_interval_ms.max(1000)) {
             self.last_recovery = Instant::now();
             self.write_recovery_snapshots();
@@ -817,6 +830,15 @@ impl ApexApp {
             (PaletteMode::LineEndings, Payload::Text(id)) => self.execute(ctx, Command::SetLineEnding, Some(id)),
             (PaletteMode::ClipboardHistory, Payload::Index(i)) => self.execute(ctx, Command::PasteFromHistory, Some(i.to_string())),
             (PaletteMode::Macros, Payload::Text(name)) => self.run_macro_named(ctx, &name),
+            (PaletteMode::BuildTasks, Payload::Index(i)) => {
+                self.focus_active_editor(ctx);
+                self.run_task(i, ctx);
+            }
+            (PaletteMode::Prompt(kind), Payload::Text(t)) if kind == "history" => {
+                ctx.copy_text(t);
+                self.set_status("Commit id copied".into(), false);
+                self.focus_active_editor(ctx);
+            }
             _ => {
                 let _ = query;
             }
@@ -914,6 +936,7 @@ impl ApexApp {
 
     pub(crate) fn open_find_in_files(&mut self, initial: Option<String>) {
         self.panel_open = true;
+        self.panel_tab = crate::tasks_ui::PanelTab::Find;
         self.fif.open = true;
         self.fif.focus_query = true;
         if let Some(t) = initial {
@@ -927,11 +950,18 @@ impl ApexApp {
     }
 
     pub(crate) fn show_bottom_panel(&mut self, ui: &mut Ui) {
+        use crate::tasks_ui::PanelTab;
         let theme = self.theme.clone();
         let roots = self.roots.clone();
         let ui_font = self.settings.ui_font_size;
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("FIND IN FILES").size(ui_font - 2.0).color(theme.ui.text_muted).strong());
+            for (tab, label) in [(PanelTab::Find, "FIND IN FILES"), (PanelTab::Output, "OUTPUT"), (PanelTab::Problems, "PROBLEMS")] {
+                let selected = self.panel_tab == tab;
+                let text = egui::RichText::new(label).size(ui_font - 2.0).color(if selected { theme.ui.text } else { theme.ui.text_muted }).strong();
+                if ui.selectable_label(selected, text).clicked() {
+                    self.panel_tab = tab;
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("×").on_hover_text("Close panel").clicked() {
                     self.panel_open = false;
@@ -939,6 +969,17 @@ impl ApexApp {
                 }
             });
         });
+        match self.panel_tab {
+            PanelTab::Output => {
+                self.show_output_panel(ui);
+                return;
+            }
+            PanelTab::Problems => {
+                self.show_problems_panel(ui);
+                return;
+            }
+            PanelTab::Find => {}
+        }
         let actions = self.fif.ui(ui, &theme, ui_font, &roots);
         for a in actions {
             match a {
@@ -1459,7 +1500,7 @@ impl ApexApp {
         let base = path.parent().unwrap_or(Path::new("."));
         let folders: Vec<String> = self.roots.iter().map(|r| pathdiff_relative(base, r)).collect();
         let body = format!(
-            "# Apex project file. Safe to commit: it holds no session state.\n# Paths are relative to this file.\nfolders = {}\n\n[settings]\n# Per-project setting overrides, same keys as settings.toml.\n",
+            "# Apex project file. Safe to commit: it holds no session state.\n# Paths are relative to this file.\nfolders = {}\n\n[settings]\n# Per-project setting overrides, same keys as settings.toml.\n\n# Build tasks run only after you trust this workspace (Project ▸ Trust Workspace).\n# [[tasks]]\n# name = \"Check\"\n# command = [\"cargo\", \"check\"]\n# problem_matcher = \"rustc\"\n",
             toml_array(&folders)
         );
         match apex_project::fileio::save_atomic(&path, body.as_bytes()) {
@@ -1496,6 +1537,14 @@ impl ApexApp {
                     self.roots.push(std::fs::canonicalize(&p).unwrap_or(p));
                 }
             }
+        }
+        if let Some(tasks) = table.get("tasks") {
+            match tasks.clone().try_into::<Vec<apex_project::tasks::TaskDef>>() {
+                Ok(t) => self.set_project_tasks(t),
+                Err(e) => self.set_status(format!("Project tasks ignored: {e}"), true),
+            }
+        } else {
+            self.set_project_tasks(Vec::new());
         }
         if let Some(settings) = table.get("settings").and_then(|s| s.as_table()) {
             let src = toml::to_string(settings).unwrap_or_default();
@@ -1604,6 +1653,80 @@ impl ApexApp {
                     self.focus_active_editor(ctx);
                 } else {
                     self.dialog = Some(Dialog::Prompt { title, text, kind });
+                }
+            }
+            Dialog::Info { title, body } => {
+                let r = egui::Modal::new(egui::Id::new("info")).show(ctx, |ui| {
+                    ui.set_width(520.0);
+                    ui.heading(&title);
+                    egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                        ui.label(egui::RichText::new(&body).monospace());
+                    });
+                    ui.add_space(8.0);
+                    ui.button("Close").clicked()
+                });
+                if r.inner || r.should_close() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.dialog = None;
+                }
+            }
+            Dialog::ConfirmRevertHunk { view, hunk_start, hunk_end, old_start, old_end } => {
+                let r = egui::Modal::new(egui::Id::new("revert-hunk")).show(ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.heading("Revert this change?");
+                    ui.label(format!(
+                        "Lines {}–{} will be replaced with the version from the Git index. Undo is available afterwards.",
+                        hunk_start + 1,
+                        hunk_end.max(hunk_start + 1)
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Revert").clicked() {
+                            1
+                        } else if ui.button("Cancel").clicked() {
+                            2
+                        } else {
+                            0
+                        }
+                    })
+                    .inner
+                });
+                match r.inner {
+                    1 => {
+                        self.dialog = None;
+                        self.git_apply_revert(view, hunk_start, hunk_end, old_start, old_end);
+                    }
+                    2 => self.dialog = None,
+                    _ => {
+                        if r.should_close() {
+                            self.dialog = None;
+                        }
+                    }
+                }
+            }
+            Dialog::Trust { root, then } => {
+                let r = egui::Modal::new(egui::Id::new("trust")).show(ctx, |ui| {
+                    ui.set_width(480.0);
+                    ui.heading("Trust this workspace?");
+                    ui.label(format!("{}", root.display()));
+                    ui.label("Trusting allows build tasks and language servers defined in this folder's project configuration to be started. Programs run with your user's permissions. Editing files never requires trust.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| if ui.button("Trust").clicked() { 1 } else if ui.button("Not now").clicked() { 2 } else { 0 }).inner
+                });
+                match r.inner {
+                    1 => {
+                        self.dialog = None;
+                        self.trust.trust(&root);
+                        self.set_status(format!("Trusted {}", root.display()), false);
+                        if let Some((c, a)) = then {
+                            self.execute(ctx, c, a);
+                        }
+                    }
+                    2 => self.dialog = None,
+                    _ => {
+                        if r.should_close() {
+                            self.dialog = None;
+                        }
+                    }
                 }
             }
             Dialog::Recovery(entries) => {

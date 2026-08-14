@@ -352,6 +352,7 @@ dependencies = [
  "encoding_rs",
  "libc",
  "nucleo-matcher",
+ "regex",
  "rfd",
  "serde",
  "serde_json",

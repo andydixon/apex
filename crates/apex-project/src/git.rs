@@ -305,3 +305,91 @@ mod tests {
         assert!(!st.branch.is_empty());
     }
 }
+
+/// One commit that touched a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub id: String,
+    pub short_id: String,
+    pub author: String,
+    pub date: String,
+    pub summary: String,
+}
+
+/// `YYYY-MM-DD HH:MM` for a Unix timestamp with a UTC offset in minutes.
+pub fn format_date(unix: i64, offset_minutes: i32) -> String {
+    let t = unix + offset_minutes as i64 * 60;
+    let days = t.div_euclid(86_400);
+    let secs = t.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, (secs % 3600) / 60)
+}
+
+/// Commits in which `path` changed, newest first, bounded by `limit`.
+pub fn file_history(workdir: &Path, path: &Path, limit: usize) -> Result<Vec<HistoryEntry>, git2::Error> {
+    let repo = git2::Repository::open(workdir)?;
+    let root = repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| workdir.to_path_buf());
+    let rel = path.strip_prefix(&root).map_err(|_| git2::Error::from_str("path is outside the repository"))?;
+    let mut walk = repo.revwalk()?;
+    if walk.push_head().is_err() {
+        return Ok(Vec::new());
+    }
+    walk.set_sorting(git2::Sort::TIME)?;
+    let mut out = Vec::new();
+    let blob_at = |commit: &git2::Commit| -> Option<git2::Oid> { commit.tree().ok()?.get_path(rel).ok().map(|e| e.id()) };
+    for oid in walk.take(5000) {
+        let Ok(oid) = oid else { continue };
+        let Ok(commit) = repo.find_commit(oid) else { continue };
+        let current = blob_at(&commit);
+        // Changed if any parent has a different blob (or the file is new).
+        let changed = if commit.parent_count() == 0 {
+            current.is_some()
+        } else {
+            (0..commit.parent_count()).any(|i| commit.parent(i).ok().and_then(|p| blob_at(&p)) != current)
+        };
+        if !changed {
+            continue;
+        }
+        let sig = commit.author();
+        let time = commit.time();
+        out.push(HistoryEntry {
+            id: oid.to_string(),
+            short_id: oid.to_string()[..7].to_string(),
+            author: sig.name().unwrap_or("").to_string(),
+            date: format_date(time.seconds(), time.offset_minutes()),
+            summary: commit.summary().unwrap_or("").to_string(),
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Unified diff text of `base` → `current` with the given labels.
+pub fn unified_diff(base: &str, current: &str, base_label: &str, current_label: &str) -> String {
+    similar::TextDiff::from_lines(base, current).unified_diff().context_radius(3).header(base_label, current_label).to_string()
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn dates_and_unified_diff() {
+        assert_eq!(format_date(0, 0), "1970-01-01 00:00");
+        assert_eq!(format_date(1_700_000_000, 60), "2023-11-14 23:13");
+        let d = unified_diff("a\nb\n", "a\nc\n", "x (HEAD)", "x");
+        assert!(d.starts_with("--- x (HEAD)\n+++ x\n"));
+        assert!(d.contains("-b\n+c\n"));
+    }
+}
