@@ -360,11 +360,8 @@ impl ApexApp {
         let re = location_regex();
         let mut open: Option<(PathBuf, usize, usize)> = None;
         let root = self.roots.first().cloned().unwrap_or_default();
-        let mut area = egui::ScrollArea::both().auto_shrink([false, false]).id_salt("apex-output");
-        if self.tasks.scroll_to_bottom {
-            area = area.vertical_scroll_offset(f32::MAX / 4.0);
-            self.tasks.scroll_to_bottom = false;
-        }
+        let area = egui::ScrollArea::both().auto_shrink([false, false]).id_salt("apex-output").stick_to_bottom(self.tasks.scroll_to_bottom);
+        self.tasks.scroll_to_bottom = self.tasks.running.is_some();
         area.show_rows(ui, row_h, n, |ui, range| {
             for i in range {
                 let line = &self.tasks.output[i];
