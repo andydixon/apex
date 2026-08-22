@@ -89,6 +89,8 @@ pub struct Settings {
     pub spell_check: bool,
     pub spell_language: String,
     pub lsp_enabled: bool,
+    /// Language id → server command (argv). Known servers found on PATH are used automatically.
+    pub lsp_servers: std::collections::BTreeMap<String, Vec<String>>,
     pub large_file_mb: usize,
     pub git_gutter: bool,
     pub completion: bool,
@@ -172,6 +174,7 @@ impl Default for Settings {
             spell_check: false,
             spell_language: "en_GB".into(),
             lsp_enabled: true,
+            lsp_servers: std::collections::BTreeMap::new(),
             large_file_mb: 64,
             git_gutter: true,
             completion: true,

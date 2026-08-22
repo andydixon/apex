@@ -1173,6 +1173,7 @@ pub fn paint(ui: &mut Ui, rect: Rect, view: &mut View, doc: &Document, style: &E
             }
         }
     }
+    view.last_caret_rect = ime_rect;
     if is_focused {
         let cursor_rect = ime_rect.unwrap_or(Rect::from_min_size(geo.text.min, vec2(1.0, lh)));
         ui.ctx().output_mut(|o| {

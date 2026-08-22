@@ -37,6 +37,7 @@ pub enum PromptKind {
     Sequence,
     Surround,
     SaveProject,
+    Rename,
 }
 
 const MAX_JUMPS: usize = 100;
@@ -778,6 +779,9 @@ impl ApexApp {
         let mode = self.palette.mode.clone();
         let operator = self.palette.operator().map(|(o, r)| (o, r.to_string()));
         self.palette.close();
+        if self.lsp_palette_accept(ctx, &mode, &p) {
+            return;
+        }
         match (mode, p) {
             (PaletteMode::Commands, Payload::Command(c, arg)) => {
                 self.recent_commands.retain(|r| *r != c);
@@ -1489,6 +1493,7 @@ impl ApexApp {
                 let path = PathBuf::from(text.trim());
                 self.save_project_file(&path);
             }
+            PromptKind::Rename => self.execute(ctx, Command::LspRename, Some(text)),
         }
         self.focus_active_editor(ctx);
     }
@@ -1725,6 +1730,62 @@ impl ApexApp {
                     _ => {
                         if r.should_close() {
                             self.dialog = None;
+                        }
+                    }
+                }
+            }
+            Dialog::ConfirmWorkspaceEdit { label, edit } => {
+                let files: Vec<String> = edit
+                    .changes
+                    .iter()
+                    .map(|(uri, edits)| {
+                        format!(
+                            "{}  ({} edit{})",
+                            apex_project::lsp::path_for(uri).map(|p| self.display_path(&p)).unwrap_or_else(|| uri.clone()),
+                            edits.len(),
+                            if edits.len() == 1 { "" } else { "s" }
+                        )
+                    })
+                    .collect();
+                let warn = self.theme.ui.warning;
+                let muted = self.theme.ui.text_muted;
+                let r = egui::Modal::new(egui::Id::new("workspace-edit")).show(ctx, |ui| {
+                    ui.set_width(520.0);
+                    ui.heading(format!("{label}: apply changes to {} file{}?", files.len(), if files.len() == 1 { "" } else { "s" }));
+                    egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                        for f in &files {
+                            ui.label(f);
+                        }
+                        for op in &edit.unsupported_operations {
+                            ui.label(egui::RichText::new(format!("file {op} operation will be skipped")).color(warn));
+                        }
+                    });
+                    ui.label(egui::RichText::new("Open files are edited in place (undo available); other files are rewritten with a safe save.").color(muted));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            1
+                        } else if ui.button("Cancel").clicked() {
+                            2
+                        } else {
+                            0
+                        }
+                    })
+                    .inner
+                });
+                match r.inner {
+                    1 => {
+                        self.dialog = None;
+                        self.lsp_confirm_workspace_edit(&edit, true);
+                    }
+                    2 => {
+                        self.dialog = None;
+                        self.lsp_confirm_workspace_edit(&edit, false);
+                    }
+                    _ => {
+                        if r.should_close() {
+                            self.dialog = None;
+                            self.lsp_confirm_workspace_edit(&edit, false);
                         }
                     }
                 }

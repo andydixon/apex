@@ -155,6 +155,8 @@ pub struct View {
     /// Quick Add Next started from a word expansion, so further additions match whole words.
     pub quick_add_word_mode: bool,
     pub last_rect: egui::Rect,
+    /// Screen rectangle of the primary caret as last painted.
+    pub last_caret_rect: Option<egui::Rect>,
     /// Cached minimap shapes: (key, shapes, built at, epoch).
     pub minimap_cache: Option<(MinimapKey, Vec<egui::Shape>, std::time::Instant, u64)>,
 }
@@ -187,6 +189,7 @@ impl View {
             quick_add_word_mode: false,
             last_rect: egui::Rect::NOTHING,
             minimap_cache: None,
+            last_caret_rect: None,
         }
     }
 

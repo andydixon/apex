@@ -6,6 +6,7 @@ pub mod editor;
 pub mod find_in_files;
 pub mod git_ui;
 pub mod keymap;
+pub mod lsp_ui;
 pub mod palette;
 pub mod settings;
 pub mod sidebar;

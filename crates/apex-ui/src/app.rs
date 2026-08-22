@@ -65,6 +65,10 @@ pub(crate) enum Dialog {
         root: PathBuf,
         then: Option<(Command, Option<String>)>,
     },
+    ConfirmWorkspaceEdit {
+        label: String,
+        edit: Box<apex_project::lsp::WorkspaceEdit>,
+    },
     Prompt {
         title: String,
         text: String,
@@ -166,6 +170,8 @@ pub struct ApexApp {
     pub(crate) trust: crate::tasks_ui::TrustStore,
     pub(crate) panel_tab: crate::tasks_ui::PanelTab,
     pub(crate) last_git_tick: Instant,
+    pub(crate) lsp: crate::lsp_ui::LspUi,
+    pub(crate) last_pointer: Option<egui::Pos2>,
 }
 
 const MAX_RECENT: usize = 30;
@@ -250,6 +256,8 @@ impl ApexApp {
             trust: Default::default(),
             panel_tab: Default::default(),
             last_git_tick: Instant::now(),
+            lsp: Default::default(),
+            last_pointer: None,
         };
         app.load_recent();
         app.load_macros();
@@ -662,7 +670,9 @@ impl ApexApp {
             auto_indent: self.settings.auto_indent,
             overwrite: self.views.get(&vid).is_some_and(|v| v.overwrite),
         };
-        self.run_edit(vid, |d, s| ops::insert_text(d, s, text, opts));
+        if self.run_edit(vid, |d, s| ops::insert_text(d, s, text, opts)) {
+            self.lsp_after_insert(vid, text);
+        }
     }
 
     pub(crate) fn copy_selection(&mut self, ctx: &egui::Context, vid: ViewId, cut: bool) {
@@ -773,7 +783,11 @@ impl ApexApp {
         if cmd.is_recordable() {
             self.record_step(crate::workspace_ui::MacroStep::Command(cmd, arg.clone()));
         }
-        if self.git_command(ctx, cmd) || self.tasks_command(ctx, cmd, arg.clone()) || self.execute_workspace(ctx, cmd, arg.clone()) {
+        if self.git_command(ctx, cmd)
+            || self.tasks_command(ctx, cmd, arg.clone())
+            || self.lsp_command(ctx, cmd, arg.clone())
+            || self.execute_workspace(ctx, cmd, arg.clone())
+        {
             return;
         }
         let active = self.active_ids();
@@ -2664,6 +2678,9 @@ impl ApexApp {
         if let Some(b) = self.git_branch_label() {
             right.insert(0, format!("git: {b}"));
         }
+        if let Some(l) = self.lsp_status_label() {
+            right.insert(0, l);
+        }
         let problems = self.all_problems();
         let errors = problems.iter().filter(|p| p.is_error).count();
         if !problems.is_empty() {
@@ -2894,6 +2911,7 @@ impl ApexApp {
                 | Dialog::Info { .. }
                 | Dialog::ConfirmRevertHunk { .. }
                 | Dialog::Trust { .. }
+                | Dialog::ConfirmWorkspaceEdit { .. }
         ) {
             self.show_workspace_dialog(ctx, dialog);
             return;
@@ -3089,7 +3107,8 @@ impl ApexApp {
             | Dialog::Recovery(_)
             | Dialog::Info { .. }
             | Dialog::ConfirmRevertHunk { .. }
-            | Dialog::Trust { .. } => {}
+            | Dialog::Trust { .. }
+            | Dialog::ConfirmWorkspaceEdit { .. } => {}
             Dialog::Issues(issues) => {
                 let r = egui::Modal::new(egui::Id::new("issues")).show(ctx, |ui| {
                     ui.set_width(520.0);
@@ -3247,7 +3266,11 @@ impl ApexApp {
                     self.active_pane = pane_id;
                     self.fold_command(Command::ToggleFold, Some(line));
                 }
-                Action::Hover(pos) => self.hover_pos = pos.map(|p| (vid, p)),
+                Action::Hover(pos) => {
+                    self.hover_pos = pos.map(|p| (vid, p));
+                    self.last_pointer = ui.ctx().input(|i| i.pointer.latest_pos());
+                    self.lsp_hover_moved(vid, pos);
+                }
             }
         }
         // The view may have been closed by a command; the document may have changed.
@@ -3272,12 +3295,12 @@ impl ApexApp {
 
     /// Problems from language servers (filled by the LSP integration).
     pub(crate) fn lsp_problems(&self) -> Vec<apex_project::tasks::Problem> {
-        Vec::new()
+        self.lsp_problem_list()
     }
 
     /// Diagnostic underlines for a document (filled by the LSP integration).
-    pub(crate) fn diagnostics_for(&self, _d: DocId) -> Vec<(usize, usize, u8)> {
-        Vec::new()
+    pub(crate) fn diagnostics_for(&self, d: DocId) -> Vec<(usize, usize, u8)> {
+        self.lsp_diagnostics_for(d)
     }
 
     pub(crate) fn show_layout(&mut self, ui: &mut Ui, layout: Layout, rect: Rect, path: Vec<usize>) {
@@ -3446,6 +3469,9 @@ impl eframe::App for ApexApp {
                 }
             }
         }
+        if self.lsp_completion_key(&ctx) {
+            ctx.request_repaint();
+        }
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(true)))) || self.last_focus_check.elapsed().as_secs() >= 2 {
             self.last_focus_check = Instant::now();
             self.check_external_changes();
@@ -3461,9 +3487,13 @@ impl eframe::App for ApexApp {
         if self.quit_confirmed {
             self.save_session();
             self.write_recovery_snapshots();
+            self.lsp_shutdown_all();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.poll_background(&ctx);
+        if self.lsp_tick(&ctx) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         for p in dropped {
             if p.is_dir() {
@@ -3530,6 +3560,7 @@ impl eframe::App for ApexApp {
         if self.dragging_tab.is_some() && ctx.input(|i| i.pointer.primary_released() || !i.pointer.any_down()) {
             self.dragging_tab = None;
         }
+        self.lsp_overlays(&ctx);
         self.show_palette(&ctx);
         self.show_dialogs(&ctx);
         self.show_editor_context_menu(&ctx);
