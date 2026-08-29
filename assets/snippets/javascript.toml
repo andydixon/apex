@@ -1,0 +1,44 @@
+[[snippets]]
+trigger = "fn"
+description = "Function"
+body = "function ${1:name}(${2}) {\n    $0\n}"
+
+[[snippets]]
+trigger = "afn"
+description = "Arrow function"
+body = "const ${1:name} = (${2}) => {\n    $0\n};"
+
+[[snippets]]
+trigger = "for"
+description = "for loop"
+body = "for (let ${1:i} = 0; $1 < ${2:n}; $1++) {\n    $0\n}"
+
+[[snippets]]
+trigger = "forof"
+description = "for…of"
+body = "for (const ${1:item} of ${2:items}) {\n    $0\n}"
+
+[[snippets]]
+trigger = "if"
+description = "if"
+body = "if (${1:condition}) {\n    $0\n}"
+
+[[snippets]]
+trigger = "log"
+description = "console.log"
+body = "console.log($0);"
+
+[[snippets]]
+trigger = "try"
+description = "try/catch"
+body = "try {\n    $1\n} catch (${2:err}) {\n    $0\n}"
+
+[[snippets]]
+trigger = "class"
+description = "Class"
+body = "class ${1:Name} {\n    constructor(${2}) {\n        $0\n    }\n}"
+
+[[snippets]]
+trigger = "imp"
+description = "import"
+body = "import ${1:name} from \"${2:module}\";"

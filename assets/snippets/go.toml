@@ -1,0 +1,29 @@
+[[snippets]]
+trigger = "func"
+description = "Function"
+body = "func ${1:name}(${2}) ${3:error }{\n\t$0\n}"
+
+[[snippets]]
+trigger = "iferr"
+description = "if err != nil"
+body = "if err != nil {\n\treturn ${1:err}\n}"
+
+[[snippets]]
+trigger = "for"
+description = "for loop"
+body = "for ${1:i} := 0; $1 < ${2:n}; $1++ {\n\t$0\n}"
+
+[[snippets]]
+trigger = "forr"
+description = "for range"
+body = "for ${1:_}, ${2:v} := range ${3:items} {\n\t$0\n}"
+
+[[snippets]]
+trigger = "main"
+description = "main package"
+body = "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"$0\")\n}"
+
+[[snippets]]
+trigger = "struct"
+description = "struct type"
+body = "type ${1:Name} struct {\n\t$0\n}"

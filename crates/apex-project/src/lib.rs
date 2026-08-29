@@ -7,6 +7,7 @@ pub mod lsp;
 pub mod paths;
 pub mod search;
 pub mod session;
+pub mod spell;
 pub mod tasks;
 pub mod tree;
 pub mod watch;

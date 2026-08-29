@@ -172,6 +172,8 @@ pub struct ApexApp {
     pub(crate) last_git_tick: Instant,
     pub(crate) lsp: crate::lsp_ui::LspUi,
     pub(crate) last_pointer: Option<egui::Pos2>,
+    pub(crate) snippets: Vec<apex_edit::snippet::SnippetDef>,
+    pub(crate) snippet_session: Option<crate::snippets_ui::SnippetSession>,
 }
 
 const MAX_RECENT: usize = 30;
@@ -258,9 +260,12 @@ impl ApexApp {
             last_git_tick: Instant::now(),
             lsp: Default::default(),
             last_pointer: None,
+            snippets: Vec::new(),
+            snippet_session: None,
         };
         app.load_recent();
         app.load_macros();
+        app.load_snippets();
         if app.settings.restore_session
             && let Some(session) = apex_project::session::Session::load()
         {
@@ -1094,6 +1099,9 @@ impl ApexApp {
                 let ind = self.doc_indent(d);
                 let auto = self.settings.auto_indent;
                 let smart = self.settings.smart_backspace;
+                if cmd == Command::InsertTab && self.try_expand_trigger(v) {
+                    return;
+                }
                 self.run_edit(v, |doc, s| match cmd {
                     Command::Indent => ops::indent_lines(doc, s, ind),
                     Command::Outdent => ops::outdent_lines(doc, s, ind),
@@ -3469,7 +3477,7 @@ impl eframe::App for ApexApp {
                 }
             }
         }
-        if self.lsp_completion_key(&ctx) {
+        if self.lsp_completion_key(&ctx) || self.snippet_key(&ctx) {
             ctx.request_repaint();
         }
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(true)))) || self.last_focus_check.elapsed().as_secs() >= 2 {
@@ -3597,7 +3605,7 @@ pub(crate) fn parse_line_col(s: &str) -> Option<(usize, usize)> {
     Some((line, col))
 }
 
-fn local_datetime_string() -> String {
+pub(crate) fn local_datetime_string() -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
     let (y, m, d, hh, mm, ss) = civil_from_unix(now + local_utc_offset_seconds());
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")

@@ -779,7 +779,7 @@ impl ApexApp {
         let mode = self.palette.mode.clone();
         let operator = self.palette.operator().map(|(o, r)| (o, r.to_string()));
         self.palette.close();
-        if self.lsp_palette_accept(ctx, &mode, &p) {
+        if self.lsp_palette_accept(ctx, &mode, &p) || self.snippet_palette_accept(ctx, &mode, &p) {
             return;
         }
         match (mode, p) {
@@ -1962,6 +1962,7 @@ impl ApexApp {
                     self.set_status("Save a project file first (Project ▸ Save Project As…)".into(), false);
                 }
             }
+            Command::InsertSnippet => self.open_snippet_palette(),
             Command::CommandPalette => self.open_command_palette(),
             Command::GotoAnything => self.open_goto_anything(arg.as_deref().unwrap_or("")),
             Command::GotoSymbol => self.open_symbol_palette(""),

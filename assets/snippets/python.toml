@@ -1,0 +1,44 @@
+[[snippets]]
+trigger = "def"
+description = "Function"
+body = "def ${1:name}(${2}):\n    ${3:\"\"\"$4\"\"\"}\n    $0"
+
+[[snippets]]
+trigger = "class"
+description = "Class"
+body = "class ${1:Name}${2:(object)}:\n    def __init__(self${3}):\n        $0"
+
+[[snippets]]
+trigger = "if"
+description = "if"
+body = "if ${1:condition}:\n    $0"
+
+[[snippets]]
+trigger = "for"
+description = "for loop"
+body = "for ${1:item} in ${2:iterable}:\n    $0"
+
+[[snippets]]
+trigger = "while"
+description = "while loop"
+body = "while ${1:condition}:\n    $0"
+
+[[snippets]]
+trigger = "try"
+description = "try/except"
+body = "try:\n    $1\nexcept ${2:Exception} as ${3:e}:\n    $0"
+
+[[snippets]]
+trigger = "main"
+description = "main guard"
+body = "def main():\n    $0\n\n\nif __name__ == \"__main__\":\n    main()"
+
+[[snippets]]
+trigger = "with"
+description = "with statement"
+body = "with ${1:open(${2:path})} as ${3:f}:\n    $0"
+
+[[snippets]]
+trigger = "lam"
+description = "lambda"
+body = "lambda ${1:x}: $0"

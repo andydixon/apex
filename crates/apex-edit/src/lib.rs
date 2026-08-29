@@ -25,6 +25,7 @@ pub mod indent;
 pub mod ops;
 pub mod search;
 pub mod selection;
+pub mod snippet;
 pub mod transaction;
 
 pub use document::{ByteEdit, DocId, Document, EditKind, FileIdentity};

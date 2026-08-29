@@ -1,0 +1,80 @@
+# Built-in Rust snippets. Users can add their own in <config>/snippets/*.toml.
+[[snippets]]
+trigger = "fn"
+description = "Function"
+body = "fn ${1:name}(${2}) ${3:-> ${4:()} }{\n    $0\n}"
+
+[[snippets]]
+trigger = "pfn"
+description = "Public function"
+body = "pub fn ${1:name}(${2}) ${3:-> ${4:()} }{\n    $0\n}"
+
+[[snippets]]
+trigger = "struct"
+description = "Struct"
+body = "#[derive(Debug, Clone)]\npub struct ${1:Name} {\n    $0\n}"
+
+[[snippets]]
+trigger = "enum"
+description = "Enum"
+body = "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum ${1:Name} {\n    ${2:Variant},$0\n}"
+
+[[snippets]]
+trigger = "impl"
+description = "impl block"
+body = "impl ${1:Type} {\n    $0\n}"
+
+[[snippets]]
+trigger = "implt"
+description = "impl Trait for Type"
+body = "impl ${1:Trait} for ${2:Type} {\n    $0\n}"
+
+[[snippets]]
+trigger = "test"
+description = "Test function"
+body = "#[test]\nfn ${1:name}() {\n    $0\n}"
+
+[[snippets]]
+trigger = "tests"
+description = "Test module"
+body = "#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn ${1:it_works}() {\n        $0\n    }\n}"
+
+[[snippets]]
+trigger = "match"
+description = "match expression"
+body = "match ${1:expr} {\n    ${2:pattern} => $0,\n}"
+
+[[snippets]]
+trigger = "iflet"
+description = "if let"
+body = "if let ${1:Some(x)} = ${2:expr} {\n    $0\n}"
+
+[[snippets]]
+trigger = "for"
+description = "for loop"
+body = "for ${1:item} in ${2:iter} {\n    $0\n}"
+
+[[snippets]]
+trigger = "while"
+description = "while loop"
+body = "while ${1:condition} {\n    $0\n}"
+
+[[snippets]]
+trigger = "pln"
+description = "println!"
+body = "println!(\"${1:{}}\"${2:, $3});$0"
+
+[[snippets]]
+trigger = "derive"
+description = "derive attribute"
+body = "#[derive(${1|Debug,Clone,Copy,PartialEq,Eq,Hash,Default|}$2)]"
+
+[[snippets]]
+trigger = "main"
+description = "main function"
+body = "fn main() {\n    $0\n}"
+
+[[snippets]]
+trigger = "mod"
+description = "module"
+body = "mod ${1:name} {\n    $0\n}"

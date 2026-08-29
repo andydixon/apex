@@ -1,0 +1,19 @@
+[[snippets]]
+trigger = "link"
+description = "Link"
+body = "[${1:text}](${2:url})$0"
+
+[[snippets]]
+trigger = "code"
+description = "Fenced code block"
+body = "```${1:language}\n$0\n```"
+
+[[snippets]]
+trigger = "table"
+description = "Table"
+body = "| ${1:Column} | ${2:Column} |\n|---|---|\n| $0 | |"
+
+[[snippets]]
+trigger = "img"
+description = "Image"
+body = "![${1:alt}](${2:path})$0"

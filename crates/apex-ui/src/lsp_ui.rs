@@ -34,6 +34,7 @@ pub enum CompletionSource {
 
 #[derive(Debug, Clone)]
 pub struct CompletionEntry {
+    pub snippet: Option<String>,
     pub label: String,
     pub detail: String,
     pub kind: String,
@@ -302,6 +303,10 @@ impl ApexApp {
                 }
             }
             LspEvent::Exited { code } => {
+                let stderr = self.lsp.clients.get(key).map(|c| c.stderr_tail()).unwrap_or_default();
+                if !stderr.trim().is_empty() {
+                    tracing::warn!("language server {} stderr:\n{stderr}", key.1);
+                }
                 self.lsp.clients.remove(key);
                 let synced: Vec<DocId> = self.lsp.synced.iter().filter(|(_, s)| &s.key == key).map(|(d, _)| *d).collect();
                 for d in synced {
@@ -315,11 +320,9 @@ impl ApexApp {
                     entry.0
                 };
                 if count >= MAX_RESTARTS {
+                    let reason = stderr.lines().last().map(|l| format!(" — {l}")).unwrap_or_default();
                     self.set_status(
-                        format!(
-                            "Language server for {} stopped {} times (exit code {:?}); not restarting. Use Tools ▸ Restart Language Server.",
-                            key.1, count, code
-                        ),
+                        format!("Language server for {} stopped {} times (exit code {:?}){reason}. Use Tools ▸ Restart Language Server.", key.1, count, code),
                         true,
                     );
                 } else {
@@ -552,6 +555,21 @@ impl ApexApp {
         }
         let mut seen: HashSet<String> = HashSet::new();
         let mut out = Vec::new();
+        let lang = self.language_of(d).id.to_string();
+        for (trigger, description, body) in self.snippet_completions(&lang, &prefix) {
+            seen.insert(trigger.clone());
+            out.push(CompletionEntry {
+                snippet: Some(body),
+                label: trigger.clone(),
+                detail: description,
+                kind: "snippet".into(),
+                insert: trigger.clone(),
+                replace: None,
+                additional: Vec::new(),
+                source: CompletionSource::Word,
+                sort: format!("!{trigger}"),
+            });
+        }
         let re = word_regex();
         // Current document first (bounded), then other open documents.
         let mut docs: Vec<&apex_edit::Document> = vec![doc];
@@ -568,6 +586,7 @@ impl ApexApp {
                 }
                 if seen.insert(w.to_string()) {
                     out.push(CompletionEntry {
+                        snippet: None,
                         label: w.to_string(),
                         detail: if i == 0 { String::new() } else { dd.title() },
                         kind: "word".into(),
@@ -687,6 +706,10 @@ impl ApexApp {
         let view = c.view;
         let head = self.views.get(&view).map(|v| v.sels.primary().head).unwrap_or(0);
         let (start, end) = item.replace.unwrap_or((c.prefix_start, head));
+        if let Some(body) = &item.snippet {
+            self.insert_snippet(view, body, Some((start, end)));
+            return;
+        }
         let insert = strip_snippet(&item.insert);
         let additional = item.additional.clone();
         self.run_edit(view, |d, s| {
@@ -763,6 +786,7 @@ impl ApexApp {
                         })
                         .collect();
                     entries.push(CompletionEntry {
+                        snippet: None,
                         label: it.label.clone(),
                         detail: it.detail.clone().unwrap_or_default().chars().take(80).collect(),
                         kind: it.kind_label().to_string(),

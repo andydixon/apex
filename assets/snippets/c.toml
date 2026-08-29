@@ -1,0 +1,29 @@
+[[snippets]]
+trigger = "main"
+description = "main"
+body = "int main(int argc, char **argv) {\n    $0\n    return 0;\n}"
+
+[[snippets]]
+trigger = "for"
+description = "for loop"
+body = "for (int ${1:i} = 0; $1 < ${2:n}; $1++) {\n    $0\n}"
+
+[[snippets]]
+trigger = "if"
+description = "if"
+body = "if (${1:condition}) {\n    $0\n}"
+
+[[snippets]]
+trigger = "struct"
+description = "struct"
+body = "typedef struct {\n    $0\n} ${1:name}_t;"
+
+[[snippets]]
+trigger = "inc"
+description = "#include"
+body = "#include <${1:stdio.h}>"
+
+[[snippets]]
+trigger = "fn"
+description = "Function"
+body = "${1:void} ${2:name}(${3:void}) {\n    $0\n}"

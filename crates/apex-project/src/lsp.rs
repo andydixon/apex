@@ -440,6 +440,7 @@ pub struct LspClient {
     shutdown_sent: Option<Instant>,
     pub started: Instant,
     pub restarts: u32,
+    stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 pub fn uri_for(path: &Path) -> String {
@@ -483,7 +484,7 @@ impl LspClient {
             return Err("no command".into());
         }
         let mut cmd = Command::new(&config.command[0]);
-        cmd.args(&config.command[1..]).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd.args(&config.command[1..]).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         for (k, v) in &config.env {
             if k.starts_with("LD_") || k.starts_with("DYLD_") {
                 continue;
@@ -498,6 +499,23 @@ impl LspClient {
         let mut child = cmd.spawn().map_err(|e| format!("could not start {:?}: {e}", config.command[0]))?;
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let tail = stderr_tail.clone();
+            std::thread::Builder::new()
+                .name("apex-lsp-stderr".into())
+                .spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines().map_while(Result::ok) {
+                        let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
+                        if t.len() >= 20 {
+                            t.pop_front();
+                        }
+                        t.push_back(line.chars().take(300).collect());
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+        }
         let (in_tx, in_rx) = unbounded();
         let (out_tx, out_rx) = bounded::<String>(1024);
         std::thread::Builder::new().name("apex-lsp-read".into()).spawn(move || reader_thread(stdout, in_tx)).map_err(|e| e.to_string())?;
@@ -518,6 +536,7 @@ impl LspClient {
             shutdown_sent: None,
             started: Instant::now(),
             restarts: 0,
+            stderr_tail,
         };
         c.send_initialize();
         Ok(c)
@@ -587,6 +606,11 @@ impl LspClient {
 
     pub fn is_running(&self) -> bool {
         self.state == ClientState::Running
+    }
+
+    /// The last lines the server wrote to stderr (for failure reports).
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail.lock().map(|t| t.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default()
     }
 
     pub fn supports(&self, capability: &str) -> bool {
@@ -742,6 +766,8 @@ impl LspClient {
         while let Ok(msg) = self.incoming.try_recv() {
             match msg {
                 Incoming::Exited => {
+                    // Give the stderr reader a moment to catch the final lines.
+                    std::thread::sleep(Duration::from_millis(30));
                     let code = self.child.try_wait().ok().flatten().and_then(|s| s.code());
                     self.state = ClientState::Exited;
                     events.push(LspEvent::Exited { code });
