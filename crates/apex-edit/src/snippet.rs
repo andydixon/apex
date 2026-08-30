@@ -13,18 +13,13 @@ use serde::{Deserialize, Serialize};
 /// A declarative snippet as stored in TOML.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+#[derive(Default)]
 pub struct SnippetDef {
     pub trigger: String,
     pub description: String,
     /// Language ids this snippet applies to (empty = all).
     pub scope: Vec<String>,
     pub body: String,
-}
-
-impl Default for SnippetDef {
-    fn default() -> Self {
-        Self { trigger: String::new(), description: String::new(), scope: Vec::new(), body: String::new() }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
