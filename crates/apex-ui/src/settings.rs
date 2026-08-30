@@ -88,6 +88,8 @@ pub struct Settings {
     pub vim_mode: bool,
     pub spell_check: bool,
     pub spell_language: String,
+    pub spell_in_comments: bool,
+    pub spell_in_strings: bool,
     pub lsp_enabled: bool,
     /// Language id → server command (argv). Known servers found on PATH are used automatically.
     pub lsp_servers: std::collections::BTreeMap<String, Vec<String>>,
@@ -173,6 +175,8 @@ impl Default for Settings {
             vim_mode: false,
             spell_check: false,
             spell_language: "en_GB".into(),
+            spell_in_comments: true,
+            spell_in_strings: false,
             lsp_enabled: true,
             lsp_servers: std::collections::BTreeMap::new(),
             large_file_mb: 64,

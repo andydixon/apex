@@ -241,13 +241,15 @@ impl ApexApp {
             }
         }
         // Hover request timing.
-        if let Some((d, pos, since, _)) = self.lsp.hover_pending
-            && since.elapsed() >= HOVER_DELAY
-        {
-            self.lsp.hover_pending = None;
-            self.lsp_request_hover(d, pos);
-        } else if self.lsp.hover_pending.is_some() {
-            repaint = true;
+        // id == 0: waiting for the pointer to rest; id != 0: request sent, waiting for the reply.
+        match self.lsp.hover_pending {
+            Some((d, pos, since, 0)) if since.elapsed() >= HOVER_DELAY => {
+                self.lsp.hover_pending = None;
+                self.lsp_request_hover(d, pos);
+            }
+            Some((_, _, since, _)) if since.elapsed() > Duration::from_secs(8) => self.lsp.hover_pending = None,
+            Some(_) => repaint = true,
+            None => {}
         }
         if self.lsp.completion.as_ref().is_some_and(|c| c.waiting_since.is_some_and(|t| t.elapsed() > Duration::from_secs(3))) {
             // Server too slow: show what we have (word completions).
@@ -446,7 +448,7 @@ impl ApexApp {
         let uri = self.lsp.synced[&d].uri.clone();
         if let Some(c) = self.lsp.clients.get_mut(&key) {
             let id = c.hover(&uri, p);
-            self.lsp.hover_pending = Some((d, pos, Instant::now() - HOVER_DELAY * 2, id));
+            self.lsp.hover_pending = Some((d, pos, Instant::now(), id));
             if !text.is_empty() {
                 text.push_str("\n\n");
             }

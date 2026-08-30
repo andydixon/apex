@@ -11,6 +11,7 @@ pub mod palette;
 pub mod settings;
 pub mod sidebar;
 pub mod snippets_ui;
+pub mod spell_ui;
 pub mod symbol_index;
 pub mod tasks_ui;
 pub mod theme;

@@ -1071,8 +1071,24 @@ pub fn paint(ui: &mut Ui, rect: Rect, view: &mut View, doc: &Document, style: &E
         let colour = match sev {
             1 => ed.diagnostic_error,
             2 => ed.diagnostic_warning,
+            4 => ed.whitespace.linear_multiply(1.6),
             _ => ed.diagnostic_info,
         };
+        if sev == 4 {
+            // Spelling: dotted underline.
+            let (line, row, xa) = locate(ui, &geo, view, doc, style, highlight, a);
+            let (lb, rb, xb) = locate(ui, &geo, view, doc, style, highlight, b.max(a + 1));
+            if let Some(y) = row_y(line, row) {
+                let xb = if (lb, rb) == (line, row) { xb } else { xa + style.char_width * 3.0 };
+                let y = y + lh - 1.5;
+                let mut x = x0 + xa;
+                while x < x0 + xb {
+                    text_painter.circle_filled(pos2(x, y), 0.8, colour);
+                    x += 3.0;
+                }
+            }
+            continue;
+        }
         let (line, row, xa) = locate(ui, &geo, view, doc, style, highlight, a);
         let (lb, rb, xb) = locate(ui, &geo, view, doc, style, highlight, b.max(a + 1));
         if let Some(y) = row_y(line, row) {

@@ -174,6 +174,7 @@ pub struct ApexApp {
     pub(crate) last_pointer: Option<egui::Pos2>,
     pub(crate) snippets: Vec<apex_edit::snippet::SnippetDef>,
     pub(crate) snippet_session: Option<crate::snippets_ui::SnippetSession>,
+    pub(crate) spell: crate::spell_ui::SpellUi,
 }
 
 const MAX_RECENT: usize = 30;
@@ -262,6 +263,7 @@ impl ApexApp {
             last_pointer: None,
             snippets: Vec::new(),
             snippet_session: None,
+            spell: Default::default(),
         };
         app.load_recent();
         app.load_macros();
@@ -791,6 +793,7 @@ impl ApexApp {
         if self.git_command(ctx, cmd)
             || self.tasks_command(ctx, cmd, arg.clone())
             || self.lsp_command(ctx, cmd, arg.clone())
+            || self.spell_command(cmd)
             || self.execute_workspace(ctx, cmd, arg.clone())
         {
             return;
@@ -2689,6 +2692,9 @@ impl ApexApp {
         if let Some(l) = self.lsp_status_label() {
             right.insert(0, l);
         }
+        if let Some(l) = self.spell_status_label() {
+            right.insert(0, l);
+        }
         let problems = self.all_problems();
         let errors = problems.iter().filter(|p| p.is_error).count();
         if !problems.is_empty() {
@@ -3143,6 +3149,9 @@ impl ApexApp {
         let Some((vid, pos)) = self.context_menu_at else { return };
         let id = egui::Id::new(("editor-context", vid.0));
         let mut cmd = None;
+        let spelling = self.views.get(&vid).map(|v| (v.doc, v.sels.primary().head)).and_then(|(d, head)| self.spell_suggestions_at(d, head));
+        let mut spell_action: Option<(usize, usize, String, Option<String>)> = None;
+        let muted = self.theme.ui.text_muted;
         let shortcuts: Vec<(Command, String)> = [
             Command::Cut,
             Command::Copy,
@@ -3161,6 +3170,21 @@ impl ApexApp {
             .open_memory(Some(egui::SetOpenCommand::Bool(true)))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
             .show(|ui| {
+                if let Some((a, b, word, suggestions)) = &spelling {
+                    ui.label(egui::RichText::new(format!("“{word}” is not in the dictionary")).color(muted));
+                    for sg in suggestions {
+                        if ui.button(sg).clicked() {
+                            spell_action = Some((*a, *b, word.clone(), Some(sg.clone())));
+                        }
+                    }
+                    if ui.button("Add to dictionary").clicked() {
+                        spell_action = Some((*a, *b, word.clone(), Some(String::new())));
+                    }
+                    if ui.button("Ignore this session").clicked() {
+                        spell_action = Some((*a, *b, word.clone(), None));
+                    }
+                    ui.separator();
+                }
                 for (c, s) in &shortcuts {
                     if ui.add(egui::Button::new(c.name()).shortcut_text(s)).clicked() {
                         cmd = Some(*c);
@@ -3168,6 +3192,16 @@ impl ApexApp {
                 }
             });
         let clicked_outside = ctx.input(|i| i.pointer.any_pressed()) && !popup.as_ref().is_some_and(|p| p.response.contains_pointer());
+        if let Some((a, b, word, action)) = spell_action {
+            match action {
+                Some(s) if s.is_empty() => self.spell_add_word(&word),
+                Some(s) => self.spell_replace(vid, a, b, &s),
+                None => self.spell_ignore_word(&word),
+            }
+            self.context_menu_at = None;
+            egui::Popup::close_id(ctx, id);
+            return;
+        }
         if let Some(c) = cmd {
             self.queue.push_back((c, None));
             self.context_menu_at = None;
@@ -3220,7 +3254,14 @@ impl ApexApp {
         self.syntax_tick(did);
         let fold_regions = self.fold_regions_for(did);
         let git_marks = self.git_marks_for(did);
-        let diagnostics = self.diagnostics_for(did);
+        let mut diagnostics = self.diagnostics_for(did);
+        if self.spell_enabled_for(did) {
+            let (first, count) = {
+                let v = &self.views[&vid];
+                (v.top_line, v.lines_per_page + 2)
+            };
+            diagnostics.extend(self.spell_ranges(did, first, first + count).into_iter().map(|(a, b)| (a, b, crate::spell_ui::SPELL_SEVERITY)));
+        }
         let (wrap, large) = {
             let view = &self.views[&vid];
             let doc = &self.docs[&did];
