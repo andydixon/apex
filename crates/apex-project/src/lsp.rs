@@ -404,6 +404,7 @@ pub enum LspEvent {
         diagnostics: Vec<Diagnostic>,
     },
     Response {
+        id: i64,
         kind: RequestKind,
         result: Result<Value, String>,
     },
@@ -584,6 +585,7 @@ impl LspClient {
         let id = self.next_id;
         self.next_id += 1;
         self.pending.insert(id, kind);
+        tracing::debug!("LSP -> {method} #{id}");
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
         id
     }
@@ -774,6 +776,7 @@ impl LspClient {
                     break;
                 }
                 Incoming::Response { id, result, error } => {
+                    tracing::debug!("LSP <- response #{id} ok={} err={}", result.is_some(), error.is_some());
                     let Some(kind) = self.pending.remove(&id) else { continue };
                     match kind {
                         RequestKind::Initialize => {
@@ -813,7 +816,7 @@ impl LspClient {
                                 (Some(r), None) => Ok(r),
                                 (None, None) => Ok(Value::Null),
                             };
-                            events.push(LspEvent::Response { kind, result: res });
+                            events.push(LspEvent::Response { id, kind, result: res });
                         }
                     }
                 }
@@ -1064,7 +1067,7 @@ while True:
                 match ev {
                     LspEvent::Ready => ready = true,
                     LspEvent::Diagnostics { diagnostics, .. } => diags = Some(diagnostics),
-                    LspEvent::Response { kind: RequestKind::Hover { .. }, result } => hover = Some(result),
+                    LspEvent::Response { kind: RequestKind::Hover { .. }, result, .. } => hover = Some(result),
                     _ => {}
                 }
             }

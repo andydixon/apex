@@ -276,7 +276,7 @@ impl ApexApp {
                     }
                 }
             }
-            LspEvent::Response { kind, result } => self.lsp_handle_response(ctx, key, kind, result),
+            LspEvent::Response { id, kind, result } => self.lsp_handle_response(ctx, key, id, kind, result),
             LspEvent::ApplyEdit { id, label, edit } => {
                 let files = edit.changes.len();
                 if files == 0 {
@@ -509,6 +509,10 @@ impl ApexApp {
             }
             return;
         }
+        if trigger_chars.contains(&last) {
+            // A trigger character starts a new request at the new position.
+            self.lsp.completion = None;
+        }
         // Existing popup: refilter on the new prefix.
         if let Some(c) = &self.lsp.completion
             && c.view == view
@@ -545,6 +549,7 @@ impl ApexApp {
                 }
             }
         }
+        tracing::debug!("completion opened: prefix={prefix:?} words={} request={:?}", state.items.len(), state.request);
         self.lsp.completion = Some(state);
         self.lsp_refilter_completion();
     }
@@ -744,7 +749,7 @@ impl ApexApp {
 
     // ----- responses -------------------------------------------------------------------
 
-    fn lsp_handle_response(&mut self, ctx: &egui::Context, key: &(PathBuf, String), kind: RequestKind, result: Result<Value, String>) {
+    fn lsp_handle_response(&mut self, ctx: &egui::Context, key: &(PathBuf, String), id: i64, kind: RequestKind, result: Result<Value, String>) {
         let result = match result {
             Ok(v) => v,
             Err(e) => {
@@ -753,6 +758,7 @@ impl ApexApp {
                 }
                 if matches!(kind, RequestKind::Completion { .. })
                     && let Some(c) = &mut self.lsp.completion
+                    && c.request == Some(id)
                 {
                     c.request = None;
                     c.waiting_since = None;
@@ -763,11 +769,12 @@ impl ApexApp {
         match kind {
             RequestKind::Completion { uri, .. } => {
                 let Some(d) = self.doc_for_uri(&uri) else { return };
-                if self.lsp.completion.as_ref().map(|c| c.doc) != Some(d) {
-                    return;
+                if self.lsp.completion.as_ref().is_none_or(|c| c.doc != d || c.request != Some(id)) {
+                    return; // popup closed or superseded by a newer request
                 }
                 let items_v = result.get("items").cloned().unwrap_or(result.clone());
                 let items: Vec<CompletionItem> = serde_json::from_value(items_v).unwrap_or_default();
+                tracing::debug!("completion response: {} items", items.len());
                 let doc = &self.docs[&d];
                 let rope = doc.rope();
                 let mut entries = Vec::with_capacity(items.len());
@@ -812,8 +819,8 @@ impl ApexApp {
             }
             RequestKind::Hover { uri } => {
                 let Some(d) = self.doc_for_uri(&uri) else { return };
-                let Some((hd, pos, _, _)) = self.lsp.hover_pending.take() else { return };
-                if hd != d {
+                let Some((hd, pos, _, hid)) = self.lsp.hover_pending.take() else { return };
+                if hd != d || hid != id {
                     return;
                 }
                 let contents = result.get("contents").map(lsp::hover_text).unwrap_or_default();
