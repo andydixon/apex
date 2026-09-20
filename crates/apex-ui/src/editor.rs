@@ -58,6 +58,8 @@ pub struct EditorStyle<'a> {
     pub fold_regions: &'a [(usize, usize)],
     pub wrap: bool,
     pub large_file: bool,
+    /// Draw a block caret (Vim normal/visual mode).
+    pub block_caret: bool,
 }
 
 /// What the widget asks the application to do, in input order.
@@ -1171,7 +1173,7 @@ pub fn paint(ui: &mut Ui, rect: Rect, view: &mut View, doc: &Document, style: &E
             let Some(y) = row_y(line, row) else { continue };
             let x = x0 + xa;
             let col = head - rope.line_to_char(line);
-            let w = if overwrite {
+            let w = if overwrite || style.block_caret {
                 let l = layout_line(ui, &geo, view, doc, line, style, highlight);
                 (l.x_of(col + 1) - l.x_of(col)).max(style.char_width)
             } else {

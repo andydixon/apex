@@ -16,6 +16,8 @@ pub mod symbol_index;
 pub mod tasks_ui;
 pub mod theme;
 pub mod view;
+pub mod vim;
+pub mod vim_ui;
 pub mod workspace;
 pub mod workspace_ui;
 

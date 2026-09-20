@@ -175,6 +175,7 @@ pub struct ApexApp {
     pub(crate) snippets: Vec<apex_edit::snippet::SnippetDef>,
     pub(crate) snippet_session: Option<crate::snippets_ui::SnippetSession>,
     pub(crate) spell: crate::spell_ui::SpellUi,
+    pub(crate) vim: crate::vim::Vim,
 }
 
 const MAX_RECENT: usize = 30;
@@ -264,6 +265,7 @@ impl ApexApp {
             snippets: Vec::new(),
             snippet_session: None,
             spell: Default::default(),
+            vim: crate::vim::Vim::new(),
         };
         app.load_recent();
         app.load_macros();
@@ -617,7 +619,13 @@ impl ApexApp {
             dialog = dialog.set_file_name(format!("{}.txt", doc.title().to_lowercase().replace(' ', "-")));
         }
         let Some(path) = dialog.save_file() else { return false };
-        let path = normalise_path(&path);
+        self.save_view_to(vid, normalise_path(&path))
+    }
+
+    /// Save the view's document under a new path.
+    pub(crate) fn save_view_to(&mut self, vid: ViewId, path: PathBuf) -> bool {
+        let Some(view) = self.views.get(&vid) else { return false };
+        let did = view.doc;
         // Saving over a file open in another tab would desynchronise it.
         if self.docs.values().any(|d| d.id != did && d.path.as_ref() == Some(&path)) {
             self.set_status(format!("{} is already open in another tab; close it first", path.display()), true);
@@ -787,6 +795,9 @@ impl ApexApp {
     }
 
     pub(crate) fn execute(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) {
+        if self.vim_command(ctx, cmd) {
+            return;
+        }
         if cmd.is_recordable() {
             self.record_step(crate::workspace_ui::MacroStep::Command(cmd, arg.clone()));
         }
@@ -820,6 +831,12 @@ impl ApexApp {
                 let v = self.new_untitled();
                 self.focus_view(v);
             }
+            Command::OpenFile if arg.is_some() => {
+                let raw = arg.clone().unwrap_or_default();
+                let p = std::path::PathBuf::from(&raw);
+                let p = if p.is_absolute() { p } else { self.current_dir().unwrap_or_default().join(p) };
+                self.open_path(&normalise_path(&p));
+            }
             Command::OpenFile => {
                 let mut dialog = rfd::FileDialog::new().set_title("Open File");
                 if let Some(dir) = self.current_dir() {
@@ -850,7 +867,16 @@ impl ApexApp {
             }
             Command::Save => {
                 let v = view!();
-                self.save_view(v, false);
+                match arg.clone() {
+                    Some(raw) => {
+                        let p = std::path::PathBuf::from(&raw);
+                        let p = if p.is_absolute() { p } else { self.current_dir().unwrap_or_default().join(p) };
+                        self.save_view_to(v, normalise_path(&p));
+                    }
+                    None => {
+                        self.save_view(v, false);
+                    }
+                }
             }
             Command::SaveAs => {
                 let v = view!();
@@ -906,7 +932,11 @@ impl ApexApp {
             }
             Command::CloseTab => {
                 let v = view!();
-                self.request_close(vec![v], AfterClose::CloseViews);
+                if arg.as_deref() == Some("force") {
+                    self.finish_close(vec![v], AfterClose::CloseViews);
+                } else {
+                    self.request_close(vec![v], AfterClose::CloseViews);
+                }
             }
             Command::CloseOtherTabs => {
                 let v = view!();
@@ -924,7 +954,11 @@ impl ApexApp {
             }
             Command::Quit | Command::CloseWindow => {
                 let all: Vec<ViewId> = self.views.keys().copied().collect();
-                self.request_close(all, AfterClose::Quit);
+                if arg.as_deref() == Some("force") {
+                    self.finish_close(all, AfterClose::Quit);
+                } else {
+                    self.request_close(all, AfterClose::Quit);
+                }
             }
             Command::CopyFilePath => {
                 if let Some(p) = active.and_then(|(_, d)| self.docs.get(&d)).and_then(|d| d.path.clone()) {
@@ -1441,7 +1475,10 @@ impl ApexApp {
             }
             Command::UseSelectionForFind => {
                 let v = view!();
-                if let Some(t) = self.with_view(v, |view, doc| doc.rope().slice(view.sels.primary().range()).to_string())
+                if let Some(pattern) = arg.clone() {
+                    self.find.needle = pattern;
+                    self.find.options.regex = true;
+                } else if let Some(t) = self.with_view(v, |view, doc| doc.rope().slice(view.sels.primary().range()).to_string())
                     && !t.is_empty()
                 {
                     self.find.needle = t;
@@ -2672,6 +2709,9 @@ impl ApexApp {
             if view.overwrite {
                 left.push_str("    OVR");
             }
+            if let Some(v) = self.vim_status_label() {
+                left = format!("{v}    {left}");
+            }
             if !self.keymap.pending().is_empty() {
                 left.push_str(&format!("    {} …", self.keymap.pending().iter().map(|k| k.to_string()).collect::<Vec<_>>().join(" ")));
             }
@@ -3281,6 +3321,7 @@ impl ApexApp {
             fold_regions: &fold_regions,
             wrap,
             large_file: large,
+            block_caret: self.vim_block_caret(),
         };
         let muted = settings.muted_syntax || settings.low_distraction;
         let mut actions = Vec::new();
@@ -3517,6 +3558,15 @@ impl eframe::App for ApexApp {
                     }
                 }
             }
+        }
+        if self.settings.vim_mode
+            && editor_focused
+            && !self.palette.open
+            && self.dialog.is_none()
+            && self.lsp.completion.is_none()
+            && self.snippet_session.is_none()
+        {
+            self.vim_input(&ctx);
         }
         if self.lsp_completion_key(&ctx) || self.snippet_key(&ctx) {
             ctx.request_repaint();
