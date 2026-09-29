@@ -22,4 +22,4 @@ pub mod vim_ui;
 pub mod workspace;
 pub mod workspace_ui;
 
-pub use app::{ApexApp, StartupArgs};
+pub use app::{ApexApp, OpenRequest, StartupArgs};

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Apex
+GenericName=Text Editor
+Comment=A native, high-performance text editor
+Exec=apex %F
+TryExec=apex
+Icon=apex
+Terminal=false
+Categories=Development;TextEditor;Utility;
+MimeType=text/plain;text/x-rust;text/x-python;text/x-csrc;text/x-c++src;text/x-chdr;text/x-java;text/x-go;text/javascript;text/x-typescript;text/html;text/css;text/markdown;text/x-shellscript;text/x-makefile;application/toml;application/yaml;application/json;application/xml;application/x-shellscript;inode/directory;
+Keywords=editor;code;text;programming;
+StartupNotify=true
+StartupWMClass=apex

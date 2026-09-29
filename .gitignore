@@ -4,3 +4,8 @@
 /dist
 /.idea
 /.vscode
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/Cargo.lock

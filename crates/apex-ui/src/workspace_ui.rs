@@ -1552,7 +1552,8 @@ impl ApexApp {
             self.set_project_tasks(Vec::new());
         }
         if let Some(settings) = table.get("settings").and_then(|s| s.as_table()) {
-            let src = toml::to_string(settings).unwrap_or_default();
+            let settings = crate::settings_ui::project_safe_settings(settings);
+            let src = toml::to_string(&settings).unwrap_or_default();
             let (merged, issues) = crate::settings::Settings::parse_layer(&self.settings, &src, &path.display().to_string());
             self.settings = merged;
             for i in issues {

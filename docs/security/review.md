@@ -1,0 +1,173 @@
+# Security review
+
+Scope: Apex 0.1 as built from this repository. This is a review of the
+trust boundaries in the code, what each one relies on, and what is known to
+be missing. It complements `SECURITY.md` (reporting, threat model) and
+`docs/security/file-handling.md` (data integrity).
+
+## What Apex is and is not
+
+Apex is a local, offline editor. It never opens a network connection,
+reads no credentials, has no accounts, telemetry or update checks, and
+embeds no scripting runtime. The only ways for data to enter the process
+are: files the user opens (and their directory listings), configuration
+files in the user's own directories, language-server processes the user
+has installed, build tasks the user runs, the clipboard, and the loopback
+single-instance socket. Those are the boundaries reviewed below.
+
+## 1. Untrusted file contents
+
+**Threat**: a crafted file crashes the editor, hangs it, or makes it write
+somewhere unexpected.
+
+* Loading is bounded: `fileio::load` reads into memory, decodes with
+  `encoding_rs` (never panics on malformed input; replacement characters
+  are inserted and the file is marked lossy), and files above
+  `large_file_mb` open in large-file mode with highlighting, minimap detail,
+  word wrap and spell checking off. A 500 MB file is still one allocation;
+  there is no memory-mapped or streamed mode (known limitation).
+* Binary detection (NUL bytes / UTF-16 heuristics) sends binaries to a
+  read-only hex preview; saving a hex preview is refused.
+* Every offset conversion is total (`apex-buffer` fuzz target `offsets`),
+  and every edit goes through `Transaction::clamped` so out-of-range
+  positions from any source cannot index past the rope.
+* Tree-sitter parsing is time-budgeted per frame and moves to a background
+  thread for large files; pathological inputs degrade to unhighlighted text
+  rather than a stalled UI. Grammars are compiled in (no grammar loading
+  from disk), so there is no WASM or dynamic library loading.
+* Regular expressions from the find bar, Find in Files and problem matchers
+  are compiled with size limits (`search::Query`), and matches are capped.
+* Rendering only lays out visible lines, and a single line is capped at
+  `MAX_LAYOUT_CHARS` for shaping, so a multi-megabyte line cannot exhaust
+  the text shaper.
+
+**Residual risk**: tree-sitter grammars are C code compiled from
+third-party crates; a grammar bug on crafted input could crash the process
+(not escalate). Recovery snapshots limit the damage of a crash to the last
+few seconds of typing.
+
+## 2. Configuration files
+
+**Threat**: a malformed `settings.toml`, key map or theme disables the
+editor.
+
+* All three parse with full diagnostics and fall back to defaults per key;
+  values are clamped (`Settings::sanitise`). The `settings` fuzz target
+  covers the three parsers. Unknown keys are reported, never silently
+  applied.
+* Project files (`*.apex-project.toml`) may come from a repository, so they
+  are treated as untrusted: their `[settings]` cannot point at programs
+  (no `lsp_servers` override from project files; see "Known limitations")
+  and their `[[tasks]]` do nothing until the workspace is trusted (below).
+
+## 3. Running programs: build tasks
+
+**Threat**: opening a repository runs attacker-chosen commands.
+
+* Tasks defined in a project file are inert until **Project > Trust
+  Workspace** has been confirmed for that folder. The decision is stored in
+  the user's data directory, keyed by canonical path, never in the
+  repository, so cloning a repo cannot pre-trust itself.
+* Detected tasks (`cargo build`, `make`, …) run the well-known tool names
+  from `PATH`; `PATH` itself is not taken from the project. The exact
+  command and directory are printed as the first line of the output.
+* Commands are spawned without a shell unless `shell = true` is set
+  explicitly in the task; arguments are passed as an argv vector.
+  Environment: the editor's environment plus the task's `env`; nothing is
+  injected from settings.
+* Processes run in their own process group on Unix (`killpg` on cancel)
+  and are killed with `taskkill /T` on Windows, so Cancel takes the whole
+  tree; a `timeout_secs` cap is enforced.
+* Output is sanitised (`tasks::sanitise_output`): ANSI/OSC escape sequences
+  are stripped before display, so a build cannot forge UI text or exploit
+  terminal-style escapes.
+
+## 4. Language servers
+
+**Threat**: a malicious or buggy server feeds the client bad data.
+
+* Servers are started only from `known_servers()` (fixed argv for programs
+  found on `PATH`) or the user's own `lsp_servers` setting. Project files
+  cannot configure servers.
+* The client parses JSON-RPC with a message size limit and ignores
+  malformed frames; every position from the server is converted with
+  clamped UTF-16 arithmetic; ranges are validated against the current
+  document version before an edit is applied.
+* `workspace/applyEdit` and rename results that touch files not open in
+  the editor are listed and confirmed by the user before being written
+  (atomic save, same path rules as any save).
+* The server's stderr is captured for diagnostics only; the editor sends
+  only document contents the user opened and the workspace folder list.
+* A server that exits repeatedly is left stopped after three restarts.
+
+## 5. Single-instance socket and `--wait`
+
+**Threat**: another local process injects "open this file" requests.
+
+* The listener binds `127.0.0.1` on an ephemeral port; the port and a
+  256-bit random token are written to `instance.json` in the per-user
+  runtime directory with owner-only permissions (`ensure_private_dir`,
+  0700/0600). A client must present the token; comparison is constant
+  time and a mismatch closes the connection without a reply.
+* Requests are one JSON line, capped at 1 MiB, with a read timeout; they
+  can only ask the editor to open paths, show a diff, or wait for a tab to
+  close. No command execution is reachable through the socket.
+* On Windows the runtime directory inherits the user profile's ACLs; the
+  token is the protection there.
+
+**Residual risk**: a process running as the same user can read the token
+and open files in the editor — equivalent to what it could do by running
+`apex` itself.
+
+## 6. Sessions, recovery and the user dictionary
+
+* Written atomically to the user's data directory with private
+  permissions; parsed with serde and rejected (renamed `*.damaged`) when
+  invalid, so corruption cannot stop start-up (`session` fuzz target).
+* Recovery snapshots contain unsaved text; they live only in that private
+  directory and are deleted when the file is saved or the restore is
+  declined.
+
+## 7. Git
+
+* libgit2 is used read-only except **Revert Hunk**, which rewrites the
+  buffer (not the repository) and requires confirmation. Hooks are never
+  executed because Apex never commits, checks out or merges.
+
+## 8. Dependencies and build
+
+* All crates are from crates.io with permissive licences compatible with
+  AGPL-3.0-or-later (`CONTRIBUTING.md` states the rule; `cargo tree` and
+  `cargo license` list them). libgit2 is built from the vendored source in
+  the `git2` crate; tree-sitter grammars are compiled from their crates.
+* Release builds use `panic = "unwind"` so a panic in a background thread
+  (syntax, search, git) is contained by that thread; the UI thread wraps
+  background results and reports failures as status messages.
+
+## Known limitations (security-relevant)
+
+1. **No sandboxing of child processes.** Build tasks and language servers
+   run with the user's full privileges, as in every mainstream editor;
+   trust gating is the mitigation.
+2. **Project files cannot be fully isolated.** `[settings]` from a project
+   can change editing behaviour (indentation, encoding, formatting on
+   save). Keys that name programs are deliberately not honoured from
+   project files.
+3. **Whole-file loading.** Very large files cost their size in memory.
+4. **No signature verification of dictionaries, themes or snippets.** They
+   are plain data in the user's own directory; a malicious snippet can only
+   insert text.
+5. **macOS Apple Event handler** accepts file URLs from the system; any app
+   that can send Apple Events to Apex (same user session) can ask it to
+   open files, which is the platform's normal behaviour.
+6. **Windows runtime directory permissions** rely on the profile ACLs
+   rather than explicit 0600 modes.
+
+## Verification performed
+
+* `cargo test --workspace` (unit, property and integration tests) and
+  `cargo clippy -- -D warnings` on every commit.
+* Fuzz targets built with `cargo +nightly fuzz build`; see
+  `docs/performance/benchmarks.md` for the run log of each target.
+* Scripted Xvfb sessions for the editing path, Vim mode, single-instance
+  IPC and `--wait`.

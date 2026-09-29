@@ -1,0 +1,50 @@
+[package]
+name = "apex-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+apex-buffer = { path = "../crates/apex-buffer" }
+apex-edit = { path = "../crates/apex-edit" }
+apex-project = { path = "../crates/apex-project" }
+apex-ui = { path = "../crates/apex-ui" }
+serde_json = "1"
+
+# The fuzz crate is deliberately outside the main workspace.
+[workspace]
+
+[[bin]]
+name = "transactions"
+path = "fuzz_targets/transactions.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "offsets"
+path = "fuzz_targets/offsets.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "settings"
+path = "fuzz_targets/settings.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "search"
+path = "fuzz_targets/search.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false

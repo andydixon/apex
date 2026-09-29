@@ -256,11 +256,11 @@ keys = "primary+shift+i"
 command = "edit.format"
 context = "editor"
 [[bindings]]
-keys = "primary+q"
+keys = "primary+alt+r"
 command = "macro.record"
 context = "editor"
 [[bindings]]
-keys = "primary+shift+q"
+keys = "primary+alt+shift+r"
 command = "macro.play"
 context = "editor"
 

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -34,13 +35,51 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      - name: Release build
-        run: cargo build --release --workspace
-      - name: Upload binary
+      - name: Benchmarks compile
+        run: cargo bench --workspace --no-run
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: packaging/linux/build.sh
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: packaging/macos/build.sh
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: powershell -File packaging/windows/build.ps1
+      - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
           name: apex-${{ matrix.os }}
           path: |
-            target/release/apex
-            target/release/apex.exe
-          if-no-files-found: ignore
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.dmg
+            dist/Apex.app
+            dist/*.zip
+            dist/*-setup.exe
+          if-no-files-found: error
+
+  fuzz-build:
+    name: fuzz targets build (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build and smoke-run each target for 20 s
+        working-directory: fuzz
+        run: |
+          cargo fuzz build
+          for t in transactions offsets settings search session; do
+            cargo fuzz run "$t" -- -max_total_time=20
+          done

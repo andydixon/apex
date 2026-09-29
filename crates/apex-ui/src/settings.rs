@@ -18,7 +18,8 @@ pub enum WhitespaceMode {
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub theme: String,
-    /// `"auto"` follows the system; otherwise `"dark"` or `"light"` picks the fallback theme.
+    /// `"auto"` switches between the dark and light variant of `theme` with the
+    /// system preference; `"dark"` or `"light"` keeps `theme` as chosen.
     pub theme_mode: String,
     pub font_family: String,
     pub font_size: f32,

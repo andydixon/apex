@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>                 <string>Apex</string>
+  <key>CFBundleDisplayName</key>          <string>Apex</string>
+  <key>CFBundleIdentifier</key>           <string>cx.dixon.apex</string>
+  <key>CFBundleExecutable</key>           <string>apex</string>
+  <key>CFBundlePackageType</key>          <string>APPL</string>
+  <key>CFBundleSignature</key>            <string>APEX</string>
+  <key>CFBundleIconFile</key>             <string>apex</string>
+  <key>CFBundleIconName</key>             <string>apex</string>
+  <key>CFBundleVersion</key>              <string>@VERSION@</string>
+  <key>CFBundleShortVersionString</key>   <string>@VERSION@</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleDevelopmentRegion</key>    <string>en_GB</string>
+  <key>LSMinimumSystemVersion</key>       <string>11.0</string>
+  <key>LSApplicationCategoryType</key>    <string>public.app-category.developer-tools</string>
+  <key>NSHighResolutionCapable</key>      <true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key> <true/>
+  <key>NSHumanReadableCopyright</key>     <string>Licensed under the GNU AGPL v3.0 or later</string>
+  <!-- Finder "Open With", Dock drops and double-clicks arrive as Apple Events
+       handled in crates/apex-app/src/macos.rs. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>     <string>Text document</string>
+      <key>CFBundleTypeRole</key>     <string>Editor</string>
+      <key>LSHandlerRank</key>        <string>Default</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.plain-text</string>
+        <string>public.text</string>
+        <string>public.source-code</string>
+        <string>public.script</string>
+        <string>public.shell-script</string>
+        <string>public.json</string>
+        <string>public.xml</string>
+        <string>public.yaml</string>
+        <string>net.daringfireball.markdown</string>
+        <string>public.c-source</string>
+        <string>public.c-plus-plus-source</string>
+        <string>public.c-header</string>
+        <string>public.python-script</string>
+        <string>public.ruby-script</string>
+        <string>public.perl-script</string>
+        <string>public.html</string>
+        <string>public.css</string>
+        <string>com.netscape.javascript-source</string>
+        <string>public.comma-separated-values-text</string>
+        <string>public.log</string>
+      </array>
+    </dict>
+    <dict>
+      <!-- Any other file: listed under "Open With" without claiming it. -->
+      <key>CFBundleTypeName</key>     <string>Any file</string>
+      <key>CFBundleTypeRole</key>     <string>Editor</string>
+      <key>LSHandlerRank</key>        <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.data</string>
+        <string>public.content</string>
+      </array>
+    </dict>
+    <dict>
+      <!-- Folders open as workspace roots. -->
+      <key>CFBundleTypeName</key>     <string>Folder</string>
+      <key>CFBundleTypeRole</key>     <string>Viewer</string>
+      <key>LSHandlerRank</key>        <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.folder</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>

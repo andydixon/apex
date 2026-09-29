@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>cx.dixon.apex</id>
+  <name>Apex</name>
+  <summary>A native, high-performance text editor</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <description>
+    <p>Apex is a Sublime-inspired editor written in Rust: multiple cursors, incremental syntax highlighting, project-wide search, git awareness, build tasks and an optional language-server client. It works entirely offline and never sends data anywhere.</p>
+  </description>
+  <launchable type="desktop-id">apex.desktop</launchable>
+  <provides><binary>apex</binary></provides>
+  <categories><category>Development</category><category>TextEditor</category></categories>
+  <content_rating type="oars-1.1"/>
+</component>

@@ -7,6 +7,11 @@ use std::path::PathBuf;
 use apex_ui::{ApexApp, StartupArgs};
 use clap::Parser;
 
+mod ipc;
+#[cfg(target_os = "macos")]
+mod macos;
+mod open_requests;
+
 #[derive(Parser, Debug)]
 #[command(name = "apex", version, about = "Apex — a native, high-performance text editor", long_about = None)]
 struct Cli {
@@ -47,7 +52,9 @@ fn parse_path_arg(arg: &str) -> (PathBuf, Option<usize>, Option<usize>) {
 }
 
 fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
+    // Finder may still pass a process serial number on old systems; it is not an argument.
+    let argv = std::env::args_os().filter(|a| !a.to_string_lossy().starts_with("-psn_"));
+    let cli = Cli::parse_from(argv);
     let filter = std::env::var("APEX_LOG").unwrap_or_else(|_| cli.log.clone());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_new(filter).unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")))
@@ -63,11 +70,32 @@ fn main() -> std::process::ExitCode {
             args.files.push((path, line, col));
         }
     }
-    if let Some(d) = &cli.diff {
-        for p in d {
-            args.files.push((PathBuf::from(p), None, None));
+    if let Some(d) = &cli.diff
+        && let [old, new] = d.as_slice()
+    {
+        args.diff = Some((PathBuf::from(old), PathBuf::from(new)));
+    }
+
+    // Hand the request to a running instance unless a new window was asked for.
+    if !cli.new_window {
+        let req = ipc::Request { files: args.files.clone(), folders: args.folders.clone(), diff: args.diff.clone(), wait: cli.wait, ..Default::default() };
+        match ipc::try_send(req) {
+            Ok(true) => return std::process::ExitCode::SUCCESS,
+            Ok(false) => {}
+            Err(e) => tracing::warn!("could not contact a running instance: {e}"),
+        }
+        if cli.reuse_window && (cli.paths.is_empty() && cli.diff.is_none()) {
+            tracing::info!("no running instance to reuse; starting one");
         }
     }
+    match ipc::serve() {
+        Ok(p) => tracing::debug!("single-instance socket recorded in {}", p.display()),
+        Err(e) => tracing::warn!("single-instance server not started: {e}"),
+    }
+    args.on_view_closed = Some(std::sync::Arc::new(|p: &std::path::Path| ipc::view_closed(p)));
+    args.inbox = Some(open_requests::init());
+    #[cfg(target_os = "macos")]
+    macos::install();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -79,7 +107,13 @@ fn main() -> std::process::ExitCode {
         centered: true,
         ..Default::default()
     };
-    match eframe::run_native(apex_project::paths::APP_NAME, options, Box::new(|cc| Ok(Box::new(ApexApp::new(cc, args))))) {
+    let creator = Box::new(|cc: &eframe::CreationContext<'_>| {
+        open_requests::set_context(cc.egui_ctx.clone());
+        Ok(Box::new(ApexApp::new(cc, args)) as Box<dyn eframe::App>)
+    });
+    let result = eframe::run_native(apex_project::paths::APP_NAME, options, creator);
+    ipc::shutdown();
+    match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("apex: could not start the graphical interface: {e}");

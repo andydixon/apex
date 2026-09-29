@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Apex application icon. Source of truth for every generated size; see packaging/icons/generate.sh. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b3140"/>
+      <stop offset="1" stop-color="#171a22"/>
+    </linearGradient>
+    <linearGradient id="peak" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7cc4ff"/>
+      <stop offset="1" stop-color="#3d8fe0"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="200" ry="200" fill="url(#bg)"/>
+  <rect x="64" y="64" width="896" height="896" rx="200" ry="200" fill="none" stroke="#5a6478" stroke-width="12" opacity="0.6"/>
+  <!-- The apex: a peaked "A" drawn as a caret stroke -->
+  <path d="M 236 760 L 512 232 L 788 760" fill="none" stroke="url(#peak)" stroke-width="112" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Crossbar as a text caret -->
+  <rect x="440" y="600" width="144" height="56" rx="14" fill="#f3f6fb"/>
+</svg>

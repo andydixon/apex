@@ -47,7 +47,7 @@ const ENTRIES: &[Entry] = &[
         key: "theme_mode",
         category: "Appearance",
         label: "Theme mode",
-        help: "auto follows the system; dark or light picks the fallback.",
+        help: "auto swaps the theme's dark/light variant with the system preference.",
         kind: Kind::Choice(&["auto", "dark", "light"]),
     },
     Entry { key: "font_family", category: "Appearance", label: "Editor font", help: "Family name, or monospace for the bundled font.", kind: Kind::Text },
@@ -253,6 +253,22 @@ const ENTRIES: &[Entry] = &[
     },
 ];
 
+/// Keys a project file may not set: anything that names a program to run.
+/// Project files can come from a cloned repository, so they must not be able
+/// to point the editor at an attacker-chosen executable.
+pub const PROJECT_FORBIDDEN_KEYS: &[&str] = &["lsp_servers"];
+
+/// The project `[settings]` table with forbidden keys removed (and logged).
+pub fn project_safe_settings(table: &toml::Table) -> toml::Table {
+    let mut t = table.clone();
+    for k in PROJECT_FORBIDDEN_KEYS {
+        if t.remove(*k).is_some() {
+            tracing::warn!("project file: `{k}` is ignored in project settings (set it in your own settings.toml)");
+        }
+    }
+    t
+}
+
 impl ApexApp {
     pub(crate) fn settings_path(&self) -> PathBuf {
         self.config_dir.join("settings.toml")
@@ -290,7 +306,8 @@ impl ApexApp {
             && let Ok(table) = toml::from_str::<toml::Table>(&src)
             && let Some(ps) = table.get("settings").and_then(|v| v.as_table())
         {
-            let (merged, more) = Settings::parse_layer(&s, &toml::to_string(ps).unwrap_or_default(), &p.display().to_string());
+            let ps = project_safe_settings(ps);
+            let (merged, more) = Settings::parse_layer(&s, &toml::to_string(&ps).unwrap_or_default(), &p.display().to_string());
             s = merged;
             issues.extend(more);
         }
@@ -671,6 +688,14 @@ mod tests {
 
     /// Every entry must resolve to a field of its declared kind, and every
     /// settings key (except the structured lsp_servers map) must have an entry.
+    #[test]
+    fn project_settings_cannot_name_programs() {
+        let t: toml::Table = toml::from_str("tab_width = 2\n[lsp_servers]\nrust = [\"evil\"]\n").unwrap();
+        let safe = project_safe_settings(&t);
+        assert!(safe.get("lsp_servers").is_none());
+        assert_eq!(safe.get("tab_width").and_then(|v| v.as_integer()), Some(2));
+    }
+
     #[test]
     fn entries_cover_settings() {
         let mut s = Settings::default();

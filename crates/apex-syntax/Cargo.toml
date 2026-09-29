@@ -43,3 +43,10 @@ tree-sitter-ini = "1.4"
 tree-sitter-make = "1.1"
 tree-sitter-cmake = "0.7"
 tree-sitter-regex = "0.25"
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "highlight"
+harness = false

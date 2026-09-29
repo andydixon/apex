@@ -21,10 +21,35 @@ use crate::workspace::{Axis, Layout, Pane, PaneId};
 use apex_syntax::SyntaxState;
 
 /// Options passed from the command line.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct StartupArgs {
     pub files: Vec<(PathBuf, Option<usize>, Option<usize>)>,
     pub folders: Vec<PathBuf>,
+    /// Files and folders arriving after start-up (Finder "Open With", a second
+    /// `apex` invocation). The sender must call `Context::request_repaint`.
+    pub inbox: Option<crossbeam_channel::Receiver<OpenRequest>>,
+    /// Called when the last view of a file closes (used for `apex --wait`).
+    pub on_view_closed: Option<ViewClosedHook>,
+    /// `apex --diff old new` at start-up.
+    pub diff: Option<(PathBuf, PathBuf)>,
+}
+
+impl std::fmt::Debug for StartupArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartupArgs").field("files", &self.files).field("folders", &self.folders).field("diff", &self.diff).finish_non_exhaustive()
+    }
+}
+
+/// Callback for `apex --wait`: the last view of this path was closed.
+pub type ViewClosedHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+/// A request to open paths in the running editor.
+#[derive(Debug, Clone, Default)]
+pub struct OpenRequest {
+    pub files: Vec<(PathBuf, Option<usize>, Option<usize>)>,
+    pub folders: Vec<PathBuf>,
+    /// Show a unified diff of two files.
+    pub diff: Option<(PathBuf, PathBuf)>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +202,10 @@ pub struct ApexApp {
     pub(crate) spell: crate::spell_ui::SpellUi,
     pub(crate) vim: crate::vim::Vim,
     pub(crate) settings_panel: crate::settings_ui::SettingsPanel,
+    pub(crate) inbox: Option<crossbeam_channel::Receiver<OpenRequest>>,
+    pub(crate) on_view_closed: Option<ViewClosedHook>,
+    /// `APEX_FRAME_TIME=1`: show the frame interval in the status bar.
+    pub(crate) show_frame_time: bool,
 }
 
 const MAX_RECENT: usize = 30;
@@ -268,6 +297,9 @@ impl ApexApp {
             spell: Default::default(),
             vim: crate::vim::Vim::new(),
             settings_panel: Default::default(),
+            inbox: args.inbox.clone(),
+            on_view_closed: args.on_view_closed.clone(),
+            show_frame_time: std::env::var_os("APEX_FRAME_TIME").is_some(),
         };
         app.load_recent();
         app.load_macros();
@@ -277,16 +309,7 @@ impl ApexApp {
         {
             app.restore_session(session);
         }
-        for folder in &args.folders {
-            app.add_root(folder);
-        }
-        for (path, line, col) in &args.files {
-            if let Some(v) = app.open_path(path)
-                && let Some(l) = line
-            {
-                app.goto_line_col(v, *l, col.unwrap_or(1));
-            }
-        }
+        app.open_request(&cc.egui_ctx, &OpenRequest { files: args.files.clone(), folders: args.folders.clone(), diff: args.diff.clone() });
         if app.views.is_empty() {
             app.new_untitled();
         }
@@ -296,6 +319,31 @@ impl ApexApp {
             app.startup_recovery_check();
         }
         app
+    }
+
+    /// `theme_mode = "auto"`: switch between the dark and light variant of the
+    /// chosen theme family when the system preference changes.
+    pub(crate) fn follow_system_theme(&mut self, ctx: &egui::Context) {
+        if self.settings.theme_mode != "auto" {
+            return;
+        }
+        let Some(sys) = ctx.system_theme() else { return };
+        let want_dark = sys == egui::Theme::Dark;
+        if self.theme.dark == want_dark {
+            return;
+        }
+        // Prefer the counterpart in the same family ("Solar Dark" ↔ "Solar Light"), else the defaults.
+        let family = self.theme.name.trim_end_matches(" Dark").trim_end_matches(" Light").to_string();
+        let counterpart = self
+            .themes
+            .iter()
+            .find(|t| t.dark == want_dark && t.name.starts_with(&family))
+            .or_else(|| self.themes.iter().find(|t| t.name == if want_dark { "Apex Dark" } else { "Apex Light" }));
+        if let Some(t) = counterpart.cloned() {
+            self.theme = t;
+            self.theme.apply_to_egui(ctx);
+            self.invalidate_all_layouts();
+        }
     }
 
     pub(crate) fn pick_theme(themes: &[Theme], name: &str, config_dir: &Path) -> Theme {
@@ -330,6 +378,61 @@ impl ApexApp {
     pub(crate) fn active_ids(&self) -> Option<(ViewId, DocId)> {
         let v = self.active_view_id()?;
         Some((v, self.views.get(&v)?.doc))
+    }
+
+    /// Open the folders and files of a request; files with a line jump there.
+    pub(crate) fn open_request(&mut self, ctx: &egui::Context, req: &OpenRequest) {
+        for folder in &req.folders {
+            self.add_root(folder);
+        }
+        for (path, line, col) in &req.files {
+            if let Some(v) = self.open_path(path)
+                && let Some(l) = line
+            {
+                self.goto_line_col(v, *l, col.unwrap_or(1));
+            }
+        }
+        if let Some((old, new)) = &req.diff {
+            self.open_diff(ctx, old, new);
+        }
+    }
+
+    /// Open a read-only unified diff of two files (`apex --diff old new`).
+    pub(crate) fn open_diff(&mut self, ctx: &egui::Context, old: &Path, new: &Path) {
+        let fallback = apex_buffer::Encoding::Legacy(encoding_rs::WINDOWS_1252);
+        let load = |p: &Path| apex_project::fileio::load(p, None, fallback).map(|l| l.text);
+        let (a, b) = match (load(old), load(new)) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(e), _) => {
+                self.set_status(format!("Could not read {}: {e}", old.display()), true);
+                return;
+            }
+            (_, Err(e)) => {
+                self.set_status(format!("Could not read {}: {e}", new.display()), true);
+                return;
+            }
+        };
+        let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string());
+        if a == b {
+            self.set_status(format!("{} and {} are identical", name(old), name(new)), false);
+            return;
+        }
+        let diff = apex_project::git::unified_diff(&a, &b, &old.display().to_string(), &new.display().to_string());
+        self.open_scratch_doc(&format!("{} vs {}.diff", name(old), name(new)), &diff, Some("diff"), true, ctx);
+    }
+
+    /// Requests queued by the platform or a second invocation since the last frame.
+    pub(crate) fn poll_inbox(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.inbox.clone() else { return };
+        let mut any = false;
+        while let Ok(req) = rx.try_recv() {
+            self.open_request(ctx, &req);
+            any = true;
+        }
+        if any {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.focus_active_editor(ctx);
+        }
     }
 
     pub(crate) fn new_untitled(&mut self) -> ViewId {
@@ -482,6 +585,9 @@ impl ApexApp {
             && let Some(doc) = self.docs.remove(&view.doc)
             && let Some(p) = doc.path
         {
+            if let Some(cb) = &self.on_view_closed {
+                cb(&p);
+            }
             self.closed_tabs.push(ClosedTab { path: p, sels: view.sels.clone(), scroll: view.scroll });
             if self.closed_tabs.len() > 20 {
                 self.closed_tabs.remove(0);
@@ -2719,6 +2825,10 @@ impl ApexApp {
         if let Some(b) = self.git_branch_label() {
             right.insert(0, format!("git: {b}"));
         }
+        if self.show_frame_time {
+            let dt = ui.input(|i| i.stable_dt);
+            right.push(format!("{:.1} ms", dt * 1000.0));
+        }
         if let Some(l) = self.lsp_status_label() {
             right.insert(0, l);
         }
@@ -3558,6 +3668,8 @@ impl eframe::App for ApexApp {
         {
             self.vim_input(&ctx);
         }
+        self.poll_inbox(&ctx);
+        self.follow_system_theme(&ctx);
         if self.lsp_completion_key(&ctx) || self.snippet_key(&ctx) {
             ctx.request_repaint();
         }
