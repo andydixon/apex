@@ -176,6 +176,7 @@ pub struct ApexApp {
     pub(crate) snippet_session: Option<crate::snippets_ui::SnippetSession>,
     pub(crate) spell: crate::spell_ui::SpellUi,
     pub(crate) vim: crate::vim::Vim,
+    pub(crate) settings_panel: crate::settings_ui::SettingsPanel,
 }
 
 const MAX_RECENT: usize = 30;
@@ -266,6 +267,7 @@ impl ApexApp {
             snippet_session: None,
             spell: Default::default(),
             vim: crate::vim::Vim::new(),
+            settings_panel: Default::default(),
         };
         app.load_recent();
         app.load_macros();
@@ -584,6 +586,9 @@ impl ApexApp {
                 let enc = doc.encoding;
                 self.forget_recovery(did);
                 self.git_mark_dirty();
+                if path == self.settings_path() {
+                    self.settings_panel.reload_pending = true;
+                }
                 let msg = if lossy {
                     format!("Saved {} (some characters could not be encoded as {enc} and were replaced)", path.display())
                 } else {
@@ -795,7 +800,7 @@ impl ApexApp {
     }
 
     pub(crate) fn execute(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) {
-        if self.vim_command(ctx, cmd) {
+        if self.vim_command(ctx, cmd) || self.settings_command(ctx, cmd) {
             return;
         }
         if cmd.is_recordable() {
@@ -1683,21 +1688,6 @@ impl ApexApp {
             }
 
             // Tools
-            Command::Settings | Command::OpenSettingsFile => {
-                let p = self.config_dir.join("settings.toml");
-                if !p.exists() {
-                    let _ = apex_project::paths::ensure_private_dir(&self.config_dir);
-                    let body = format!(
-                        "# Apex settings. Every key shown here is at its default value.\n# Remove a line to fall back to the default.\n\n{}",
-                        Settings::default().to_toml_string()
-                    );
-                    if let Err(e) = fileio::save_atomic(&p, body.as_bytes()) {
-                        self.set_status(format!("Could not create settings file: {e}"), true);
-                        return;
-                    }
-                }
-                self.open_path(&p);
-            }
             Command::OpenKeymapFile => {
                 let p = self.config_dir.join("keymap.toml");
                 if !p.exists() {
@@ -3660,6 +3650,7 @@ impl eframe::App for ApexApp {
             self.dragging_tab = None;
         }
         self.lsp_overlays(&ctx);
+        self.show_settings_panel(&ctx);
         self.show_palette(&ctx);
         self.show_dialogs(&ctx);
         self.show_editor_context_menu(&ctx);

@@ -9,6 +9,7 @@ pub mod keymap;
 pub mod lsp_ui;
 pub mod palette;
 pub mod settings;
+pub mod settings_ui;
 pub mod sidebar;
 pub mod snippets_ui;
 pub mod spell_ui;
