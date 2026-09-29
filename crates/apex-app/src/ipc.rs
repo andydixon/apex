@@ -9,7 +9,7 @@
 //! from other machines or, on Unix, other users.
 
 use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -106,9 +106,8 @@ fn random_token() -> String {
     let s = RandomState::new();
     let mut out = String::new();
     for salt in 0..4u64 {
-        let mut h = s.build_hasher();
-        (std::process::id(), salt, std::time::SystemTime::now()).hash(&mut h);
-        out.push_str(&format!("{:016x}", h.finish()));
+        let v = s.hash_one((std::process::id(), salt, std::time::SystemTime::now()));
+        out.push_str(&format!("{v:016x}"));
     }
     out
 }
