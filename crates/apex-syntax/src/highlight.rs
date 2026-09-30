@@ -136,7 +136,25 @@ pub struct SyntaxState {
     edits_since_bg: Vec<InputEdit>,
     /// Edits not yet applied because there is no tree to apply them to.
     pub last_parse: Duration,
+    /// Time spent rebuilding injection layers in the last update.
+    pub last_injections: Duration,
+    /// Byte ranges (post-edit) touched since the last injection rebuild.
+    pending_dirty: Vec<std::ops::Range<usize>>,
     pub enabled: bool,
+}
+
+/// Sort and merge overlapping or touching byte ranges.
+fn merge_ranges(mut v: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
+    v.retain(|r| r.end > r.start);
+    v.sort_by_key(|r| r.start);
+    let mut out: Vec<std::ops::Range<usize>> = Vec::with_capacity(v.len());
+    for r in v {
+        match out.last_mut() {
+            Some(l) if r.start <= l.end => l.end = l.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
 }
 
 fn to_input_edit(e: &ByteEdit) -> InputEdit {
@@ -186,6 +204,8 @@ impl SyntaxState {
             bg_generation: 0,
             edits_since_bg: Vec::new(),
             last_parse: Duration::ZERO,
+            last_injections: Duration::ZERO,
+            pending_dirty: Vec::new(),
             enabled: (lang.grammar.is_some() || lang.simple.is_some()) && !doc.large_file,
         };
         // Edits before we existed are irrelevant: we parse the current text.
@@ -222,9 +242,30 @@ impl SyntaxState {
                 if let Some(r) = &mut self.root {
                     r.tree.edit(e);
                 }
+                let delta = e.new_end_byte as isize - e.old_end_byte as isize;
                 for c in &mut self.children {
                     c.tree.edit(e);
+                    // Keep the injected region's byte range in step with the text.
+                    if c.range.start >= e.old_end_byte {
+                        c.range.start = (c.range.start as isize + delta).max(0) as usize;
+                        c.range.end = (c.range.end as isize + delta).max(0) as usize;
+                    } else if c.range.end > e.start_byte {
+                        c.range.end = (c.range.end as isize + delta).max(c.range.start as isize) as usize;
+                    }
                 }
+                // Earlier dirty ranges move with the text too.
+                for d in &mut self.pending_dirty {
+                    if d.start >= e.old_end_byte {
+                        d.start = (d.start as isize + delta).max(0) as usize;
+                        d.end = (d.end as isize + delta).max(0) as usize;
+                    } else if d.end > e.start_byte {
+                        d.end = (d.end as isize + delta).max(d.start as isize) as usize;
+                    }
+                }
+                // A pure deletion still dirties the byte where it happened.
+                self.pending_dirty.push(e.start_byte..e.new_end_byte.max(e.start_byte + 1));
+                // Regions deleted outright are gone; a stale empty layer would linger.
+                self.children.retain(|c| c.range.end > c.range.start);
             }
             if self.bg.is_some() {
                 self.edits_since_bg.extend(edits.iter().copied());
@@ -286,10 +327,36 @@ impl SyntaxState {
         match tree {
             Some(t) => {
                 let _ = queries;
-                self.install_root(doc, t);
+                self.install_root_incremental(doc, t);
             }
             None => self.start_background(doc),
         }
+    }
+
+    /// Install a tree produced incrementally from the previous root: only the
+    /// regions tree-sitter reports as changed (plus the edited bytes) have
+    /// their injections re-queried.
+    fn install_root_incremental(&mut self, doc: &Document, tree: Tree) {
+        let Some(queries) = compiled(self.lang) else { return };
+        let len = doc.len_bytes();
+        let mut dirty = std::mem::take(&mut self.pending_dirty);
+        let old = self.root.take();
+        match old {
+            Some(old) => {
+                for r in tree.changed_ranges(&old.tree) {
+                    dirty.push(r.start_byte..r.end_byte);
+                }
+            }
+            None => {
+                self.root = Some(Layer { lang: self.lang, queries, tree, range: 0..len, depth: 0 });
+                self.cache_valid = false;
+                self.rebuild_injections(doc, None);
+                return;
+            }
+        }
+        self.root = Some(Layer { lang: self.lang, queries, tree, range: 0..len, depth: 0 });
+        self.cache_valid = false;
+        self.rebuild_injections(doc, Some(dirty));
     }
 
     fn start_background(&mut self, doc: &Document) {
@@ -320,12 +387,21 @@ impl SyntaxState {
         let len = doc.len_bytes();
         self.root = Some(Layer { lang: self.lang, queries, tree, range: 0..len, depth: 0 });
         self.cache_valid = false;
-        self.rebuild_injections(doc);
+        self.pending_dirty.clear();
+        self.rebuild_injections(doc, None);
     }
 
     /// Re-parse injected regions, reusing existing child trees incrementally
     /// when the region (language and range) is unchanged.
-    fn rebuild_injections(&mut self, doc: &Document) {
+    fn rebuild_injections(&mut self, doc: &Document, dirty: Option<Vec<std::ops::Range<usize>>>) {
+        let started = Instant::now();
+        // Incremental only when the dirty set is small; otherwise a full pass is cheaper.
+        let dirty = dirty.map(merge_ranges).filter(|d| d.len() <= 64 && d.iter().map(|r| r.end - r.start).sum::<usize>() * 2 < doc.len_bytes().max(1));
+        self.rebuild_injections_inner(doc, dirty);
+        self.last_injections = started.elapsed();
+    }
+
+    fn rebuild_injections_inner(&mut self, doc: &Document, dirty: Option<Vec<std::ops::Range<usize>>>) {
         let Some(root) = &self.root else { return };
         let Some(inj) = root.queries.injections.as_ref() else {
             self.children.clear();
@@ -339,40 +415,75 @@ impl SyntaxState {
             self.children.clear();
             return;
         };
+        // Incremental: widen each dirty range to cover the existing injection
+        // regions it touches (a change inside a code fence must re-query the whole
+        // fence), then only those windows are queried and only children inside them
+        // are replaced.
+        let windows: Option<Vec<std::ops::Range<usize>>> = dirty.map(|d| {
+            d.into_iter()
+                .map(|mut r| {
+                    for c in &self.children {
+                        if c.range.start <= r.end && c.range.end >= r.start {
+                            r.start = r.start.min(c.range.start);
+                            r.end = r.end.max(c.range.end);
+                        }
+                    }
+                    r
+                })
+                .collect()
+        });
         let mut wanted: Vec<(&'static LanguageDef, Range)> = Vec::new();
-        let mut total = 0usize;
+        let touched = |c: &Layer, ws: &[std::ops::Range<usize>]| ws.iter().any(|r| c.range.start <= r.end && c.range.end >= r.start);
+        let mut total = self.children.iter().filter(|c| windows.as_ref().is_some_and(|w| !touched(c, w))).map(|c| c.range.end - c.range.start).sum::<usize>();
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(inj, root.tree.root_node(), |n: Node| rope.byte_slice(n.byte_range()).chunks().map(|c| c.as_bytes()));
-        while let Some(m) = matches.next() {
-            let mut lang_name: Option<String> =
-                inj.property_settings(m.pattern_index).iter().find(|p| &*p.key == "injection.language").and_then(|p| p.value.as_ref().map(|v| v.to_string()));
-            if lang_name.is_none()
-                && let Some(li) = language_idx
-                && let Some(c) = m.captures().iter().find(|c| c.index as usize == li)
-            {
-                lang_name = Some(rope.byte_slice(c.node.byte_range()).to_string());
-            }
-            let Some(name) = lang_name else { continue };
-            let Some(lang) = lookup(name.trim()) else { continue };
-            if lang.grammar.is_none() || lang.id == self.lang.id {
-                continue;
-            }
-            for c in m.captures().iter().filter(|c| c.index as usize == content_idx) {
-                let r = c.node.range();
-                if r.end_byte <= r.start_byte {
+        let query_windows: Vec<std::ops::Range<usize>> = match &windows {
+            Some(w) => merge_ranges(w.clone()),
+            None => std::iter::once(0..root.range.end).collect(),
+        };
+        for w in &query_windows {
+            cursor.set_byte_range(w.clone());
+            let mut matches = cursor.matches(inj, root.tree.root_node(), |n: Node| rope.byte_slice(n.byte_range()).chunks().map(|c| c.as_bytes()));
+            while let Some(m) = matches.next() {
+                let mut lang_name: Option<String> = inj
+                    .property_settings(m.pattern_index)
+                    .iter()
+                    .find(|p| &*p.key == "injection.language")
+                    .and_then(|p| p.value.as_ref().map(|v| v.to_string()));
+                if lang_name.is_none()
+                    && let Some(li) = language_idx
+                    && let Some(c) = m.captures().iter().find(|c| c.index as usize == li)
+                {
+                    lang_name = Some(rope.byte_slice(c.node.byte_range()).to_string());
+                }
+                let Some(name) = lang_name else { continue };
+                let Some(lang) = lookup(name.trim()) else { continue };
+                if lang.grammar.is_none() || lang.id == self.lang.id {
                     continue;
                 }
-                total += r.end_byte - r.start_byte;
-                if total > MAX_INJECTION_BYTES {
-                    tracing::debug!("injection limit reached; remaining regions unhighlighted");
-                    break;
+                for c in m.captures().iter().filter(|c| c.index as usize == content_idx) {
+                    let r = c.node.range();
+                    if r.end_byte <= r.start_byte || wanted.iter().any(|(_, w)| w.start_byte == r.start_byte && w.end_byte == r.end_byte) {
+                        continue;
+                    }
+                    // Only regions intersecting a window are re-queried; a wide node that
+                    // merely touches the window is still wanted in full.
+                    if windows.as_ref().is_some_and(|ws| !ws.iter().any(|x| r.start_byte < x.end && r.end_byte > x.start)) {
+                        continue;
+                    }
+                    total += r.end_byte - r.start_byte;
+                    if total > MAX_INJECTION_BYTES {
+                        tracing::debug!("injection limit reached; remaining regions unhighlighted");
+                        break;
+                    }
+                    wanted.push((lang, r));
                 }
-                wanted.push((lang, r));
             }
         }
-        drop(matches);
-        let mut old = std::mem::take(&mut self.children);
-        let mut new_children = Vec::with_capacity(wanted.len());
+        let (mut old, kept): (Vec<Layer>, Vec<Layer>) = match &windows {
+            Some(ws) => std::mem::take(&mut self.children).into_iter().partition(|c| touched(c, ws)),
+            None => (std::mem::take(&mut self.children), Vec::new()),
+        };
+        let mut new_children = kept;
         for (lang, range) in wanted {
             let Some(queries) = compiled(lang) else { continue };
             let Some(g) = lang.grammar.as_ref() else { continue };
@@ -387,6 +498,7 @@ impl SyntaxState {
             }
         }
         let _ = self.parser.set_included_ranges(&[]);
+        new_children.sort_by_key(|c| c.range.start);
         self.children = new_children;
     }
 
@@ -596,5 +708,93 @@ mod tests {
         let r = s.enclosing_ranges(11); // inside `c`
         assert!(r.len() >= 3);
         assert!(r.windows(2).all(|w| w[1].0 <= w[0].0 && w[1].1 >= w[0].1));
+    }
+}
+
+#[cfg(test)]
+mod incremental_injection_tests {
+    use super::*;
+    use apex_edit::{Change, Document, EditKind, SelectionSet, Transaction};
+
+    fn has_scope(st: &mut SyntaxState, doc: &Document, line: usize, scope: &str) -> bool {
+        st.spans_for_line(doc, line).iter().any(|s| s.scope.starts_with(scope))
+    }
+
+    /// Code-fence layers only (Markdown also injects inline layers for paragraphs).
+    fn fences(st: &SyntaxState) -> Vec<(&'static str, std::ops::Range<usize>)> {
+        st.children.iter().filter(|c| c.lang.id != "markdown_inline").map(|c| (c.lang.id, c.range.clone())).collect()
+    }
+
+    #[test]
+    fn injections_follow_edits_incrementally() {
+        let lang = crate::language::lookup("markdown").unwrap();
+        let mut doc = Document::from_text("# Title\n\n```rust\nfn main() {}\n```\n\ntext\n");
+        let budget = Duration::from_secs(5);
+        let mut st = SyntaxState::new(lang, &mut doc, budget);
+        assert!(has_scope(&mut st, &doc, 3, "keyword"), "fence is highlighted as Rust");
+        assert_eq!(fences(&st).len(), 1);
+        let sels = SelectionSet::default();
+        // Typing inside the fence keeps the injected layer and its range.
+        let at = doc.rope().line_to_char(3) + 3;
+        doc.apply(Transaction::single(Change::insert(at, " ")), &sels, &sels, EditKind::Other);
+        st.update(&mut doc, budget);
+        assert!(has_scope(&mut st, &doc, 3, "keyword"));
+        assert_eq!(fences(&st).len(), 1);
+        // Typing before the fence shifts its range.
+        doc.apply(Transaction::single(Change::insert(0, "intro\n")), &sels, &sels, EditKind::Other);
+        st.update(&mut doc, budget);
+        assert!(has_scope(&mut st, &doc, 4, "keyword"));
+        assert_eq!(fences(&st)[0].1.start, doc.rope().line_to_byte(4));
+        // A new fence appended afterwards gets its own layer.
+        let end = doc.len_chars();
+        doc.apply(Transaction::single(Change::insert(end, "```python\ndef f(): pass\n```\n")), &sels, &sels, EditKind::Other);
+        st.update(&mut doc, budget);
+        assert_eq!(fences(&st).len(), 2);
+        let py_line = doc.len_lines() - 3;
+        assert!(has_scope(&mut st, &doc, py_line, "keyword"), "python fence highlighted");
+        // Deleting the first fence removes its layer and the others stay right.
+        let a = doc.rope().line_to_char(3);
+        let b = doc.rope().line_to_char(6);
+        doc.apply(Transaction::single(Change::delete(a, b)), &sels, &sels, EditKind::Other);
+        st.update(&mut doc, budget);
+        assert_eq!(fences(&st).len(), 1, "{:?}", fences(&st));
+        let py_line = doc.len_lines() - 3;
+        assert!(has_scope(&mut st, &doc, py_line, "keyword"));
+    }
+}
+
+#[cfg(test)]
+mod timing_probe {
+    //! `cargo test -p apex-syntax timing_probe -- --ignored --nocapture` prints
+    //! where an incremental edit spends its time on a 100 KB Rust file.
+    use super::*;
+    use apex_edit::{Change, Document, EditKind, SelectionSet, Transaction};
+
+    #[test]
+    #[ignore]
+    fn incremental_edit_breakdown() {
+        let unit = include_str!("highlight.rs");
+        let mut src = String::new();
+        while src.len() < 100 * 1024 {
+            src.push_str(unit);
+        }
+        let lang = crate::language::lookup("rust").unwrap();
+        let mut doc = Document::from_text(&src);
+        let budget = Duration::from_secs(10);
+        let t = Instant::now();
+        let mut st = SyntaxState::new(lang, &mut doc, budget);
+        println!("initial parse+injections: {:?} (parse {:?})", t.elapsed(), st.last_parse);
+        let mid = doc.len_chars() / 2;
+        let sels = SelectionSet::default();
+        for i in 0..3 {
+            doc.apply(Transaction::single(Change::insert(mid, "x")), &sels, &sels, EditKind::Other);
+            let t = Instant::now();
+            st.update(&mut doc, budget);
+            let upd = t.elapsed();
+            let t = Instant::now();
+            let line = doc.rope().char_to_line(mid);
+            let n = st.spans_for_line(&doc, line).len();
+            println!("edit {i}: update {upd:?} (parse {:?}, injections {:?}), spans_for_line {:?} ({n} spans)", st.last_parse, st.last_injections, t.elapsed());
+        }
     }
 }

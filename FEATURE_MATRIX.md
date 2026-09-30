@@ -81,7 +81,7 @@ packaging, benchmarks, fuzzing, documentation).
 | Completion popup: words, snippets, language server; merged and ranked | I | |
 | Spell checking (prose, comments, strings), suggestions, user dictionary | V | tokeniser and dictionary tests |
 | Vim mode: normal/insert/visual/visual-line/replace, counts, operators, text objects, registers, marks, search, `.`, `:` commands | V | 12 engine tests + scripted Xvfb session |
-| Print support | – | export via the OS print dialog is not implemented; use a PDF printer from the terminal |
+| Print (File ▸ Print…) | I | plain text to the default printer via `lp`/`lpr` (Unix, macOS) or PowerShell `Out-Printer` (Windows); no page dialog |
 | Screen-reader output for the editor text | – | AccessKit exposes menus, buttons and dialogs; the custom text widget is not yet described (see ARCHITECTURE.md › Accessibility) |
 
 ## Multi-cursor

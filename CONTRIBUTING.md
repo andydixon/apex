@@ -10,10 +10,12 @@ Thank you for considering a contribution.
 * Data integrity beats everything else. Any change touching saving, loading,
   undo or selections needs tests, and a regression test for every fixed
   data-loss defect.
+* No `unwrap`/`expect` on data from files, processes or configuration.
 * British English in documentation and user-facing text.
 * The licence is AGPL-3.0-or-later; new dependencies must be compatible (MIT,
-  Apache-2.0, BSD, MPL-2.0, zlib, OFL for fonts). Run `cargo deny check` if you
-  add one.
+  Apache-2.0, BSD, MPL-2.0, zlib, OFL for fonts) and are listed by
+  `cargo license`. Tree-sitter grammar crates are MIT/Apache-2.0.
+* Nothing may contact the network at run time; nothing may send telemetry.
 
 ## Workflow
 
@@ -23,24 +25,23 @@ make run ARGS=README.md
 ```
 
 Before opening a pull request, run the manual smoke test in
-`docs/development/manual-smoke-test.md` if you touched `apex-ui`.
+`docs/development/manual-smoke-test.md` if you touched `apex-ui`, and
+`tests/visual/smoke.sh` on Linux. Keep `FEATURE_MATRIX.md` and
+`CHANGELOG.md` current with your change.
 
-## Code organisation
+## Documentation for developers
 
-See `ARCHITECTURE.md`. Dependencies flow towards `apex-buffer`; nothing below
-`apex-ui` may depend on egui. Public interfaces, invariants and threading
-assumptions are documented in the source.
-
-## Adding a command
-
-1. Add a variant to the `commands!` macro in `crates/apex-ui/src/command.rs`
-   with a stable id (`category.name`), a name and a category.
-2. Implement it in `ApexApp::execute`.
-3. Bind it in `assets/keymap-default.toml` and add it to a menu if appropriate.
-4. Update `FEATURE_MATRIX.md`.
+* `ARCHITECTURE.md` — crates, offset spaces, document model, rendering and
+  input pipelines, worker model, syntax engine, persistence, security.
+* `docs/development/building-and-testing.md`
+* `docs/development/adding-commands.md`
+* `docs/development/adding-grammars.md`
+* `docs/development/release-process.md`
+* `benches/README.md` — benchmarks, profiling and fuzzing.
 
 ## Adding a theme
 
 Copy `assets/themes/apex-dark.toml`, change the values, and add it to
 `BUILTIN_THEME_SOURCES` in `crates/apex-ui/src/theme.rs`. Partial themes
-inherit missing colours from the dark or light base.
+inherit missing colours from the dark or light base. User themes need no code
+change: drop the file into `<config>/themes/`.

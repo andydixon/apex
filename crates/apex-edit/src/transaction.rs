@@ -52,6 +52,8 @@ impl Change {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     changes: Vec<Change>,
+    /// `prefix[i]` = total length delta of `changes[..i]`, for O(log n) position mapping.
+    prefix: Vec<isize>,
 }
 
 impl Transaction {
@@ -73,7 +75,19 @@ impl Transaction {
             // Two insertions at the same point are fine; keep both in order.
             out.push(c);
         }
-        Self { changes: out }
+        Self::from_sorted(out)
+    }
+
+    /// Wrap already sorted, disjoint changes, computing the prefix deltas.
+    fn from_sorted(changes: Vec<Change>) -> Self {
+        let mut prefix = Vec::with_capacity(changes.len() + 1);
+        let mut acc = 0isize;
+        for c in &changes {
+            prefix.push(acc);
+            acc += c.new_len() as isize - c.old_len() as isize;
+        }
+        prefix.push(acc);
+        Self { changes, prefix }
     }
 
     pub fn single(change: Change) -> Self {
@@ -95,7 +109,7 @@ impl Transaction {
             c.start = c.start.min(n);
             c.end = c.end.clamp(c.start, n);
         }
-        self
+        Self::from_sorted(self.changes)
     }
 
     /// Apply to `rope`, returning the inverse transaction (in post-edit
@@ -128,15 +142,19 @@ impl Transaction {
             inverse[i] = Change { start: new_start, end: new_start + c.new_len(), text: removed };
             byte_edits.push(crate::document::ByteEdit { start_byte, old_end_byte, new_end_byte, start_point, old_end_point, new_end_point });
         }
-        let inverse = Transaction { changes: inverse };
+        let inverse = Transaction::from_sorted(inverse);
         debug_assert!(inverse.changes.windows(2).all(|w| w[0].end <= w[1].start));
         (inverse, byte_edits)
     }
 
     /// Map a pre-edit position to its post-edit equivalent.
     pub fn map_pos(&self, pos: usize, assoc: Assoc) -> usize {
-        let mut delta: isize = 0;
-        for c in &self.changes {
+        // Changes are sorted and disjoint, so only the last change starting
+        // before `pos` can contain it; everything earlier contributes a plain
+        // length delta. Binary search keeps 1,000-cursor transactions cheap.
+        let first = self.changes.partition_point(|c| c.start < pos).saturating_sub(1);
+        let mut delta: isize = self.prefix[first];
+        for c in &self.changes[first..] {
             if pos < c.start {
                 break;
             }

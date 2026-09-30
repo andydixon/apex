@@ -1071,6 +1071,19 @@ impl ApexApp {
                     self.request_close(all, AfterClose::Quit);
                 }
             }
+            Command::Print => {
+                // Print support where practical: the buffer as plain text through the
+                // platform's default printer (lp/lpr on Unix and macOS, Out-Printer on Windows).
+                if let Some((_, d)) = active
+                    && let Some(doc) = self.docs.get(&d)
+                {
+                    let title = doc.title();
+                    match print_text(&title, &doc.text()) {
+                        Ok(via) => self.set_status(format!("Sent {title} to the default printer via {via}"), false),
+                        Err(e) => self.set_status(format!("Could not print: {e}"), true),
+                    }
+                }
+            }
             Command::CopyFilePath => {
                 if let Some(p) = active.and_then(|(_, d)| self.docs.get(&d)).and_then(|d| d.path.clone()) {
                     ctx.copy_text(p.display().to_string());
@@ -3588,6 +3601,39 @@ impl ApexApp {
             .into();
         });
     }
+}
+
+/// Send plain text to the default printer. Returns the program used.
+fn print_text(title: &str, text: &str) -> std::io::Result<&'static str> {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("apex-print-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let safe: String = title.chars().map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+    let path = dir.join(format!("{safe}.txt"));
+    let mut f = std::fs::File::create(&path)?;
+    f.write_all(text.as_bytes())?;
+    f.flush()?;
+    let try_run = |program: &'static str, args: &[&str]| -> Option<&'static str> {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args).arg(&path).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        match cmd.status() {
+            Ok(st) if st.success() => Some(program),
+            _ => None,
+        }
+    };
+    let via = if cfg!(windows) {
+        let script = format!("Get-Content -LiteralPath '{}' | Out-Printer", path.display().to_string().replace('\'', "''"));
+        let st = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).status();
+        match st {
+            Ok(s) if s.success() => Some("Out-Printer"),
+            _ => None,
+        }
+    } else {
+        try_run("lp", &["-t", title]).or_else(|| try_run("lpr", &["-T", title]))
+    };
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(&dir);
+    via.ok_or_else(|| std::io::Error::other("no printing command found (lp or lpr on Unix, PowerShell Out-Printer on Windows) or the printer rejected the job"))
 }
 
 /// Build the lazy per-line highlighter used by the editor widget.

@@ -9,9 +9,14 @@ fuzz_target!(|data: (String, u32, u8)| {
     let (text, idx, tab) = data;
     let rope = Rope::from_str(&text);
     let n = rope.len_chars();
-    let p = (idx as usize) % (n + 1);
+    let raw = (idx as usize) % (n + 1);
     let tab = (tab as usize % 16) + 1;
-    assert_eq!(byte_to_char(&rope, char_to_byte(&rope, p)), p);
+    let slice = rope.slice(..);
+    // Carets only ever rest on grapheme boundaries (a CRLF pair is one grapheme),
+    // so the round-trip invariants are stated for snapped positions.
+    let p = snap_to_grapheme(slice, raw);
+    assert!(p <= raw);
+    assert_eq!(byte_to_char(&rope, char_to_byte(&rope, raw)), raw);
     let (line, col16) = char_to_utf16_position(&rope, p);
     let back = utf16_position_to_char(&rope, line, col16);
     assert_eq!(back, p);
@@ -19,11 +24,12 @@ fuzz_target!(|data: (String, u32, u8)| {
     let col = p - rope.line_to_char(line);
     let d = char_col_to_display_col(l, col, tab);
     let c = display_col_to_char_col(l, d, tab);
-    assert!(c <= col);
+    // Zero-width characters (combining marks) make several char columns share a
+    // display column, so the round trip need not return `col`, but it must land
+    // on the same display column and inside the line.
+    assert!(c <= l.len_chars());
+    assert_eq!(char_col_to_display_col(l, c, tab), d);
     assert!(line_end_char(&rope, line) >= rope.line_to_char(line));
-    let slice = rope.slice(..);
-    let s = snap_to_grapheme(slice, p);
-    assert!(s <= p);
     assert!(next_grapheme_boundary(slice, p) >= p);
     assert!(prev_grapheme_boundary(slice, p) <= p);
     assert!(next_word_start(slice, p) >= p);
