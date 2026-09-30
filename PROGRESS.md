@@ -97,6 +97,12 @@ Responses now carry their request id.
   for 60 s with no crashes (log in `docs/performance/benchmarks.md`).
 * Large-file mode (threshold `large_file_mb`), profiling profile,
   `APEX_FRAME_TIME` readout.
+* Two optimisations found by the benchmarks: injection layers are now
+  re-queried only inside changed byte ranges (a keystroke in a 100 KB Rust
+  file went from 12.9 ms to 0.25 ms of syntax work; test
+  `injections_follow_edits_incrementally`), and `Transaction::map_pos` uses
+  prefix sums with binary search (10,000 positions through 1,000 changes:
+  58.7 ms to 0.4 ms).
 * Security review: `docs/security/review.md`. One finding fixed during the
   review: project files could set `lsp_servers`; program-naming keys are now
   stripped from project settings (test `project_settings_cannot_name_programs`).
@@ -138,7 +144,7 @@ Last full run (`cargo test --workspace`, 12 October 2026):
 | apex-buffer | 16 |
 | apex-edit | 42 (+ 8 property tests) |
 | apex-project | 25 |
-| apex-syntax | 14 |
+| apex-syntax | 15 (+1 ignored timing probe) |
 | apex-ui | 38 |
 
 `cargo clippy --workspace --all-targets -- -D warnings` and

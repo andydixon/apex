@@ -4,7 +4,7 @@
 
 CARGO ?= cargo
 
-.PHONY: build release run test lint fmt check bench package clean doc
+.PHONY: build release run test lint fmt check bench fuzz package clean doc
 
 build:
 	$(CARGO) build --workspace
@@ -34,6 +34,9 @@ bench:
 
 doc:
 	$(CARGO) doc --workspace --no-deps
+
+fuzz:
+	cd fuzz && for t in transactions offsets settings search session; do cargo +nightly fuzz run $$t -- -max_total_time=60; done
 
 package: release
 	./packaging/package.sh
