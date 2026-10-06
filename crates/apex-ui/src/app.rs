@@ -1063,6 +1063,18 @@ impl ApexApp {
                 let all: Vec<ViewId> = self.views.keys().copied().collect();
                 self.request_close(all, AfterClose::CloseViews);
             }
+            Command::NewWindow => {
+                // One OS window per process (see ARCHITECTURE.md): a new window is a
+                // new instance that shares settings, themes, key maps and snippets
+                // through the configuration directory and keeps its own tabs.
+                match std::env::current_exe() {
+                    Ok(exe) => match std::process::Command::new(exe).arg("--new-window").spawn() {
+                        Ok(_) => self.set_status("Opened a new window".into(), false),
+                        Err(e) => self.set_status(format!("Could not open a new window: {e}"), true),
+                    },
+                    Err(e) => self.set_status(format!("Could not open a new window: {e}"), true),
+                }
+            }
             Command::Quit | Command::CloseWindow => {
                 let all: Vec<ViewId> = self.views.keys().copied().collect();
                 if arg.as_deref() == Some("force") {
