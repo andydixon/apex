@@ -1,7 +1,7 @@
 # Plan: Git and GitHub integration
 
-Status: proposed (2026-10-12). Nothing here is implemented yet; the current
-git support is listed in `FEATURE_MATRIX.md` under "Git".
+Status: in progress. Done: G1. Order: G1 → G2 → G4 → G6 → G7 (small,
+then medium) → G3 → G5 (large). `FEATURE_MATRIX.md` tracks what exists.
 
 ## Where we start
 

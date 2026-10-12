@@ -105,6 +105,10 @@ packaging, benchmarks, fuzzing, documentation).
 | Next/previous change, revert hunk (confirmed), show hunk diff | I | |
 | Compare with saved/index/HEAD, `--diff` of two files | V | IPC script opens a diff tab |
 | File history, open a past version, status palette | I | |
+| `git` job runner: background, serialised, cancellable, output log, no terminal prompts, trust-gated | V | `git_cli` unit tests; `tests/visual/git.sh` |
+| Stage/unstage file, stage/unstage all, discard file (confirmed) | V | `tests/visual/git.sh` (unstage file) |
+| Stage change at caret, stage selected lines (partial patches via `git apply --cached`) | V | `git_cli` tests against real git; `tests/visual/git.sh` |
+| Git menu, editor context-menu entries | I | |
 
 ## Build tasks and language servers
 

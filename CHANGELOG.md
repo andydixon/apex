@@ -5,6 +5,12 @@ All notable changes to Apex are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Git menu. Staging through your installed `git`: stage/unstage file or all,
+  stage the change at the caret or only the selected lines, discard file
+  changes; a GIT output tab logs every command. Git commands need a trusted
+  workspace.
+
 ## [0.0.1] - 2026-10-12
 
 ### Added
