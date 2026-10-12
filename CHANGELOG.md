@@ -10,6 +10,9 @@ All notable changes to Apex are recorded here. The format follows
   stage the change at the caret or only the selected lines, discard file
   changes; a GIT output tab logs every command. Git commands need a trusted
   workspace.
+- Source Control panel in the lower half of the sidebar (`git_sidebar`):
+  staged, unstaged and conflicted files with inline actions, a commit box
+  (Ctrl+Enter, amend, sign-off, message history), undo last commit.
 
 ## [0.0.1] - 2026-10-12
 

@@ -94,5 +94,9 @@ command "Amend Last Commit"
 [ "$(git -C "$REPO" log -1 --format=%s)" = "Shout line 15" ] || fail "amend message"
 [ "$(git -C "$REPO" rev-list --count HEAD)" = $((before + 1)) ] || fail "amend created a commit"
 pass "amend"
+echo new > "$REPO/new.txt"
+sleep 5
+xdotool mousemove 150 306; sleep 1
+shot g2-panel-hover
 grep -q "fatal\|panicked" "$OUT/app.log" && fail "errors in app log"
 echo "all git checks passed"

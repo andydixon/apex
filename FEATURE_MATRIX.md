@@ -109,6 +109,9 @@ packaging, benchmarks, fuzzing, documentation).
 | Stage/unstage file, stage/unstage all, discard file (confirmed) | V | `tests/visual/git.sh` (unstage file) |
 | Stage change at caret, stage selected lines (partial patches via `git apply --cached`) | V | `git_cli` tests against real git; `tests/visual/git.sh` |
 | Git menu, editor context-menu entries | I | |
+| Source Control panel in the sidebar (repository chooser, ahead/behind, grouped files, inline actions) | I | screenshot from `tests/visual/git.sh` |
+| Commit (Ctrl+Enter), commit all when nothing staged (confirmed), amend, sign-off, message history | V | `tests/visual/git.sh` (commit, amend) |
+| Undo last commit (soft reset, message restored), open staged/unstaged changes | I | |
 
 ## Build tasks and language servers
 

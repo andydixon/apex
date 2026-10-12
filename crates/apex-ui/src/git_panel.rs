@@ -106,12 +106,15 @@ impl ApexApp {
                 branch.push_str(" (no commits)");
             }
             if let Some(u) = &status.upstream {
-                if status.ahead + status.behind > 0 {
-                    branch.push_str(&format!("  ↑{} ↓{}", status.ahead, status.behind));
-                }
-                ui.label(egui::RichText::new(format!("⎇ {branch}")).size(ui_font - 1.0)).on_hover_text(format!("Tracking {u}"));
+                let ab = match (status.ahead, status.behind) {
+                    (0, 0) => String::new(),
+                    (a, 0) => format!("  ({a} ahead)"),
+                    (0, b) => format!("  ({b} behind)"),
+                    (a, b) => format!("  ({a} ahead, {b} behind)"),
+                };
+                ui.label(egui::RichText::new(format!("{branch}{ab}")).size(ui_font - 1.0)).on_hover_text(format!("Branch {} tracking {u}", status.branch));
             } else {
-                ui.label(egui::RichText::new(format!("⎇ {branch}")).size(ui_font - 1.0));
+                ui.label(egui::RichText::new(branch).size(ui_font - 1.0)).on_hover_text("Branch (no upstream)");
             }
             if self.git.repos.len() > 1 {
                 let mut repos: Vec<PathBuf> = self.git.repos.keys().cloned().collect();
@@ -286,7 +289,7 @@ impl ApexApp {
                 Group::Changes | Group::Conflicts => {
                     actions.push(("+", if group == Group::Conflicts { "Mark resolved (stage)" } else { "Stage" }, Command::GitStageFile));
                     if group == Group::Changes {
-                        actions.push(("↶", "Discard changes", Command::GitDiscardFile));
+                        actions.push(("⟲", "Discard changes", Command::GitDiscardFile));
                     }
                 }
             }

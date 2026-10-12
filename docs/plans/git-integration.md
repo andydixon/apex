@@ -1,6 +1,6 @@
 # Plan: Git and GitHub integration
 
-Status: in progress. Done: G1. Order: G1 → G2 → G4 → G6 → G7 (small,
+Status: in progress. Done: G1, G2. Order: G1 → G2 → G4 → G6 → G7 (small,
 then medium) → G3 → G5 (large). `FEATURE_MATRIX.md` tracks what exists.
 
 ## Where we start

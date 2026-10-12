@@ -32,6 +32,29 @@ Settings: `git_gutter = false` turns the marks off. Large repositories are
 scanned in the background and the status refreshes when the watcher sees
 changes under `.git`.
 
+## Source Control panel
+
+The lower half of the sidebar shows the repository of the active file (a
+drop-down chooses between several open repositories): the branch and how
+far it is ahead of or behind its upstream, the commit box, and the changed
+files grouped as **Merge conflicts**, **Staged changes** and **Changes**.
+Drag the divider to resize it; `git_sidebar = false` (or **Git > Toggle
+Source Control Panel**) hides it.
+
+* Click a file to preview it, double-click to open its changes (staged:
+  HEAD → index; unstaged: index → working tree). Hover a file for Stage (+),
+  Unstage (−) and Discard (⟲); right-click for the full list.
+* **Commit** (or Ctrl+Enter in the message box) commits the staged changes.
+  With nothing staged it offers to commit all changes to tracked files.
+  Up and Down in an empty message box recall earlier messages; the number
+  beside Sign-off is the summary line's length (50 recommended, 72 at most).
+* **Amend** rewrites the last commit with the staged changes (an empty
+  message keeps the old one); **Sign-off** adds a `Signed-off-by` trailer.
+* **Undo Last Commit…** (Git menu or the panel's … menu) removes the last
+  commit after confirming, keeps its changes staged and puts its message
+  back in the box.
+* Your hooks run as usual; their output is in the GIT tab.
+
 ## Staging
 
 * **Stage File / Unstage File** for the active file, **Stage All Changes /
