@@ -73,6 +73,9 @@ Git menu), **Open Staged Changes**, the Compare commands and
 * The strip's buttons act on one change: **>** replaces it with the left
   side (an undoable edit), **+** stages it (unstaged changes), **−**
   unstages it (staged changes). The left side refreshes after staging.
+* Long unchanged stretches are folded on both sides, keeping three lines of
+  context around each change; **Expand / Collapse** in the header toggles
+  this, and a fold's "… n lines" marker can be clicked open as usual.
 * The sides scroll together. **Next / Previous** in the header (or Goto >
   Next Change) jump between changes; **Unified** opens the same comparison
   as a unified diff.

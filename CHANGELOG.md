@@ -22,8 +22,8 @@ All notable changes to Apex are recorded here. The format follows
   diff.
 - Side-by-side diff view for Open Changes, staged changes, Compare with
   Saved/Index/HEAD and `apex --diff`: synchronised scrolling, changed lines
-  and words highlighted, the working copy editable on the right, and per
-  change revert, stage and unstage buttons.
+  and words highlighted, long unchanged stretches folded, the working copy
+  editable on the right, and per change revert, stage and unstage buttons.
 - Branches (switch, create, rename, delete, merge), a log with lane graph
   and commit actions, line history, stash, and merge-conflict resolution in
   the editor with Continue/Abort for merges, rebases, cherry-picks and

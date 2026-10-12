@@ -48,6 +48,46 @@ pub struct DiffState {
     computed: Option<(u64, u64, Arc<Computed>)>,
     /// Scroll positions last frame, to tell which side the user scrolled.
     last: Option<(usize, f32, usize, f32)>,
+    /// Fold long unchanged stretches (both sides), and for which revisions
+    /// the folds were made.
+    pub fold_unchanged: bool,
+    folded_for: Option<(u64, u64)>,
+}
+
+/// Lines of context kept around each change when unchanged stretches fold.
+const CONTEXT: usize = 3;
+
+/// Folds `(start, end)` (lines strictly between are hidden) for the long
+/// unchanged blocks of one side.
+fn unchanged_folds(blocks: &[Block], left: bool) -> Vec<(usize, usize)> {
+    let n = blocks.len();
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| !b.changed)
+        .filter_map(|(i, b)| {
+            let r = if left { &b.left } else { &b.right };
+            let start = if r.start == 0 { 0 } else { r.start + CONTEXT - 1 };
+            // The last block runs to the end of the file: no context needed after it.
+            let end = if i + 1 == n { r.end.saturating_sub(1) } else { r.end.saturating_sub(CONTEXT) };
+            (end > start + 2).then_some((start, end))
+        })
+        .collect()
+}
+
+/// Visual row of `line` given folds (hidden lines do not count).
+fn visual_row(folds: &[(usize, usize)], line: usize) -> f32 {
+    let mut hidden = 0usize;
+    let mut l = line;
+    for &(a, b) in folds {
+        if l > a && l < b {
+            l = a;
+        }
+        if l >= b {
+            hidden += b - a - 1;
+        }
+    }
+    (l - hidden.min(l)) as f32
 }
 
 /// Line tints and span tints for one side of a diff.
@@ -134,6 +174,8 @@ impl ApexApp {
                 right_label: right_label.to_string(),
                 computed: None,
                 last: None,
+                fold_unchanged: true,
+                folded_for: None,
             },
         );
         self.focus_view(tab);
@@ -175,8 +217,10 @@ impl ApexApp {
 
     pub(crate) fn show_diff(&mut self, ui: &mut Ui, pane_id: PaneId, tab: ViewId, rect: Rect) {
         let Some(c) = self.diff_computed(tab) else { return };
+        self.diff_apply_folds(tab, &c.blocks);
         let Some(st) = self.diffs.get(&tab) else { return };
         let (right_view, right_focused) = (st.right_view, st.right_focused);
+        let fold_unchanged = st.fold_unchanged;
         let (left_label, right_label) = (st.left_label.clone(), st.right_label.clone());
         let source = st.source.clone();
         let theme = self.theme.clone();
@@ -198,7 +242,7 @@ impl ApexApp {
         // Labels are clipped to their half; the navigation sits over the right end.
         let lp = ui.painter_at(Rect::from_min_max(header.min, pos2(left_rect.max.x - 4.0, header.max.y)));
         lp.text(pos2(left_rect.min.x + 8.0, header.center().y), egui::Align2::LEFT_CENTER, &left_label, small.clone(), theme.ui.text_muted);
-        let rp = ui.painter_at(Rect::from_min_max(pos2(right_rect.min.x, header.min.y), pos2(header.max.x - 260.0, header.max.y)));
+        let rp = ui.painter_at(Rect::from_min_max(pos2(right_rect.min.x, header.min.y), pos2(header.max.x - 340.0, header.max.y)));
         rp.text(pos2(right_rect.min.x + 8.0, header.center().y), egui::Align2::LEFT_CENTER, &right_label, small.clone(), theme.ui.text_muted);
         let n = diff_align::changes(&c.blocks).count();
         let mut nav: Option<bool> = None;
@@ -206,6 +250,14 @@ impl ApexApp {
         let mut hdr = ui.new_child(egui::UiBuilder::new().max_rect(header.shrink2(vec2(6.0, 2.0))).layout(egui::Layout::right_to_left(egui::Align::Center)));
         if hdr.small_button("Unified").on_hover_text("Open the same comparison as a unified diff").clicked() {
             unified = true;
+        }
+        let mut toggle_folds = false;
+        if hdr
+            .small_button(if fold_unchanged { "Expand" } else { "Collapse" })
+            .on_hover_text(if fold_unchanged { "Show the unchanged lines" } else { "Fold unchanged lines, keeping some context" })
+            .clicked()
+        {
+            toggle_folds = true;
         }
         if hdr.small_button("Next").on_hover_text("Next change").clicked() {
             nav = Some(true);
@@ -230,11 +282,15 @@ impl ApexApp {
         let right_editable = self.views.get(&right_view).and_then(|v| self.docs.get(&v.doc)).is_some_and(|d| !d.read_only);
         let painter = ui.painter_at(strip);
         painter.rect_filled(strip, 0.0, theme.editor.gutter_background);
-        let y = |line: usize, top: f32| strip.min.y + (line as f32 - top) * lh;
+        let lfolds = self.views.get(&tab).and_then(|v| self.docs.get(&v.doc).map(|d| v.folds(d))).unwrap_or_default();
+        let rfolds = self.views.get(&right_view).and_then(|v| self.docs.get(&v.doc).map(|d| v.folds(d))).unwrap_or_default();
+        let (ltop_row, rtop_row) = (visual_row(&lfolds, ltop as usize), visual_row(&rfolds, rtop as usize));
+        let yl = |line: usize| strip.min.y + (visual_row(&lfolds, line) - ltop_row) * lh;
+        let yr = |line: usize| strip.min.y + (visual_row(&rfolds, line) - rtop_row) * lh;
         let mut action: Option<(usize, bool)> = None; // (block index, revert?)
         for (i, b) in c.blocks.iter().enumerate().filter(|(_, b)| b.changed) {
-            let (l0, l1) = (y(b.left.start, ltop), y(b.left.end, ltop));
-            let (r0, r1) = (y(b.right.start, rtop), y(b.right.end, rtop));
+            let (l0, l1) = (yl(b.left.start), yl(b.left.end));
+            let (r0, r1) = (yr(b.right.start), yr(b.right.end));
             if (l1 < strip.min.y && r1 < strip.min.y) || (l0 > strip.max.y && r0 > strip.max.y) {
                 continue;
             }
@@ -282,12 +338,42 @@ impl ApexApp {
         if unified {
             self.diff_open_unified(ui.ctx(), tab);
         }
+        if toggle_folds && let Some(st) = self.diffs.get_mut(&tab) {
+            st.fold_unchanged = !st.fold_unchanged;
+            st.folded_for = None;
+        }
         // Keep the sides aligned: whichever side moved this frame (scrolling,
         // caret movement, a jump) leads; the other follows on the next frame.
         if self.diff_sync_scroll(tab, &c.blocks) {
             ui.ctx().request_repaint();
         }
         self.diff_record_scroll(tab);
+    }
+
+    /// Fold (or unfold) the unchanged stretches of both sides when the
+    /// texts or the setting changed.
+    fn diff_apply_folds(&mut self, tab: ViewId, blocks: &[Block]) {
+        let Some(st) = self.diffs.get(&tab) else { return };
+        let key = st.computed.as_ref().map(|(a, b, _)| (*a, *b));
+        if st.folded_for.is_some() && st.folded_for == key {
+            return;
+        }
+        let (fold, rv) = (st.fold_unchanged, st.right_view);
+        for (v, left) in [(tab, true), (rv, false)] {
+            let Some(d) = self.views.get(&v).map(|x| x.doc) else { continue };
+            let Some(doc) = self.docs.get(&d) else { continue };
+            let folds = if fold { unchanged_folds(blocks, left) } else { Vec::new() };
+            if let Some(view) = self.views.get_mut(&v) {
+                view.fold_anchors.clear();
+                for (a, b) in folds {
+                    view.fold(doc, a, b);
+                }
+                view.cache.clear();
+            }
+        }
+        if let Some(st) = self.diffs.get_mut(&tab) {
+            st.folded_for = key;
+        }
     }
 
     fn diff_positions(&self, tab: ViewId) -> Option<(usize, f32, usize, f32)> {
@@ -539,5 +625,27 @@ impl ApexApp {
             DiffSource::Plain,
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folds_keep_context_and_rows_skip_hidden_lines() {
+        let left: String = (0..40).map(|i| format!("{i}\n")).collect();
+        let mut right_lines: Vec<String> = (0..40).map(|i| format!("{i}\n")).collect();
+        right_lines[20] = "changed\n".into();
+        let right: String = right_lines.concat();
+        let blocks = diff_align::blocks(&left, &right);
+        let f = unchanged_folds(&blocks, true);
+        // Lines 0..20 unchanged: fold from 0 to 17 (keeps 17, 18, 19); 21..40: 23 to 39.
+        assert_eq!(f, vec![(0, 17), (23, 39)]);
+        assert_eq!(visual_row(&f, 0), 0.0);
+        assert_eq!(visual_row(&f, 17), 1.0);
+        assert_eq!(visual_row(&f, 20), 4.0);
+        assert_eq!(visual_row(&f, 10), 0.0, "a hidden line sits on its fold's first line");
+        assert!(unchanged_folds(&diff_align::blocks("a\nb\n", "a\nc\n"), true).is_empty());
     }
 }

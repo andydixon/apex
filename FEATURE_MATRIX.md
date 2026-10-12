@@ -104,7 +104,7 @@ packaging, benchmarks, fuzzing, documentation).
 | Sidebar file status | I | |
 | Next/previous change, revert hunk (confirmed), show hunk diff | I | |
 | Compare with saved/index/HEAD, `--diff` of two files (side by side) | V | Xvfb run of `--diff` (alignment, sync scroll, revert + save) |
-| Side-by-side diff: aligned sync scrolling, line and word tints, connector strip, editable working copy, revert/stage/unstage per change, next/previous, unified toggle | V | `diff_align` tests; `tests/visual/git.sh` (stage from the strip) |
+| Side-by-side diff: aligned sync scrolling, line and word tints, connector strip, editable working copy, revert/stage/unstage per change, next/previous, unified toggle, folded unchanged stretches | V | `diff_align` tests; `tests/visual/git.sh` (stage from the strip) |
 | File history, open a past version, status palette | I | |
 | `git` job runner: background, serialised, cancellable, output log, no terminal prompts, trust-gated | V | `git_cli` unit tests; `tests/visual/git.sh` |
 | Stage/unstage file, stage/unstage all, discard file (confirmed) | V | `tests/visual/git.sh` (unstage file) |
