@@ -16,7 +16,7 @@ use crate::palette::{PaletteItem, PaletteMode, Payload};
 
 enum Incoming {
     /// The PR for (workdir, branch), or None when the branch has none.
-    Status(PathBuf, String, Option<PrSummary>),
+    Status(PathBuf, String, Option<Box<PrSummary>>),
     List(Vec<PrSummary>),
     Checks(Vec<forge::CheckRun>),
     Diff(u64, String),
@@ -105,7 +105,7 @@ impl ApexApp {
         for m in got {
             match m {
                 Incoming::Status(w, b, pr) => {
-                    self.git.forge.pr = pr.map(|p| (w, b, p));
+                    self.git.forge.pr = pr.map(|p| (w, b, *p));
                     if self.git.forge.pr.is_none() {
                         self.set_status("This branch has no pull request".into(), false);
                     }
@@ -190,7 +190,7 @@ impl ApexApp {
             Ok(out) => {
                 let pr = forge::parse_pr(&out)?;
                 let label = pr.status_label();
-                let _ = tx.send(Incoming::Status(workdir, branch, Some(pr)));
+                let _ = tx.send(Incoming::Status(workdir, branch, Some(Box::new(pr))));
                 Ok(label)
             }
             Err(e) if e.contains("no pull requests found") => {
@@ -409,7 +409,7 @@ impl ApexApp {
                     if let Ok(v) = c.gh(&["pr", "view", "--json", forge::PR_FIELDS], None)
                         && let Ok(pr) = forge::parse_pr(&v)
                     {
-                        let _ = tx.send(Incoming::Status(wd, branch.clone(), Some(pr)));
+                        let _ = tx.send(Incoming::Status(wd, branch.clone(), Some(Box::new(pr))));
                     }
                     Ok(if url.is_empty() { "Pull request created".into() } else { format!("Pull request created: {url}") })
                 });
