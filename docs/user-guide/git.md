@@ -90,6 +90,34 @@ how many commits there are to push and to pull.
   once and is never stored. Progress appears in the status bar; **Cancel
   Git Command** stops a slow transfer.
 
+## GitHub and other code hosts
+
+**Git > Remote** builds links from the repository's remote (GitHub, GitLab,
+Bitbucket, Codeberg/Gitea; other hosts are treated like GitHub, which suits
+GitHub Enterprise) and opens them in your browser. Apex itself makes no
+network request for these.
+
+* **Open File on Remote** / **Copy Permalink**: the active file at the
+  current commit, with the selected lines highlighted. Apex warns when the
+  commit is not pushed yet or the file has uncommitted changes.
+* **Open Commit / Branch on Remote**, **Compare Branch on Remote** (the
+  host's "new pull/merge request" page).
+
+**Git > GitHub** uses the [GitHub CLI](https://cli.github.com/) (`gh`), which
+holds your GitHub login; Apex stores no tokens. Install it and run
+`gh auth login` once (`APEX_GH` selects a particular binary).
+
+* **Create Pull Request…**: title and description filled in from the
+  branch's commits, base branch (the remote's default), draft. Unpushed
+  commits are pushed first; a new branch is published.
+* The status bar shows the current branch's pull request, its checks and
+  review state. It refreshes after you push or create a pull request, and
+  on **Refresh Pull Request Status**; Apex does not poll GitHub.
+* **Pull Requests…** lists open pull requests; choose one to check it out,
+  show its diff, or open it in the browser.
+* **Pull Request Checks…** lists the checks; Enter opens one's details.
+* **Open Pull Request in Browser**.
+
 ## Blame
 
 **Git > Toggle Blame** (Ctrl+K Ctrl+G) adds a column to the gutter with the

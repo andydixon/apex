@@ -1,6 +1,7 @@
 //! Workspace-level services that do not depend on the GUI.
 
 pub mod fileio;
+pub mod forge;
 pub mod git;
 pub mod git_cli;
 pub mod git_history;

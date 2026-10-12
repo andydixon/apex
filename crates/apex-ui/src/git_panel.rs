@@ -113,6 +113,8 @@ impl ApexApp {
                         Command::GitUndoCommit,
                         Command::GitSync,
                         Command::GitForcePush,
+                        Command::GhCreatePr,
+                        Command::GitOpenBranchOnRemote,
                         Command::GitHistoryEditor,
                         Command::GitShowOutput,
                     ] {

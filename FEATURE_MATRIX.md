@@ -117,6 +117,8 @@ packaging, benchmarks, fuzzing, documentation).
 | Fetch, pull (ff-only/rebase/merge), push, sync, force push with lease (confirmed), publish branch (confirmed) | V | `tests/visual/git.sh` (push, pull); publish/force push not scripted |
 | Ahead/behind in panel and status bar, optional auto-fetch | I | |
 | Askpass: credential/passphrase prompts relayed to an Apex dialog, never stored | V | `git_cli::askpass_relays_prompts_to_the_ui` (real `git credential fill`) |
+| Remote links: open file (lines, pinned to commit), permalink, commit, branch, compare; GitHub/GitLab/Bitbucket/Gitea URL schemes | V | `forge` tests |
+| GitHub via `gh`: create PR (prefilled, pushes/publishes first), PR status in status bar, PR list → check out / diff / open, checks list | V | `forge` tests; `tests/visual/git.sh` with a fake `gh` (status, list, check out, create); real GitHub checked by hand only |
 | Edit Commit History: per-commit author/committer/date/message, search, Claude/Codex filter, bulk author replace, date spread, co-author removal | V | `git_history` tests; `tests/visual/git.sh` (bulk replace + apply) |
 | History rewrite: clean-tree check, backup tag kept on the old history, local refs only, cleanup, optional force push with lease (typed FORCE) | V | `git_history::applies_edits_with_real_git`; push path untested |
 

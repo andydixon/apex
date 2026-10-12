@@ -25,6 +25,26 @@ seq -f 'line %g' 1 20 > "$REPO/f.txt"
 git -C "$REPO" add f.txt && git -C "$REPO" commit -q -m "first commit"
 git -C "$REPO" remote add origin "$REMOTE"
 git -C "$REPO" push -q -u origin main
+# Look like GitHub to Apex while git really talks to the local bare repository.
+git -C "$REPO" remote set-url origin https://github.com/tester/repo.git
+git -C "$REPO" config url."$REMOTE".insteadOf https://github.com/tester/repo.git
+# A stand-in for the GitHub CLI: records its arguments, returns canned JSON.
+GH="$OUT/fake-gh"
+cat > "$GH" <<'SH'
+#!/bin/sh
+echo "$*" >> "$(dirname "$0")/gh.log"
+case "$1 $2" in
+  "--version "*) echo "gh version 2.99.0" ;;
+  "pr list") echo '[{"number":7,"title":"Faster search","headRefName":"feature/fast-search","url":"https://github.com/tester/repo/pull/7","isDraft":false,"state":"OPEN","author":{"login":"ada"}}]' ;;
+  "pr view") echo '{"number":7,"title":"Faster search","headRefName":"feature/fast-search","url":"https://github.com/tester/repo/pull/7","isDraft":false,"state":"OPEN","author":{"login":"ada"},"reviewDecision":"APPROVED","statusCheckRollup":[{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/x"}]}' ;;
+  "pr checkout") exit 0 ;;
+  "pr create") cat > "$(dirname "$0")/pr-body.txt"; echo "https://github.com/tester/repo/pull/8" ;;
+  "pr diff") printf 'diff --git a/x b/x\n+added\n' ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+SH
+chmod +x "$GH"
+export APEX_GH="$GH"
 # Two separate changes: line 2 and line 15.
 sed -i 's/^line 2$/LINE TWO/; s/^line 15$/LINE FIFTEEN/' "$REPO/f.txt"
 mkdir -p "$APEX_DATA_DIR" && printf '["%s"]' "$REPO" > "$APEX_DATA_DIR/trusted.json"
@@ -118,6 +138,32 @@ sleep 2
 [ "$(git -C "$REPO" log -1 --format=%s)" = "From another clone" ] || fail "pull"
 pass "pull (fast-forward)"
 
+# G7: GitHub through the (fake) GitHub CLI.
+command "Refresh Pull Request Status"
+sleep 1
+grep -q "^pr view --json" "$OUT/gh.log" || fail "pr status not requested"
+shot g7-pr-status
+command "Pull Requests…"
+sleep 2
+shot g7-pr-list
+key Return; sleep 1      # pull request #7 -> its actions
+key Return; sleep 1.5    # "Check out"
+grep -q "^pr checkout 7" "$OUT/gh.log" || fail "pr checkout"
+pass "pull request list and check out"
+git -C "$REPO" switch -q -c feature/fast-search
+echo fast > "$REPO/search.txt" && git -C "$REPO" add search.txt && git -C "$REPO" commit -q -m "Make search faster" -m "Uses an index."
+sleep 5
+command "Create Pull Request"
+sleep 1
+shot g7-create-pr
+xdotool mousemove 387 548 click 1; sleep 4
+grep -q "^pr create --title Make search faster --body-file - --base main --head feature/fast-search" "$OUT/gh.log" || fail "pr create arguments"
+[ "$(cat "$OUT/pr-body.txt")" = "Uses an index." ] || fail "pr body"
+git -C "$REMOTE" rev-parse -q --verify refs/heads/feature/fast-search >/dev/null || fail "branch not published before creating the PR"
+pass "create pull request (published the branch first)"
+git -C "$REPO" switch -q main
+sleep 5
+
 # History editor: replace the author of every commit, apply, check git.
 git -C "$REPO" add -A && git -C "$REPO" commit -q -m "Work in progress"
 command "Edit Commit History"
@@ -131,7 +177,7 @@ xdotool mousemove 637 421 click 1; type_text "renamed@example.com"
 xdotool mousemove 460 467 click 1; sleep 1
 xdotool mousemove 107 125 click 1; sleep 1
 shot h3-confirm
-xdotool mousemove 410 457 click 1; sleep 5
+key Return; sleep 5
 authors=$(git -C "$REPO" log --branches --format=%an | sort -u)
 [ "$authors" = "Renamed Person" ] || fail "history rewrite: authors are $authors"
 tag=$(git -C "$REPO" tag -l 'apex-backup-*' | head -1)

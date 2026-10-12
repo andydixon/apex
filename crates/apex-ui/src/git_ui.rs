@@ -43,6 +43,9 @@ pub struct GitUi {
     pub(crate) sc: crate::git_panel::SourceControl,
     pub(crate) blame: crate::git_blame::BlameUi,
     pub(crate) history: crate::history_ui::HistoryEditor,
+    pub(crate) forge: crate::forge_ui::ForgeUi,
+    /// The Create Pull Request form's contents, handed to `GhSubmitPr`.
+    pub(crate) forge_pending_submit: Option<crate::app::Dialog>,
 }
 
 impl GitUi {

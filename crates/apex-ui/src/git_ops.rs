@@ -31,7 +31,7 @@ pub struct GitOps {
 }
 
 /// `origin` if present, else the first configured remote.
-fn first_remote(workdir: &Path) -> Option<String> {
+pub(crate) fn first_remote(workdir: &Path) -> Option<String> {
     let repo = git2::Repository::open(workdir).ok()?;
     let remotes = repo.remotes().ok()?;
     let names: Vec<String> = remotes.iter().flatten().map(str::to_string).collect();
@@ -108,6 +108,7 @@ impl ApexApp {
         if let Some(r) = finished {
             let label = self.git.ops.running.take().map(|j| j.label).unwrap_or_default();
             self.git.ops.progress = None;
+            let ok = r.is_ok();
             match r {
                 Ok(msg) if msg.is_empty() => {}
                 Ok(msg) => self.set_status(msg, false),
@@ -118,6 +119,13 @@ impl ApexApp {
                 }
             }
             self.git_mark_dirty();
+            // After publishing commits, the branch's pull request may have changed.
+            if ok
+                && matches!(label.as_str(), "Push" | "Publish" | "Sync" | "Force push")
+                && let Some(w) = self.git_panel_repo()
+            {
+                self.forge_refresh_pr(w);
+            }
             self.git_start_next();
         }
         true

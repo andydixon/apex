@@ -5,6 +5,7 @@ pub mod command;
 pub mod editor;
 pub mod file_dialogs;
 pub mod find_in_files;
+pub mod forge_ui;
 pub mod git_blame;
 pub mod git_ops;
 pub mod git_panel;

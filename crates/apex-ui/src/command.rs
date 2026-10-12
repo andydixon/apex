@@ -354,6 +354,21 @@ commands! {
     GitPush => "git.push", "Push", Git;
     GitForcePush => "git.force_push", "Force Push (with Lease)…", Git;
     GitSync => "git.sync", "Sync (Pull then Push)", Git;
+    GitOpenOnRemote => "git.open_on_remote", "Open File on Remote", Git;
+    GitCopyPermalink => "git.copy_permalink", "Copy Permalink", Git;
+    GitOpenCommitOnRemote => "git.open_commit_on_remote", "Open Commit on Remote", Git;
+    GitOpenBranchOnRemote => "git.open_branch_on_remote", "Open Branch on Remote", Git;
+    GitCompareOnRemote => "git.compare_on_remote", "Compare Branch on Remote", Git;
+    GhCreatePr => "github.create_pr", "Create Pull Request…", Git;
+    GhPrStatus => "github.pr_status", "Refresh Pull Request Status", Git;
+    GhOpenPr => "github.open_pr", "Open Pull Request in Browser", Git;
+    GhListPrs => "github.list_prs", "Pull Requests…", Git;
+    GhChecks => "github.checks", "Pull Request Checks…", Git;
+    GhPrActions => "github.pr_actions", "Pull Request Actions", Git;
+    GhCheckoutPr => "github.checkout_pr", "Check Out Pull Request", Git;
+    GhPrDiff => "github.pr_diff", "Show Pull Request Diff", Git;
+    GhOpenUrl => "github.open_url", "Open Link", Git;
+    GhSubmitPr => "github.submit_pr", "Submit Pull Request", Git;
     GitCancel => "git.cancel", "Cancel Git Command", Git;
 
     // Tools

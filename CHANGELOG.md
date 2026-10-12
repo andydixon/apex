@@ -16,6 +16,10 @@ All notable changes to Apex are recorded here. The format follows
 - Fetch, Pull (`git_pull_mode`), Push (publishes new branches after asking),
   Sync and Force Push with lease; ahead/behind counts; optional auto-fetch;
   password and passphrase prompts from git/ssh appear as an Apex dialog.
+- Remote links (open file at lines, permalink, commit, branch, compare) for
+  GitHub, GitLab, Bitbucket and Gitea; GitHub pull requests through the
+  GitHub CLI: create, status and checks in the status bar, list, check out,
+  diff.
 - Blame (Ctrl+K Ctrl+G): gutter column with author and age, unsaved edits
   shown as not committed, click for the commit view; optional inline blame.
 - Edit Commit History: edit authors, committers, dates and messages across

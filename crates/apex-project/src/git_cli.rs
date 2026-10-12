@@ -22,6 +22,17 @@ pub fn program() -> PathBuf {
     std::env::var_os("APEX_GIT").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("git"))
 }
 
+/// The GitHub CLI: `APEX_GH` if set, else `gh` on `PATH`.
+pub fn gh_program() -> PathBuf {
+    std::env::var_os("APEX_GH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("gh"))
+}
+
+/// Whether `gh` can be run (checked once per process).
+pub fn gh_available() -> bool {
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| base_command(&gh_program(), None).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()))
+}
+
 /// Whether `git` can be run at all (checked once).
 pub fn available() -> bool {
     static OK: OnceLock<bool> = OnceLock::new();
@@ -110,6 +121,11 @@ impl JobCtx {
         self.run(args, stdin, false)
     }
 
+    /// Run the GitHub CLI (`gh`, or `APEX_GH`) in the repository.
+    pub fn gh(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<String, String> {
+        self.run_program(&gh_program(), "gh", args, stdin, false)
+    }
+
     pub fn log(&self, line: impl Into<String>) {
         let _ = self.tx.send(JobEvent::Log(line.into()));
     }
@@ -119,12 +135,21 @@ impl JobCtx {
     }
 
     fn run(&self, args: &[&str], stdin: Option<&[u8]>, log_stdout: bool) -> Result<String, String> {
+        self.run_program(&program(), "git", args, stdin, log_stdout)
+    }
+
+    fn run_program(&self, prog: &Path, name: &str, args: &[&str], stdin: Option<&[u8]>, log_stdout: bool) -> Result<String, String> {
         if self.cancelled() {
             return Err("cancelled".into());
         }
-        self.log(format!("$ git {}", args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")));
-        let mut cmd = base_command(&program(), Some(&self.workdir));
-        cmd.args(["-c", "color.ui=false", "-c", "core.quotepath=false"]).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        self.log(format!("$ {name} {}", args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")));
+        let mut cmd = base_command(prog, Some(&self.workdir));
+        if name == "git" {
+            cmd.args(["-c", "color.ui=false", "-c", "core.quotepath=false"]);
+        } else {
+            cmd.env("GH_PROMPT_DISABLED", "1").env("GH_NO_UPDATE_NOTIFIER", "1").env("GH_SPINNER_DISABLED", "1");
+        }
+        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
         if let Some((port, token)) = &self.askpass
             && let Some(exe) = askpass_program()
         {
@@ -139,7 +164,7 @@ impl JobCtx {
         if stdin.is_some() {
             cmd.stdin(Stdio::piped());
         }
-        let mut child = cmd.spawn().map_err(|e| format!("could not run git: {e}"))?;
+        let mut child = cmd.spawn().map_err(|e| format!("could not run {name}: {e}"))?;
         if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
             // Small payloads (messages, patches); written before reading.
             let data = data.to_vec();
@@ -206,7 +231,7 @@ impl JobCtx {
             None if self.cancelled() => Err("cancelled".into()),
             c => {
                 let msg = stderr.iter().rev().find(|l| l.starts_with("fatal:") || l.starts_with("error:")).or(stderr.last()).cloned();
-                Err(msg.unwrap_or_else(|| format!("git exited with code {}", c.map(|c| c.to_string()).unwrap_or_else(|| "none".into()))))
+                Err(msg.unwrap_or_else(|| format!("{name} exited with code {}", c.map(|c| c.to_string()).unwrap_or_else(|| "none".into()))))
             }
         }
     }

@@ -100,6 +100,15 @@ pub(crate) enum Dialog {
         kind: crate::workspace_ui::PromptKind,
     },
     Recovery(Vec<apex_project::session::RecoveryEntry>),
+    /// The Create Pull Request form.
+    CreatePr {
+        workdir: PathBuf,
+        branch: String,
+        base: String,
+        title: String,
+        body: String,
+        draft: bool,
+    },
     /// A credential prompt from git or ssh (askpass).
     Askpass {
         prompt: String,
@@ -927,6 +936,7 @@ impl ApexApp {
             || self.git_commit_command(ctx, cmd, arg.clone())
             || self.git_blame_command(ctx, cmd, arg.clone())
             || self.history_command(cmd, arg.clone())
+            || self.forge_command(ctx, cmd, arg.clone())
             || self.tasks_command(ctx, cmd, arg.clone())
             || self.lsp_command(ctx, cmd, arg.clone())
             || self.spell_command(cmd)
@@ -2630,6 +2640,23 @@ impl ApexApp {
                     item(ui, &mut q, c);
                 }
                 ui.separator();
+                ui.menu_button("Remote", |ui| {
+                    for c in [
+                        Command::GitOpenOnRemote,
+                        Command::GitCopyPermalink,
+                        Command::GitOpenCommitOnRemote,
+                        Command::GitOpenBranchOnRemote,
+                        Command::GitCompareOnRemote,
+                    ] {
+                        item(ui, &mut q, c);
+                    }
+                });
+                ui.menu_button("GitHub", |ui| {
+                    for c in [Command::GhCreatePr, Command::GhListPrs, Command::GhPrStatus, Command::GhOpenPr, Command::GhChecks] {
+                        item(ui, &mut q, c);
+                    }
+                });
+                ui.separator();
                 item(ui, &mut q, Command::GitHistoryEditor);
                 ui.separator();
                 item(ui, &mut q, Command::GitCancel);
@@ -2900,6 +2927,9 @@ impl ApexApp {
         if let Some(b) = self.git_branch_label() {
             right.insert(0, format!("git: {b}"));
         }
+        if let Some(pr) = self.forge_status_label() {
+            right.insert(0, pr);
+        }
         if let Some((_, note)) = self.git_blame_caret_note() {
             left.push_str(&format!("    {}", note.chars().take(80).collect::<String>()));
         }
@@ -3153,6 +3183,10 @@ impl ApexApp {
             self.show_workspace_dialog(ctx, dialog);
             return;
         }
+        if matches!(dialog, Dialog::CreatePr { .. }) {
+            self.show_create_pr_dialog(ctx, dialog);
+            return;
+        }
         match dialog {
             Dialog::ConfirmClose { views, then, index } => {
                 let Some(&vid) = views.get(index) else {
@@ -3354,7 +3388,8 @@ impl ApexApp {
             | Dialog::Trust { .. }
             | Dialog::ConfirmWorkspaceEdit { .. }
             | Dialog::Confirm { .. }
-            | Dialog::Askpass { .. } => {}
+            | Dialog::Askpass { .. }
+            | Dialog::CreatePr { .. } => {}
             Dialog::Issues(issues) => {
                 let r = egui::Modal::new(egui::Id::new("issues")).show(ctx, |ui| {
                     ui.set_width(520.0);
@@ -4005,6 +4040,29 @@ fn hex_preview(bytes: &[u8]) -> String {
         out.push_str("… (preview truncated at 1 MiB)\n");
     }
     out
+}
+
+/// Open a web link in the default browser. Only `https:` links are opened.
+pub(crate) fn open_url(url: &str) -> bool {
+    if !url.starts_with("https://") {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    let cmd = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "macos")]
+    let cmd = std::process::Command::new("open").arg(url).spawn();
+    // rundll32 avoids cmd.exe treating `&` in query strings as a separator.
+    #[cfg(target_os = "windows")]
+    let cmd = std::process::Command::new("rundll32").arg("url.dll,FileProtocolHandler").arg(url).spawn();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let cmd: std::io::Result<std::process::Child> = Err(std::io::Error::other("unsupported platform"));
+    match cmd {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("could not open {url}: {e}");
+            false
+        }
+    }
 }
 
 pub(crate) fn reveal_in_file_manager(path: &Path) {

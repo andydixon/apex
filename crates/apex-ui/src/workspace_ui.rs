@@ -203,6 +203,7 @@ impl ApexApp {
             repaint = true;
         }
         self.git_auto_fetch();
+        self.forge_poll(ctx);
         if self.git_blame_poll() {
             repaint = true;
         }
@@ -821,6 +822,7 @@ impl ApexApp {
             return;
         }
         match (mode, p) {
+            (PaletteMode::Prompt(_), Payload::Command(c, arg)) => self.execute(ctx, c, arg),
             (PaletteMode::Commands, Payload::Command(c, arg)) => {
                 self.recent_commands.retain(|r| *r != c);
                 self.recent_commands.push_front(c);

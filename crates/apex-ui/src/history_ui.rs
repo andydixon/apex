@@ -548,7 +548,10 @@ impl ApexApp {
                         });
                     }
                     let can = !force || typed.trim() == "FORCE";
-                    ui.horizontal(|ui| (ui.add_enabled(can, egui::Button::new("Rewrite")).clicked(), ui.button("Cancel").clicked())).inner
+                    // Enter confirms too (it is also how FORCE is submitted).
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let (ok, cancel) = ui.horizontal(|ui| (ui.add_enabled(can, egui::Button::new("Rewrite")).clicked(), ui.button("Cancel").clicked())).inner;
+                    (ok || (enter && can), cancel)
                 });
                 let (ok, cancel) = r.inner;
                 if ok {
