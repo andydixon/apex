@@ -60,10 +60,11 @@ All notable changes to Apex are recorded here. The format follows
   targets, security review, user guide and developer documentation.
 
 ### Fixed
-- Open Folder / Open File / Save As no longer hang the editor on macOS: the
-  dialog is shown by `osascript` in a separate process (both in-process AppKit
-  paths hung inside winit's event handler), and runs on a worker thread on
-  Linux and Windows, so the window stays responsive.
+- Open Folder / Open File / Save As no longer hang the editor on macOS:
+  dialogs are started from a worker thread, so AppKit runs the panel from
+  the main queue outside winit's event handler (starting it inside the
+  handler hung before the panel appeared). A dialog that never answers no
+  longer blocks the next one.
 - The macOS Dock icon (and the window icon elsewhere) is Apex's icon instead
   of egui's default logo, which eframe installed at run time.
 - `make release` now also produces the platform package (`Apex.app` and DMG

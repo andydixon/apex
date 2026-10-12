@@ -170,7 +170,7 @@ repaint when something arrives:
 | LSP server I/O | reader thread per server | message size limit; restart backoff |
 | File watcher | `notify` | coalesced into a rescan timer |
 | Second invocation / Apple Events | `open_requests` channel | polled every frame |
-| Native file dialogs | `file_dialogs.rs`: worker thread running rfd (Linux, Windows) or `osascript` in its own process (macOS) | one at a time; no AppKit panel is ever run from inside winit's event handler |
+| Native file dialogs | `file_dialogs.rs`: rfd's blocking dialog started from a worker thread (on macOS rfd runs the panel from the main dispatch queue) | latest request wins; no AppKit panel is ever started from inside winit's event handler |
 
 Results are tagged with the generation or revision they were computed for and
 discarded when stale, so a slow worker can never overwrite newer state.
