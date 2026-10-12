@@ -11,12 +11,12 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
-use std::time::Duration;
 
 use crate::app::{ApexApp, Dialog, normalise_path};
 use crate::view::ViewId;
 
 /// What to do with the chosen paths.
+#[derive(Debug, Clone)]
 pub(crate) enum FileDialogKind {
     OpenFiles,
     /// `replace`: Open Folder (new workspace) rather than Add Folder.
@@ -28,10 +28,11 @@ pub(crate) enum FileDialogKind {
     /// (used to resume a close-with-save sequence).
     SaveAs {
         vid: ViewId,
-        then: Option<Dialog>,
+        then: Option<Box<Dialog>>,
     },
 }
 
+#[derive(Clone, Copy, PartialEq)]
 enum Mode {
     PickFiles,
     PickFolder,
@@ -109,12 +110,16 @@ pub struct PendingFileDialog {
 }
 
 impl PendingFileDialog {
-    fn start(spec: FileDialogSpec, kind: FileDialogKind) -> Self {
+    fn start(spec: FileDialogSpec, kind: FileDialogKind, ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
         std::thread::Builder::new()
             .name("apex-file-dialog".into())
             .spawn(move || {
                 let _ = tx.send(spec.run_sync());
+                // Wake the UI only when there is an answer: repainting while
+                // the panel is up made no difference to it, and on macOS a
+                // covered window's redraw can block the main thread.
+                ctx.request_repaint();
             })
             .ok();
         Self { kind, rx }
@@ -131,21 +136,51 @@ impl PendingFileDialog {
 }
 
 impl ApexApp {
-    /// Show a native dialog; the result arrives through `poll_file_dialog`.
+    /// Show a native dialog (or the path prompt when `native_file_dialogs`
+    /// is off); the result arrives through `poll_file_dialog`.
     pub(crate) fn show_file_dialog(&mut self, spec: FileDialogSpec, kind: FileDialogKind) {
+        if !self.settings.native_file_dialogs {
+            self.prompt_for_path(&spec, kind);
+            return;
+        }
+        let Some(ctx) = self.egui_ctx.clone() else { return };
         // A dialog that never answered must not block the next one: the
         // new request replaces it and a late answer is ignored.
-        self.file_dialog = Some(PendingFileDialog::start(spec, kind));
+        self.file_dialog = Some(PendingFileDialog::start(spec, kind, ctx));
+    }
+
+    /// The in-app alternative: a path prompt with Tab completion.
+    pub(crate) fn prompt_for_path(&mut self, spec: &FileDialogSpec, kind: FileDialogKind) {
+        let mut initial = spec
+            .directory
+            .clone()
+            .or_else(|| self.roots.first().cloned())
+            .or_else(|| directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()))
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        if !initial.is_empty() && !initial.ends_with(std::path::MAIN_SEPARATOR) {
+            initial.push(std::path::MAIN_SEPARATOR);
+        }
+        if let Some(n) = &spec.file_name {
+            initial.push_str(n);
+        }
+        let title = match spec.mode {
+            Mode::PickFolder => format!("{} (folder path; Tab completes)", spec.title),
+            _ => format!("{} (file path; Tab completes)", spec.title),
+        };
+        self.prompt(&title, &initial, crate::workspace_ui::PromptKind::Path(Box::new(kind), spec.mode == Mode::PickFolder));
     }
 
     /// Called every frame: deliver a finished dialog's result.
     pub(crate) fn poll_file_dialog(&mut self, ctx: &egui::Context) {
         let Some(pending) = &mut self.file_dialog else { return };
-        let Some(paths) = pending.poll() else {
-            ctx.request_repaint_after(Duration::from_millis(50));
-            return;
-        };
+        let Some(paths) = pending.poll() else { return };
         let Some(PendingFileDialog { kind, .. }) = self.file_dialog.take() else { return };
+        self.file_dialog_result(kind, paths);
+        ctx.request_repaint();
+    }
+
+    pub(crate) fn file_dialog_result(&mut self, kind: FileDialogKind, paths: Vec<PathBuf>) {
         match kind {
             FileDialogKind::OpenFiles => {
                 for p in paths {
@@ -172,16 +207,16 @@ impl ApexApp {
                     && self.save_view_to(vid, normalise_path(p))
                     && then.is_some()
                 {
-                    self.dialog = then;
+                    self.dialog = then.map(|d| *d);
                 }
             }
         }
-        ctx.request_repaint();
     }
 
     /// Ask for a path and save the view's document there; `then` is shown
     /// after a successful save (e.g. the next step of closing tabs).
     pub(crate) fn save_view_as_then(&mut self, vid: ViewId, then: Option<Dialog>) {
+        let then = then.map(Box::new);
         let Some(view) = self.views.get(&vid) else { return };
         let Some(doc) = self.docs.get(&view.doc) else { return };
         let mut spec = FileDialogSpec::save_file("Save As");
@@ -197,3 +232,68 @@ impl ApexApp {
     }
 }
 
+/// Tab completion for a typed path: the completed text and the candidates
+/// (names, with a trailing separator for folders) when it is ambiguous.
+pub(crate) fn complete_path(text: &str, folders_only: bool) -> (String, Vec<String>) {
+    let sep = std::path::MAIN_SEPARATOR;
+    let expanded = match text.strip_prefix('~') {
+        Some(rest) => directories::UserDirs::new().map(|u| format!("{}{rest}", u.home_dir().display())).unwrap_or_else(|| text.to_string()),
+        None => text.to_string(),
+    };
+    let (dir, prefix) = match expanded.rfind(['/', sep]) {
+        Some(i) => (expanded[..=i].to_string(), expanded[i + 1..].to_string()),
+        None => return (text.to_string(), Vec::new()),
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else { return (expanded, Vec::new()) };
+    let lower = prefix.to_lowercase();
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let is_dir = e.path().is_dir();
+            (name.to_lowercase().starts_with(&lower) && (is_dir || !folders_only) && (!name.starts_with('.') || prefix.starts_with('.')))
+                .then(|| if is_dir { format!("{name}{sep}") } else { name })
+        })
+        .collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    match names.len() {
+        0 => (expanded, Vec::new()),
+        1 => (format!("{dir}{}", names[0]), Vec::new()),
+        _ => {
+            // Longest common prefix (case-insensitive match, keep the first's case).
+            let first: Vec<char> = names[0].chars().collect();
+            let mut n = first.len();
+            for other in &names[1..] {
+                n = n.min(first.iter().zip(other.chars()).take_while(|(a, b)| a.to_lowercase().eq(b.to_lowercase())).count());
+            }
+            let common: String = first[..n].iter().collect();
+            let completed = if common.chars().count() > prefix.chars().count() { format!("{dir}{common}") } else { expanded };
+            (completed, names)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_completion() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir(root.join("alpha")).unwrap();
+        std::fs::create_dir(root.join("alpine")).unwrap();
+        std::fs::write(root.join("beta.txt"), "").unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        let base = format!("{}{sep}", root.display());
+        let (t, c) = complete_path(&format!("{base}al"), false);
+        assert_eq!(t, format!("{base}alp"));
+        assert_eq!(c, vec![format!("alpha{sep}"), format!("alpine{sep}")]);
+        let (t, c) = complete_path(&format!("{base}alph"), true);
+        assert_eq!(t, format!("{base}alpha{sep}"));
+        assert!(c.is_empty());
+        assert_eq!(complete_path(&format!("{base}be"), false).0, format!("{base}beta.txt"));
+        assert_eq!(complete_path(&format!("{base}be"), true).0, format!("{base}be"));
+        assert_eq!(complete_path("nothing", false).0, "nothing");
+    }
+}

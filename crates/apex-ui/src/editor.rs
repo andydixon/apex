@@ -60,6 +60,31 @@ pub struct EditorStyle<'a> {
     pub large_file: bool,
     /// Draw a block caret (Vim normal/visual mode).
     pub block_caret: bool,
+    /// Blame annotations in a column at the left of the gutter.
+    pub blame: Option<&'a BlameColumn>,
+    /// Dim text after the end of this line (current-line blame).
+    pub inline_note: Option<(usize, &'a str)>,
+}
+
+/// One line's blame annotation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BlameCell {
+    pub author: String,
+    pub age: String,
+    /// 0 = oldest commit in the file, 1 = newest.
+    pub tint: f32,
+    /// First line of a run from the same commit (the text is drawn once).
+    pub first: bool,
+    /// Commit id; `None` for uncommitted lines.
+    pub commit: Option<String>,
+    pub tooltip: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BlameColumn {
+    pub width: f32,
+    /// Indexed by document line; missing lines have no annotation.
+    pub cells: Vec<BlameCell>,
 }
 
 /// What the widget asks the application to do, in input order.
@@ -100,7 +125,8 @@ pub fn geometry(rect: Rect, doc: &Document, style: &EditorStyle) -> Geometry {
     let total_lines = doc.len_lines();
     let digits = total_lines.max(1).to_string().len().max(2);
     let fold_w = if style.settings.line_numbers { FOLD_W } else { 0.0 };
-    let gutter_w = if style.settings.line_numbers { digits as f32 * style.char_width + GUTTER_PAD * 2.0 + fold_w } else { GUTTER_PAD + 8.0 };
+    let blame_w = style.blame.map(|b| b.width).unwrap_or(0.0);
+    let gutter_w = blame_w + if style.settings.line_numbers { digits as f32 * style.char_width + GUTTER_PAD * 2.0 + fold_w } else { GUTTER_PAD + 8.0 };
     let minimap_w = if style.settings.minimap && !style.large_file && rect.width() > 500.0 { style.settings.minimap_width } else { 0.0 };
     let text = Rect::from_min_max(pos2(rect.min.x + gutter_w, rect.min.y), pos2(rect.max.x - SCROLLBAR_W - minimap_w, rect.max.y));
     let minimap = (minimap_w > 0.0).then(|| Rect::from_min_max(pos2(text.max.x, rect.min.y), pos2(rect.max.x - SCROLLBAR_W, rect.max.y)));
@@ -663,6 +689,12 @@ pub fn input(
                 if let Some(vr) = rows.iter().find(|r| p.y >= r.y && p.y < r.y + lh) {
                     out.push(Action::ToggleFold(vr.line));
                 }
+            } else if in_gutter && style.blame.is_some_and(|b| p.x < rect.min.x + b.width) {
+                if let Some(vr) = rows.iter().find(|r| p.y >= r.y && p.y < r.y + lh)
+                    && let Some(id) = style.blame.and_then(|b| b.cells.get(vr.line)).and_then(|c| c.commit.clone())
+                {
+                    out.push(Action::Command(Command::GitShowCommit, Some(id)));
+                }
             } else if in_gutter {
                 if let Some(vr) = rows.iter().find(|r| p.y >= r.y && p.y < r.y + lh) {
                     let line = vr.line;
@@ -1050,7 +1082,22 @@ pub fn paint(ui: &mut Ui, rect: Rect, view: &mut View, doc: &Document, style: &E
         let layout = layout_line(ui, &geo, view, doc, vr.line, style, highlight);
         max_width = max_width.max(layout.width());
         let galley = layout.galley.clone();
+        let last_row_w = galley.rows.last().map(|r| r.rect().width()).unwrap_or(0.0);
+        let rows_n = galley.rows.len().max(1) as f32;
         text_painter.galley(pos2(x0, top), galley, ed.foreground);
+        if let Some((l, note)) = style.inline_note
+            && l == vr.line
+        {
+            let x = x0 + last_row_w + style.char_width * 4.0;
+            let y = top + (rows_n - 1.0) * lh + lh / 2.0;
+            text_painter.text(
+                pos2(x, y),
+                egui::Align2::LEFT_CENTER,
+                note,
+                egui::FontId::new(style.font_id.size * 0.9, egui::FontFamily::Proportional),
+                ed.line_number,
+            );
+        }
         if line_len_chars(rope, vr.line) > MAX_LAYOUT_CHARS {
             let x = x0 + layout.width() + 4.0;
             text_painter.text(pos2(x, top + lh / 2.0), egui::Align2::LEFT_CENTER, "... (line truncated for display)", style.font_id.clone(), ed.line_number);
@@ -1230,8 +1277,12 @@ pub fn paint(ui: &mut Ui, rect: Rect, view: &mut View, doc: &Document, style: &E
                 painter.add(egui::Shape::convex_polygon(pts, if folded { ed.fold_marker } else { ed.line_number }, Stroke::NONE));
             }
         }
+        if let Some(b) = style.blame {
+            paint_blame_cell(ui, &painter, rect, b, line, y, lh, style);
+        }
         if bookmarks.binary_search(&line).is_ok() {
-            painter.circle_filled(pos2(rect.min.x + 6.0, y + lh / 2.0), 3.0, theme.ui.accent);
+            let bx = rect.min.x + style.blame.map(|b| b.width).unwrap_or(0.0) + 6.0;
+            painter.circle_filled(pos2(bx, y + lh / 2.0), 3.0, theme.ui.accent);
         }
         if let Some((_, kind)) = style.git_marks.iter().find(|(l, _)| *l == line) {
             let colour = match kind {
@@ -1493,6 +1544,32 @@ pub fn selection_summary(doc: &Document, sels: &SelectionSet) -> String {
 
 pub fn ccursor(i: usize) -> CCursor {
     CCursor { index: CharIndex(i), prefer_next_row: false }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_blame_cell(ui: &Ui, painter: &egui::Painter, rect: Rect, b: &BlameColumn, line: usize, y: f32, lh: f32, style: &EditorStyle) {
+    let Some(cell) = b.cells.get(line) else { return };
+    let ed = &style.theme.editor;
+    let r = Rect::from_min_size(pos2(rect.min.x, y), vec2(b.width - 4.0, lh));
+    // Newer commits are tinted more strongly.
+    let alpha = if cell.commit.is_some() { (20.0 + cell.tint * 70.0) as u8 } else { 0 };
+    let accent = style.theme.ui.accent;
+    painter.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), alpha));
+    if cell.first {
+        let font = egui::FontId::new(style.font_id.size * 0.82, egui::FontFamily::Proportional);
+        let colour = if cell.commit.is_some() { ed.line_number_active } else { ed.line_number };
+        let clip = painter.with_clip_rect(r.shrink2(vec2(4.0, 0.0)).intersect(painter.clip_rect()));
+        clip.text(pos2(r.max.x - 6.0, y + lh / 2.0), egui::Align2::RIGHT_CENTER, &cell.age, font.clone(), ed.line_number);
+        let age_w = cell.age.chars().count() as f32 * font.size * 0.55 + 14.0;
+        let clip = painter.with_clip_rect(Rect::from_min_max(r.min, pos2(r.max.x - age_w, r.max.y)).intersect(painter.clip_rect()));
+        clip.text(pos2(r.min.x + 6.0, y + lh / 2.0), egui::Align2::LEFT_CENTER, &cell.author, font, colour);
+    }
+    if ui.rect_contains_pointer(r) && !cell.tooltip.is_empty() {
+        egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::new(("blame-tip", line)), egui::PopupAnchor::Pointer).show(|ui| {
+            ui.set_max_width(480.0);
+            ui.label(&cell.tooltip);
+        });
+    }
 }
 
 pub fn arc_galley_text(g: &Arc<egui::Galley>) -> &str {

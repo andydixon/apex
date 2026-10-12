@@ -71,6 +71,7 @@ commands! {
     NewFile => "file.new", "New File", File;
     OpenFile => "file.open", "Open File…", File;
     OpenFolder => "file.open_folder", "Open Folder…", File;
+    OpenFolderByPath => "file.open_folder_path", "Open Folder by Path…", File;
     OpenRecent => "file.open_recent", "Open Recent…", File;
     ReopenClosed => "file.reopen_closed", "Reopen Closed File", File;
     Save => "file.save", "Save", File;
@@ -345,6 +346,8 @@ commands! {
     GitUndoCommit => "git.undo_commit", "Undo Last Commit…", Git;
     GitOpenChanges => "git.open_changes", "Open Changes", Git;
     GitOpenStagedChanges => "git.open_staged_changes", "Open Staged Changes", Git;
+    GitToggleBlame => "git.toggle_blame", "Toggle Blame", Git;
+    GitShowCommit => "git.show_commit", "Show Commit", Git;
     GitCancel => "git.cancel", "Cancel Git Command", Git;
 
     // Tools

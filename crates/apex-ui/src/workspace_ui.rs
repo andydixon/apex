@@ -28,8 +28,10 @@ pub enum MacroStep {
 }
 
 /// What a text prompt dialog is for.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PromptKind {
+#[derive(Debug, Clone)]
+pub(crate) enum PromptKind {
+    /// A typed path standing in for a file dialog (folder only = true).
+    Path(Box<crate::file_dialogs::FileDialogKind>, bool),
     NewFile(PathBuf),
     NewFolder(PathBuf),
     MacroName,
@@ -198,6 +200,9 @@ impl ApexApp {
             repaint = true;
         }
         if self.git_ops_poll() {
+            repaint = true;
+        }
+        if self.git_blame_poll() {
             repaint = true;
         }
         if self.git.has_repos() && self.last_git_tick.elapsed() >= Duration::from_secs(4) {
@@ -1511,6 +1516,41 @@ impl ApexApp {
                 self.save_project_file(&path);
             }
             PromptKind::Rename => self.execute(ctx, Command::LspRename, Some(text)),
+            PromptKind::Path(kind, folder) => {
+                let raw = text.trim();
+                let path = match raw.strip_prefix('~') {
+                    Some(rest) => {
+                        directories::UserDirs::new().map(|u| PathBuf::from(format!("{}{rest}", u.home_dir().display()))).unwrap_or_else(|| PathBuf::from(raw))
+                    }
+                    None => PathBuf::from(raw),
+                };
+                let saving = matches!(*kind, crate::file_dialogs::FileDialogKind::SaveAs { .. });
+                let ok = if folder {
+                    path.is_dir()
+                } else if saving {
+                    path.parent().is_some_and(Path::is_dir) && !path.is_dir()
+                } else {
+                    path.is_file()
+                };
+                if !ok {
+                    self.set_status(
+                        format!(
+                            "{} is not {}",
+                            path.display(),
+                            if folder {
+                                "a folder"
+                            } else if saving {
+                                "a file path in an existing folder"
+                            } else {
+                                "a file"
+                            }
+                        ),
+                        true,
+                    );
+                    return;
+                }
+                self.file_dialog_result(*kind, vec![path]);
+            }
         }
         self.focus_active_editor(ctx);
     }
@@ -1648,10 +1688,43 @@ impl ApexApp {
             Dialog::Prompt { title, mut text, kind } => {
                 let mut accept = false;
                 let mut cancel = false;
+                let path_mode = match &kind {
+                    PromptKind::Path(_, folder) => Some(*folder),
+                    _ => None,
+                };
                 let r = egui::Modal::new(egui::Id::new("prompt")).show(ctx, |ui| {
-                    ui.set_width(380.0);
+                    ui.set_width(if path_mode.is_some() { 560.0 } else { 380.0 });
                     ui.label(&title);
-                    let resp = ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY));
+                    let tab = path_mode.is_some() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+                    let mut candidates = Vec::new();
+                    if let Some(folder) = path_mode
+                        && tab
+                    {
+                        let (t, c) = crate::file_dialogs::complete_path(&text, folder);
+                        text = t;
+                        candidates = c;
+                        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("path-candidates"), candidates.clone()));
+                    } else if path_mode.is_some() {
+                        candidates = ui.ctx().data(|d| d.get_temp::<Vec<String>>(egui::Id::new("path-candidates"))).unwrap_or_default();
+                    }
+                    let id = egui::Id::new("prompt-text");
+                    let resp = ui.add(egui::TextEdit::singleline(&mut text).id(id).desired_width(f32::INFINITY));
+                    if tab && let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+                        // Keep the caret at the end after completing.
+                        let end = egui::text::CCursor::new(text.chars().count());
+                        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
+                        state.store(ui.ctx(), id);
+                    }
+                    if resp.changed() {
+                        ui.ctx().data_mut(|d| d.remove::<Vec<String>>(egui::Id::new("path-candidates")));
+                    }
+                    if !candidates.is_empty() {
+                        egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                            for c in candidates.iter().take(200) {
+                                ui.label(egui::RichText::new(c).monospace());
+                            }
+                        });
+                    }
                     resp.request_focus();
                     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         accept = true;
@@ -1917,6 +1990,10 @@ impl ApexApp {
     /// Commands handled by this module. Returns false if not handled.
     pub(crate) fn execute_workspace(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) -> bool {
         match cmd {
+            Command::OpenFolderByPath => {
+                let spec = crate::file_dialogs::FileDialogSpec::open_folder("Open Folder").directory(self.roots.first().cloned());
+                self.prompt_for_path(&spec, crate::file_dialogs::FileDialogKind::OpenFolder { replace: true });
+            }
             Command::OpenFolder | Command::AddFolder => {
                 let title = if cmd == Command::OpenFolder { "Open Folder" } else { "Add Folder to Workspace" };
                 let spec = crate::file_dialogs::FileDialogSpec::open_folder(title).directory(self.roots.first().cloned());

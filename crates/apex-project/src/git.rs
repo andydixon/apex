@@ -467,3 +467,186 @@ mod history_tests {
         assert!(d.contains("-b\n+c\n"));
     }
 }
+
+/// A commit referenced by a blame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameCommit {
+    pub id: String,
+    pub author: String,
+    pub email: String,
+    pub time: i64,
+    pub summary: String,
+    pub message: String,
+}
+
+/// Who last changed each line. `lines[i]` indexes `commits`; `None` means
+/// the line is not committed (edited in the buffer or new).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlameInfo {
+    pub commits: Vec<BlameCommit>,
+    pub lines: Vec<Option<u32>>,
+}
+
+/// Blame `path` as of HEAD, then against `buffer` (the editor's text) so
+/// unsaved edits show as not committed.
+pub fn blame(workdir: &Path, path: &Path, buffer: Option<&str>) -> Result<BlameInfo, git2::Error> {
+    let repo = git2::Repository::open(workdir)?;
+    let root = repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| workdir.to_path_buf());
+    let rel = path.strip_prefix(&root).map_err(|_| git2::Error::from_str("path is outside the repository"))?;
+    let base = repo.blame_file(rel, None)?;
+    let blame = match buffer {
+        Some(b) => base.blame_buffer(b.as_bytes())?,
+        None => base,
+    };
+    let mut info = BlameInfo::default();
+    let mut index: HashMap<git2::Oid, u32> = HashMap::new();
+    for h in blame.iter() {
+        let id = h.final_commit_id();
+        let slot = if id.is_zero() {
+            None
+        } else if let Some(i) = index.get(&id) {
+            Some(*i)
+        } else {
+            let c = repo.find_commit(id)?;
+            let a = c.author();
+            info.commits.push(BlameCommit {
+                id: id.to_string(),
+                author: a.name().unwrap_or("").to_string(),
+                email: a.email().unwrap_or("").to_string(),
+                time: c.time().seconds(),
+                summary: c.summary().unwrap_or("").to_string(),
+                message: c.message().unwrap_or("").to_string(),
+            });
+            let i = (info.commits.len() - 1) as u32;
+            index.insert(id, i);
+            Some(i)
+        };
+        let start = h.final_start_line().saturating_sub(1);
+        let end = start + h.lines_in_hunk();
+        if info.lines.len() < end {
+            info.lines.resize(end, None);
+        }
+        for l in &mut info.lines[start..end] {
+            *l = slot;
+        }
+    }
+    Ok(info)
+}
+
+/// Run [`blame`] on a worker thread.
+pub fn start_blame(workdir: PathBuf, path: PathBuf, buffer: String) -> Receiver<Result<BlameInfo, String>> {
+    let (tx, rx) = bounded(1);
+    let spawned = std::thread::Builder::new().name("apex-git-blame".into()).spawn(move || {
+        let _ = tx.send(blame(&workdir, &path, Some(&buffer)).map_err(|e| e.message().to_string()));
+    });
+    if let Err(e) = spawned {
+        tracing::error!("could not spawn blame thread: {e}");
+    }
+    rx
+}
+
+/// "3 months ago" (long) or "3 mo" (short) for a Unix time.
+pub fn relative_age(time: i64, now: i64, short: bool) -> String {
+    let s = (now - time).max(0);
+    let (n, long, abbr) = match s {
+        0..60 => return if short { "now".into() } else { "just now".into() },
+        60..3600 => (s / 60, "minute", "min"),
+        3600..86_400 => (s / 3600, "hour", "h"),
+        86_400..1_209_600 => (s / 86_400, "day", "d"),
+        1_209_600..5_259_600 => (s / 604_800, "week", "wk"),
+        5_259_600..31_557_600 => (s / 2_629_800, "month", "mo"),
+        _ => (s / 31_557_600, "year", "y"),
+    };
+    if short { format!("{n} {abbr}") } else { format!("{n} {long}{} ago", if n == 1 { "" } else { "s" }) }
+}
+
+/// `git show`-style text for a commit: header, message and the patch
+/// against its first parent.
+pub fn commit_text(workdir: &Path, id: &str) -> Result<String, git2::Error> {
+    let repo = git2::Repository::open(workdir)?;
+    let commit = repo.revparse_single(id)?.peel_to_commit()?;
+    let a = commit.author();
+    let mut out = format!(
+        "commit {}\nAuthor: {} <{}>\nDate:   {}\n",
+        commit.id(),
+        a.name().unwrap_or(""),
+        a.email().unwrap_or(""),
+        format_date(a.when().seconds(), a.when().offset_minutes())
+    );
+    if commit.parent_count() > 1 {
+        let parents: Vec<String> = commit.parent_ids().map(|p| p.to_string()[..7].to_string()).collect();
+        out.push_str(&format!("Merge:  {}\n", parents.join(" ")));
+    }
+    out.push('\n');
+    for l in commit.message().unwrap_or("").trim_end().lines() {
+        if l.is_empty() {
+            out.push('\n');
+        } else {
+            out.push_str(&format!("    {l}\n"));
+        }
+    }
+    out.push('\n');
+    let parent_tree = commit.parent(0).ok().map(|p| p.tree()).transpose()?;
+    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit.tree()?), None)?;
+    diff.print(git2::DiffFormat::Patch, |_, _, line| {
+        if matches!(line.origin(), '+' | '-' | ' ') {
+            out.push(line.origin());
+        }
+        out.push_str(&String::from_utf8_lossy(line.content()));
+        true
+    })?;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod blame_tests {
+    use super::*;
+
+    fn commit_all(repo: &git2::Repository, msg: &str, time: i64) {
+        let mut index = repo.index().unwrap();
+        index.add_all(["*"], git2::IndexAddOption::DEFAULT, None).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::new("Ada", "ada@example.com", &git2::Time::new(time, 0)).unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents).unwrap();
+    }
+
+    #[test]
+    fn blame_tracks_commits_and_buffer_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo = git2::Repository::init(root).unwrap();
+        let f = root.join("f.txt");
+        std::fs::write(&f, "a\nb\nc\n").unwrap();
+        commit_all(&repo, "first", 1_000_000);
+        std::fs::write(&f, "a\nB\nc\n").unwrap();
+        commit_all(&repo, "second\n\nbody", 2_000_000);
+        let info = blame(root, &f, Some("a\nB\nc\nnew\n")).unwrap();
+        assert_eq!(info.commits.len(), 2);
+        let summary = |l: usize| info.lines[l].map(|i| info.commits[i as usize].summary.clone());
+        assert_eq!(summary(0).as_deref(), Some("first"));
+        assert_eq!(summary(1).as_deref(), Some("second"));
+        assert_eq!(summary(2).as_deref(), Some("first"));
+        assert_eq!(info.lines[3], None);
+        let text = commit_text(root, "HEAD").unwrap();
+        assert!(text.starts_with("commit "), "{text}");
+        assert!(text.contains("Author: Ada <ada@example.com>"));
+        assert!(text.contains("    second\n\n    body\n"));
+        assert!(text.contains("-b\n+B\n"), "{text}");
+        assert!(commit_text(root, "HEAD~1").unwrap().contains("+a\n+b\n+c\n"));
+    }
+
+    #[test]
+    fn ages() {
+        assert_eq!(relative_age(100, 100, false), "just now");
+        assert_eq!(relative_age(0, 120, false), "2 minutes ago");
+        assert_eq!(relative_age(0, 3600, false), "1 hour ago");
+        assert_eq!(relative_age(0, 86_400 * 3, true), "3 d");
+        assert_eq!(relative_age(0, 86_400 * 21, false), "3 weeks ago");
+        assert_eq!(relative_age(0, 86_400 * 100, true), "3 mo");
+        assert_eq!(relative_age(0, 86_400 * 800, false), "2 years ago");
+        assert_eq!(relative_age(500, 100, true), "now");
+    }
+}

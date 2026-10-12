@@ -212,6 +212,8 @@ pub struct ApexApp {
     pub(crate) settings_panel: crate::settings_ui::SettingsPanel,
     /// The native file dialog in progress, if any (see `file_dialogs.rs`).
     pub(crate) file_dialog: Option<crate::file_dialogs::PendingFileDialog>,
+    /// For waking the UI from worker threads.
+    pub(crate) egui_ctx: Option<egui::Context>,
     pub(crate) inbox: Option<crossbeam_channel::Receiver<OpenRequest>>,
     pub(crate) on_view_closed: Option<ViewClosedHook>,
     /// `APEX_FRAME_TIME=1`: show the frame interval in the status bar.
@@ -308,6 +310,7 @@ impl ApexApp {
             vim: crate::vim::Vim::new(),
             settings_panel: Default::default(),
             file_dialog: None,
+            egui_ctx: Some(cc.egui_ctx.clone()),
             inbox: args.inbox.clone(),
             on_view_closed: args.on_view_closed.clone(),
             show_frame_time: std::env::var_os("APEX_FRAME_TIME").is_some(),
@@ -916,6 +919,7 @@ impl ApexApp {
         if self.git_command(ctx, cmd)
             || self.git_ops_command(cmd, arg.clone())
             || self.git_commit_command(ctx, cmd, arg.clone())
+            || self.git_blame_command(ctx, cmd, arg.clone())
             || self.tasks_command(ctx, cmd, arg.clone())
             || self.lsp_command(ctx, cmd, arg.clone())
             || self.spell_command(cmd)
@@ -2317,7 +2321,7 @@ impl ApexApp {
         let themes: Vec<(String, bool)> = self.themes.iter().map(|t| (t.name.clone(), t.name == self.theme.name)).collect();
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                for c in [Command::NewFile, Command::OpenFile, Command::OpenFolder] {
+                for c in [Command::NewFile, Command::OpenFile, Command::OpenFolder, Command::OpenFolderByPath] {
                     item(ui, &mut q, c);
                 }
                 ui.menu_button("Open Recent", |ui| {
@@ -2603,6 +2607,10 @@ impl ApexApp {
                     item(ui, &mut q, c);
                 }
                 ui.separator();
+                for c in [Command::GitToggleBlame, Command::GitShowCommit] {
+                    item(ui, &mut q, c);
+                }
+                ui.separator();
                 for c in [Command::NextChange, Command::PrevChange, Command::ShowHunkDiff, Command::RevertHunk] {
                     item(ui, &mut q, c);
                 }
@@ -2878,6 +2886,9 @@ impl ApexApp {
         }
         if let Some(b) = self.git_branch_label() {
             right.insert(0, format!("git: {b}"));
+        }
+        if let Some((_, note)) = self.git_blame_caret_note() {
+            left.push_str(&format!("    {}", note.chars().take(80).collect::<String>()));
         }
         if self.show_frame_time {
             let dt = ui.input(|i| i.stable_dt);
@@ -3465,6 +3476,8 @@ impl ApexApp {
         self.syntax_tick(did);
         let fold_regions = self.fold_regions_for(did);
         let git_marks = self.git_marks_for(did);
+        let blame = self.git_blame_column(did, char_width);
+        let inline_note = if self.settings.git_blame_inline && focused { self.git_blame_caret_note() } else { None };
         let mut diagnostics = self.diagnostics_for(did);
         if self.spell_enabled_for(did) {
             let (first, count) = {
@@ -3493,6 +3506,8 @@ impl ApexApp {
             wrap,
             large_file: large,
             block_caret: self.vim_block_caret(),
+            blame: blame.as_deref(),
+            inline_note: inline_note.as_ref().map(|(l, s)| (*l, s.as_str())),
         };
         let muted = settings.muted_syntax || settings.low_distraction;
         let mut actions = Vec::new();

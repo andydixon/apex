@@ -94,6 +94,16 @@ command "Amend Last Commit"
 [ "$(git -C "$REPO" log -1 --format=%s)" = "Shout line 15" ] || fail "amend message"
 [ "$(git -C "$REPO" rev-list --count HEAD)" = $((before + 1)) ] || fail "amend created a commit"
 pass "amend"
+# G4: blame column, then click line 1's annotation to open its commit.
+xdotool mousemove 700 300 click 1; sleep 0.3
+key ctrl+k ctrl+g
+sleep 3
+shot g4-blame
+xdotool mousemove 300 62 click 1; sleep 1.5
+title=$(xdotool getwindowname "$WID")
+case "$title" in *commit*) pass "blame opens the commit ($title)";; *) fail "commit view not opened: $title";; esac
+shot g4-commit-view
+key ctrl+w
 echo new > "$REPO/new.txt"
 sleep 5
 xdotool mousemove 150 306; sleep 1

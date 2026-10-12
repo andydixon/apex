@@ -96,8 +96,12 @@ pub struct Settings {
     pub lsp_servers: std::collections::BTreeMap<String, Vec<String>>,
     pub large_file_mb: usize,
     pub git_gutter: bool,
+    /// Use the system's file dialogs; off = an in-app path prompt.
+    pub native_file_dialogs: bool,
     /// Source Control in the lower part of the sidebar.
     pub git_sidebar: bool,
+    /// Dim author/date/summary after the caret line.
+    pub git_blame_inline: bool,
     pub completion: bool,
     pub completion_delay_ms: u64,
 }
@@ -184,7 +188,9 @@ impl Default for Settings {
             lsp_servers: std::collections::BTreeMap::new(),
             large_file_mb: 64,
             git_gutter: true,
+            native_file_dialogs: true,
             git_sidebar: true,
+            git_blame_inline: false,
             completion: true,
             completion_delay_ms: 150,
         }

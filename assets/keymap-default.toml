@@ -466,6 +466,9 @@ command = "view.toggle_minimap"
 keys = "primary+k primary+w"
 command = "view.toggle_word_wrap"
 [[bindings]]
+keys = "primary+k primary+g"
+command = "git.toggle_blame"
+[[bindings]]
 keys = "f11"
 command = "view.fullscreen"
 [[bindings]]

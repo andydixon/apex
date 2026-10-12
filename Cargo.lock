@@ -365,6 +365,7 @@ dependencies = [
  "apex-project",
  "apex-syntax",
  "crossbeam-channel",
+ "directories",
  "eframe",
  "egui",
  "encoding_rs",
