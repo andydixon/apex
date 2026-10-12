@@ -1869,18 +1869,9 @@ impl ApexApp {
     pub(crate) fn execute_workspace(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) -> bool {
         match cmd {
             Command::OpenFolder | Command::AddFolder => {
-                let mut dialog = rfd::FileDialog::new().set_title(if cmd == Command::OpenFolder { "Open Folder" } else { "Add Folder to Workspace" });
-                if let Some(r) = self.roots.first() {
-                    dialog = dialog.set_directory(r);
-                }
-                if let Some(path) = dialog.pick_folder() {
-                    if cmd == Command::OpenFolder {
-                        self.open_folder(&path);
-                    } else {
-                        self.add_root(&path);
-                    }
-                    self.settings.sidebar = true;
-                }
+                let title = if cmd == Command::OpenFolder { "Open Folder" } else { "Add Folder to Workspace" };
+                let spec = crate::file_dialogs::FileDialogSpec::open_folder(title).directory(self.roots.first().cloned());
+                self.show_file_dialog(spec, crate::file_dialogs::FileDialogKind::OpenFolder { replace: cmd == Command::OpenFolder });
             }
             Command::RemoveFolder => {
                 let target =
@@ -1951,9 +1942,8 @@ impl ApexApp {
                 self.prompt("Save project file as", &default, PromptKind::SaveProject);
             }
             Command::OpenProject => {
-                if let Some(p) = rfd::FileDialog::new().set_title("Open Project").add_filter("Apex project", &["apex-project"]).pick_file() {
-                    self.open_project_file(&p);
-                }
+                let spec = crate::file_dialogs::FileDialogSpec::open_file("Open Project").filter("Apex project", &["apex-project", "toml"]);
+                self.show_file_dialog(spec, crate::file_dialogs::FileDialogKind::OpenProject);
             }
             Command::RecentProjects => self.open_list_palette(PaletteMode::RecentProjects),
             Command::OpenProjectSettings => {

@@ -202,6 +202,8 @@ pub struct ApexApp {
     pub(crate) spell: crate::spell_ui::SpellUi,
     pub(crate) vim: crate::vim::Vim,
     pub(crate) settings_panel: crate::settings_ui::SettingsPanel,
+    /// The native file dialog in progress, if any (see `file_dialogs.rs`).
+    pub(crate) file_dialog: Option<crate::file_dialogs::PendingFileDialog>,
     pub(crate) inbox: Option<crossbeam_channel::Receiver<OpenRequest>>,
     pub(crate) on_view_closed: Option<ViewClosedHook>,
     /// `APEX_FRAME_TIME=1`: show the frame interval in the status bar.
@@ -297,6 +299,7 @@ impl ApexApp {
             spell: Default::default(),
             vim: crate::vim::Vim::new(),
             settings_panel: Default::default(),
+            file_dialog: None,
             inbox: args.inbox.clone(),
             on_view_closed: args.on_view_closed.clone(),
             show_frame_time: std::env::var_os("APEX_FRAME_TIME").is_some(),
@@ -671,7 +674,11 @@ impl ApexApp {
         let Some(view) = self.views.get(&vid) else { return false };
         let did = view.doc;
         let Some(doc) = self.docs.get(&did) else { return false };
-        let Some(path) = doc.path.clone() else { return self.save_view_as(vid) };
+        let Some(path) = doc.path.clone() else {
+            // No path yet: the dialog answers asynchronously, so this save is not done yet.
+            self.save_view_as_then(vid, None);
+            return false;
+        };
         if doc.read_only && doc.language_override.as_deref() == Some("hex") {
             self.set_status("Binary previews are read-only".into(), true);
             return false;
@@ -714,23 +721,9 @@ impl ApexApp {
         }
     }
 
-    pub(crate) fn save_view_as(&mut self, vid: ViewId) -> bool {
-        let Some(view) = self.views.get(&vid) else { return false };
-        let did = view.doc;
-        let Some(doc) = self.docs.get(&did) else { return false };
-        let mut dialog = rfd::FileDialog::new().set_title("Save As");
-        if let Some(p) = &doc.path {
-            if let Some(parent) = p.parent() {
-                dialog = dialog.set_directory(parent);
-            }
-            if let Some(name) = p.file_name() {
-                dialog = dialog.set_file_name(name.to_string_lossy());
-            }
-        } else {
-            dialog = dialog.set_file_name(format!("{}.txt", doc.title().to_lowercase().replace(' ', "-")));
-        }
-        let Some(path) = dialog.save_file() else { return false };
-        self.save_view_to(vid, normalise_path(&path))
+    /// Save As through the native dialog; completes later in `poll_file_dialog`.
+    pub(crate) fn save_view_as(&mut self, vid: ViewId) {
+        self.save_view_as_then(vid, None);
     }
 
     /// Save the view's document under a new path.
@@ -949,15 +942,8 @@ impl ApexApp {
                 self.open_path(&normalise_path(&p));
             }
             Command::OpenFile => {
-                let mut dialog = rfd::FileDialog::new().set_title("Open File");
-                if let Some(dir) = self.current_dir() {
-                    dialog = dialog.set_directory(dir);
-                }
-                if let Some(paths) = dialog.pick_files() {
-                    for p in paths {
-                        self.open_path(&p);
-                    }
-                }
+                let spec = crate::file_dialogs::FileDialogSpec::open_files("Open File").directory(self.current_dir());
+                self.show_file_dialog(spec, crate::file_dialogs::FileDialogKind::OpenFiles);
             }
             Command::OpenRecent => {
                 if let Some(a) = arg {
@@ -3139,6 +3125,13 @@ impl ApexApp {
                 });
                 match choice {
                     Some(0) => {
+                        let untitled = self.views.get(&vid).and_then(|v| self.docs.get(&v.doc)).is_some_and(|d| d.path.is_none());
+                        if untitled {
+                            // Ask for a name; the close sequence resumes after the save.
+                            self.dialog = None;
+                            self.save_view_as_then(vid, Some(Dialog::ConfirmClose { views, then, index: index + 1 }));
+                            return;
+                        }
                         if self.save_view(vid, false) {
                             self.dialog = Some(Dialog::ConfirmClose { views, then, index: index + 1 });
                         } else if !matches!(self.dialog, Some(Dialog::SaveConflict { .. })) {
@@ -3727,6 +3720,7 @@ impl eframe::App for ApexApp {
             self.vim_input(&ctx);
         }
         self.poll_inbox(&ctx);
+        self.poll_file_dialog(&ctx);
         self.follow_system_theme(&ctx);
         if self.lsp_completion_key(&ctx) || self.snippet_key(&ctx) {
             ctx.request_repaint();

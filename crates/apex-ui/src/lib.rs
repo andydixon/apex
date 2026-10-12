@@ -3,6 +3,7 @@
 pub mod app;
 pub mod command;
 pub mod editor;
+pub mod file_dialogs;
 pub mod find_in_files;
 pub mod git_ui;
 pub mod keymap;

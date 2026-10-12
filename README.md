@@ -91,8 +91,10 @@ cargo build --release
 ./target/release/apex path/to/file.rs
 ```
 
-`make build`, `make test`, `make lint`, `make fmt`, `make check`,
-`make bench`, `make release` and `make package` wrap the cargo invocations.
+`make build`, `make test`, `make lint`, `make fmt`, `make check` and
+`make bench` wrap the cargo invocations; `make release` builds the release
+binary and then packages it for the current platform (`Apex.app` and a DMG
+on macOS, tarball and `.deb` on Linux) into `dist/`.
 Tests, lint and format checks must pass before a commit:
 
 ```sh

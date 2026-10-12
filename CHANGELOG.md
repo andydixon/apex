@@ -49,6 +49,11 @@ All notable changes to Apex are recorded here. The format follows
   targets, security review, user guide and developer documentation.
 
 ### Fixed
+- Open Folder / Open File / Save As no longer freeze the editor on macOS:
+  native dialogs are a sheet polled from the frame loop there, and run on a
+  worker thread on Linux and Windows, so the window stays responsive.
+- `make release` now also produces the platform package (`Apex.app` and DMG
+  on macOS, tarball and `.deb` on Linux) via `packaging/package.sh`.
 - Macro recording no longer shadows Quit on Ctrl+Q (now Ctrl+Alt+R).
 - Completion popup opens on language-server trigger characters and ignores
   stale responses; hover requests are no longer repeated every frame.

@@ -11,6 +11,7 @@ build:
 
 release:
 	$(CARGO) build --release --workspace
+	./packaging/package.sh
 
 run:
 	$(CARGO) run --bin apex -- $(ARGS)

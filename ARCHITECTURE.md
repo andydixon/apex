@@ -170,6 +170,7 @@ repaint when something arrives:
 | LSP server I/O | reader thread per server | message size limit; restart backoff |
 | File watcher | `notify` | coalesced into a rescan timer |
 | Second invocation / Apple Events | `open_requests` channel | polled every frame |
+| Native file dialogs | `file_dialogs.rs`: worker thread (Linux, Windows) or a sheet polled as a future (macOS) | one at a time; rfd's modal loop is never nested inside winit's dispatch |
 
 Results are tagged with the generation or revision they were computed for and
 discarded when stale, so a slow worker can never overwrite newer state.

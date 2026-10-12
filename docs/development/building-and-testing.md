@@ -13,7 +13,7 @@ README. No other system libraries: the GUI stack (egui, wgpu, winit), git
 | Make target | Cargo |
 |---|---|
 | `make build` | `cargo build` (dev profile: `opt-level = 1`, dependencies at 3) |
-| `make release` | `cargo build --release` (fat LTO, one codegen unit) |
+| `make release` | `cargo build --release` (fat LTO, one codegen unit), then `packaging/package.sh` → `dist/` (`Apex.app` + DMG on macOS, tarball + `.deb` on Linux) |
 | `make test` | `cargo test --workspace` |
 | `make lint` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | `make fmt` / `make check` | `cargo fmt --all` / `cargo fmt --all -- --check` |
