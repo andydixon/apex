@@ -103,7 +103,10 @@ fn main() -> std::process::ExitCode {
             .with_app_id(apex_project::paths::APP_ID)
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([480.0, 320.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            // Without an icon eframe installs egui's logo as the window and
+            // (on macOS) Dock icon at run time, replacing the bundle's.
+            .with_icon(app_icon()),
         centered: true,
         ..Default::default()
     };
@@ -120,6 +123,10 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(2)
         }
     }
+}
+
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icons/png/apex-512.png")).unwrap_or_default()
 }
 
 #[cfg(test)]

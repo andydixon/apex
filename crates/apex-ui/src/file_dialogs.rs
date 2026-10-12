@@ -1,17 +1,16 @@
 //! Native file dialogs without blocking the event loop.
 //!
-//! rfd's synchronous dialogs run a nested modal loop. On macOS that deadlocks
-//! inside winit's event dispatch (Open Folder froze the editor), so the
-//! asynchronous dialog is polled from the frame loop there. On Linux and
-//! Windows the synchronous dialog runs on its own thread, which also keeps the
-//! window responsive while the portal or shell dialog is open. One dialog at a
-//! time; its result is handled on the UI thread in `poll_file_dialog`.
+//! Every dialog runs on a worker thread and its result is handled on the UI
+//! thread in `poll_file_dialog`, so the window keeps repainting. Linux and
+//! Windows use rfd (portal / shell dialog). On macOS AppKit panels must be
+//! shown from the main thread, and both rfd paths (a nested `runModal`, or a
+//! sheet started from inside winit's event handler) hung the editor before
+//! the panel appeared; there the standard dialog is shown by `osascript` in
+//! its own process instead, so nothing in Apex's run loop can block on it.
+//! One dialog at a time.
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::mpsc::{Receiver, channel};
-use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use crate::app::{ApexApp, Dialog, normalise_path};
@@ -78,6 +77,7 @@ impl FileDialogSpec {
         self
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn sync_dialog(&self) -> rfd::FileDialog {
         let mut d = rfd::FileDialog::new().set_title(&self.title);
         if let Some(dir) = &self.directory {
@@ -92,21 +92,8 @@ impl FileDialogSpec {
         d
     }
 
-    fn async_dialog(&self) -> rfd::AsyncFileDialog {
-        let mut d = rfd::AsyncFileDialog::new().set_title(&self.title);
-        if let Some(dir) = &self.directory {
-            d = d.set_directory(dir);
-        }
-        if let Some(n) = &self.file_name {
-            d = d.set_file_name(n);
-        }
-        if let Some((name, exts)) = &self.filter {
-            d = d.add_filter(name, exts);
-        }
-        d
-    }
-
     /// Run the blocking dialog (on a worker thread). Empty = cancelled.
+    #[cfg(not(target_os = "macos"))]
     fn run_sync(&self) -> Vec<PathBuf> {
         let d = self.sync_dialog();
         match self.mode {
@@ -117,63 +104,97 @@ impl FileDialogSpec {
         }
     }
 
-    /// The non-blocking dialog as a future (polled from the frame loop).
-    fn run_async(&self) -> Pin<Box<dyn Future<Output = Vec<PathBuf>>>> {
-        let d = self.async_dialog();
-        match self.mode {
-            Mode::PickFiles => Box::pin(async move { d.pick_files().await.map(|v| v.iter().map(|h| h.path().to_path_buf()).collect()).unwrap_or_default() }),
-            Mode::PickFolder => Box::pin(async move { d.pick_folder().await.map(|h| vec![h.path().to_path_buf()]).unwrap_or_default() }),
-            Mode::PickFile => Box::pin(async move { d.pick_file().await.map(|h| vec![h.path().to_path_buf()]).unwrap_or_default() }),
-            Mode::SaveFile => Box::pin(async move { d.save_file().await.map(|h| vec![h.path().to_path_buf()]).unwrap_or_default() }),
+    /// macOS: the standard dialog via `osascript` (see the module comment).
+    /// Values travel as arguments, never inside the script text.
+    #[cfg(target_os = "macos")]
+    fn run_sync(&self) -> Vec<PathBuf> {
+        let dir = self.directory.as_ref().filter(|d| d.is_dir()).map(|d| d.display().to_string());
+        let output = std::process::Command::new("/usr/bin/osascript")
+            .args(apple_script(&self.mode, dir.is_some(), self.file_name.is_some()).iter().flat_map(|l| ["-e", l]))
+            .arg(&self.title)
+            .arg(dir.unwrap_or_default())
+            .arg(self.file_name.clone().unwrap_or_default())
+            .stdin(std::process::Stdio::null())
+            .output();
+        // ponytail: no type filter on macOS (`of type` needs UTIs); the
+        // caller validates what it opens.
+        match output {
+            // Cancel exits with status 1 ("User canceled. (-128)").
+            Ok(o) if o.status.success() => parse_osascript_paths(&String::from_utf8_lossy(&o.stdout)),
+            Ok(_) => Vec::new(),
+            Err(e) => {
+                tracing::error!("could not run osascript for the file dialog: {e}");
+                Vec::new()
+            }
         }
     }
 }
 
-enum Backend {
-    Thread(Receiver<Vec<PathBuf>>),
-    Future(Pin<Box<dyn Future<Output = Vec<PathBuf>>>>),
+/// AppleScript for one dialog. Arguments: 1 = prompt, 2 = folder, 3 = name.
+/// Prints one POSIX path per line.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn apple_script(mode: &Mode, with_dir: bool, with_name: bool) -> Vec<String> {
+    let loc = if with_dir { " default location (POSIX file (item 2 of argv))" } else { "" };
+    let choose = match mode {
+        Mode::PickFolder => format!("choose folder with prompt (item 1 of argv){loc}"),
+        Mode::PickFile => format!("choose file with prompt (item 1 of argv){loc}"),
+        Mode::PickFiles => format!("choose file with prompt (item 1 of argv){loc} with multiple selections allowed"),
+        Mode::SaveFile => {
+            let name = if with_name { " default name (item 3 of argv)" } else { "" };
+            format!("choose file name with prompt (item 1 of argv){name}{loc}")
+        }
+    };
+    [
+        "on run argv",
+        // Bring osascript's dialog in front of the editor.
+        "activate",
+        &format!("set picked to {choose}"),
+        "if class of picked is not list then set picked to {picked}",
+        "set out to \"\"",
+        "repeat with f in picked",
+        "set out to out & POSIX path of (contents of f) & linefeed",
+        "end repeat",
+        "return out",
+        "end run",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_osascript_paths(out: &str) -> Vec<PathBuf> {
+    out.lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        // Folders come back with a trailing slash.
+        .map(|l| PathBuf::from(if l.len() > 1 { l.trim_end_matches('/') } else { l }))
+        .collect()
 }
 
 pub struct PendingFileDialog {
     kind: FileDialogKind,
-    backend: Backend,
+    rx: Receiver<Vec<PathBuf>>,
 }
 
 impl PendingFileDialog {
     fn start(spec: FileDialogSpec, kind: FileDialogKind) -> Self {
-        // macOS: NSOpenPanel must live on the main thread, and runModal would nest
-        // the event loop, so use the completion-handler based async API there.
-        let use_future = cfg!(target_os = "macos");
-        let backend = if use_future {
-            Backend::Future(spec.run_async())
-        } else {
-            let (tx, rx) = channel();
-            std::thread::Builder::new()
-                .name("apex-file-dialog".into())
-                .spawn(move || {
-                    let _ = tx.send(spec.run_sync());
-                })
-                .ok();
-            Backend::Thread(rx)
-        };
-        Self { kind, backend }
+        let (tx, rx) = channel();
+        std::thread::Builder::new()
+            .name("apex-file-dialog".into())
+            .spawn(move || {
+                let _ = tx.send(spec.run_sync());
+            })
+            .ok();
+        Self { kind, rx }
     }
 
     /// Some(paths) once the user has answered; empty = cancelled.
     fn poll(&mut self) -> Option<Vec<PathBuf>> {
-        match &mut self.backend {
-            Backend::Thread(rx) => match rx.try_recv() {
-                Ok(v) => Some(v),
-                Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Vec::new()),
-            },
-            Backend::Future(fut) => {
-                let mut cx = Context::from_waker(Waker::noop());
-                match fut.as_mut().poll(&mut cx) {
-                    Poll::Ready(v) => Some(v),
-                    Poll::Pending => None,
-                }
-            }
+        match self.rx.try_recv() {
+            Ok(v) => Some(v),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Vec::new()),
         }
     }
 }
@@ -244,5 +265,21 @@ impl ApexApp {
             spec = spec.directory(self.current_dir()).file_name(format!("{}.txt", doc.title().to_lowercase().replace(' ', "-")));
         }
         self.show_file_dialog(spec, FileDialogKind::SaveAs { vid, then });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn osascript_output_and_script() {
+        assert_eq!(parse_osascript_paths("/Users/a/Code/\n"), vec![PathBuf::from("/Users/a/Code")]);
+        assert_eq!(parse_osascript_paths("/a b/x.rs\n/c.txt\n"), vec![PathBuf::from("/a b/x.rs"), PathBuf::from("/c.txt")]);
+        assert_eq!(parse_osascript_paths("/\n"), vec![PathBuf::from("/")]);
+        assert!(parse_osascript_paths("").is_empty());
+        let s = apple_script(&Mode::SaveFile, true, true).join("\n");
+        assert!(s.contains("choose file name with prompt (item 1 of argv) default name (item 3 of argv) default location (POSIX file (item 2 of argv))"));
+        assert!(apple_script(&Mode::PickFolder, false, false).join("\n").contains("set picked to choose folder with prompt (item 1 of argv)\n"));
     }
 }
