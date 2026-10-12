@@ -16,6 +16,8 @@ pub mod git_ui;
 pub mod history_ui;
 pub mod keymap;
 pub mod lsp_ui;
+#[cfg(target_os = "macos")]
+pub mod macos_dialogs;
 pub mod palette;
 pub mod settings;
 pub mod settings_ui;

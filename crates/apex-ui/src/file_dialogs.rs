@@ -1,13 +1,20 @@
-//! Native file dialogs without blocking the event loop.
+//! File dialogs that never block the event loop.
 //!
-//! Every dialog is started from a worker thread with rfd's blocking API and
-//! its result is handled on the UI thread in `poll_file_dialog`, so the
-//! window keeps repainting. On macOS rfd hands the panel to the main thread
-//! through the main dispatch queue, so it runs from the run loop *outside*
-//! winit's event handler: starting it inside the handler (a nested
-//! `runModal`, or a sheet) hung the editor before the panel appeared, and a
-//! panel shown by a separate `osascript` process stayed behind the window.
-//! Only the latest dialog's answer is used.
+//! Each platform gets the mechanism that is safe for it:
+//!
+//! * **Linux and Windows:** rfd's blocking API on a worker thread (the
+//!   portal / GTK and Win32 dialogs are happy off the UI thread). The answer
+//!   comes back through a channel.
+//! * **macOS:** AppKit's panels must be created from a plain main-thread
+//!   run-loop callout, neither from a GCD block (what rfd does for worker
+//!   threads, which deadlocks) nor from inside winit's drawing pass (where
+//!   egui's `update` runs). `macos_dialogs` queues the panel on the main run
+//!   loop and shows it as a sheet; see that module for the full story.
+//! * **Any platform, `native_file_dialogs` off:** an in-app path prompt with
+//!   Tab completion. This is also the fallback when a dialog cannot start.
+//!
+//! In every case the result is handled on the UI thread in
+//! `poll_file_dialog`, so the window keeps repainting while the dialog is up.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
@@ -33,7 +40,7 @@ pub(crate) enum FileDialogKind {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Mode {
+pub(crate) enum Mode {
     PickFiles,
     PickFolder,
     PickFile,
@@ -42,11 +49,12 @@ enum Mode {
 
 /// Dialog parameters, independent of the backend.
 pub struct FileDialogSpec {
-    title: String,
-    directory: Option<PathBuf>,
-    file_name: Option<String>,
-    filter: Option<(String, Vec<String>)>,
-    mode: Mode,
+    pub(crate) title: String,
+    pub(crate) directory: Option<PathBuf>,
+    pub(crate) file_name: Option<String>,
+    /// `(name, extensions)`; honoured by rfd, ignored by the macOS panel.
+    pub(crate) filter: Option<(String, Vec<String>)>,
+    pub(crate) mode: Mode,
 }
 
 impl FileDialogSpec {
@@ -78,6 +86,7 @@ impl FileDialogSpec {
         self
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn sync_dialog(&self) -> rfd::FileDialog {
         let mut d = rfd::FileDialog::new().set_title(&self.title);
         if let Some(dir) = &self.directory {
@@ -93,6 +102,7 @@ impl FileDialogSpec {
     }
 
     /// Run the blocking dialog (on a worker thread). Empty = cancelled.
+    #[cfg(not(target_os = "macos"))]
     fn run_sync(&self) -> Vec<PathBuf> {
         let d = self.sync_dialog();
         match self.mode {
@@ -112,13 +122,15 @@ pub struct PendingFileDialog {
 impl PendingFileDialog {
     fn start(spec: FileDialogSpec, kind: FileDialogKind, ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
+        #[cfg(target_os = "macos")]
+        crate::macos_dialogs::start(spec, tx, ctx);
+        #[cfg(not(target_os = "macos"))]
         std::thread::Builder::new()
             .name("apex-file-dialog".into())
             .spawn(move || {
                 let _ = tx.send(spec.run_sync());
                 // Wake the UI only when there is an answer: repainting while
-                // the panel is up made no difference to it, and on macOS a
-                // covered window's redraw can block the main thread.
+                // the dialog is up makes no difference to it.
                 ctx.request_repaint();
             })
             .ok();
@@ -144,8 +156,13 @@ impl ApexApp {
             return;
         }
         let Some(ctx) = self.egui_ctx.clone() else { return };
-        // A dialog that never answered must not block the next one: the
-        // new request replaces it and a late answer is ignored.
+        // On macOS the sheet blocks the window, so a second request while one
+        // is up can only come from a modeless panel; keep the first, it will
+        // answer. Elsewhere a dialog that never answered must not block the
+        // next one: the new request replaces it and a late answer is ignored.
+        if cfg!(target_os = "macos") && self.file_dialog.is_some() {
+            return;
+        }
         self.file_dialog = Some(PendingFileDialog::start(spec, kind, ctx));
     }
 

@@ -35,7 +35,13 @@ All notable changes to Apex are recorded here. The format follows
   removal and a Claude/Codex filter; applies with `git filter-branch` after
   a backup tag, optionally force-pushing with lease.
 - Open Folder by Path… and the `native_file_dialogs` setting: an in-app path
-  prompt with Tab completion (the default on macOS for now).
+  prompt with Tab completion as an alternative to the system dialogs.
+
+### Fixed
+- macOS: Open, Open Folder and Save As no longer hang the editor. The
+  system panel is now shown as a sheet from the main run loop instead of
+  through rfd, whose main-queue dispatch deadlocked against AppKit's panel
+  service.
 
 ## [0.0.1] - 2026-10-12
 

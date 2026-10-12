@@ -364,6 +364,7 @@ dependencies = [
  "apex-edit",
  "apex-project",
  "apex-syntax",
+ "block2 0.6.2",
  "crossbeam-channel",
  "directories",
  "eframe",
@@ -373,6 +374,10 @@ dependencies = [
  "git2",
  "libc",
  "nucleo-matcher",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
  "regex",
  "rfd",
  "serde",
@@ -2644,6 +2649,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags 2.13.2",
+ "block2 0.6.2",
  "dispatch2",
  "objc2 0.6.5",
 ]

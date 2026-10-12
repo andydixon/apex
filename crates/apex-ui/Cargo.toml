@@ -10,7 +10,6 @@ license.workspace = true
 git2.workspace = true
 fastrand = "2"
 directories.workspace = true
-rfd.workspace = true
 apex-buffer.workspace = true
 apex-edit.workspace = true
 apex-project.workspace = true
@@ -30,6 +29,19 @@ eframe.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Linux and Windows dialogs come from rfd; macOS uses AppKit directly in
+# macos_dialogs.rs (see there for why), so rfd is not built on macOS.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+rfd.workspace = true
+
+# Only the AppKit features macos_dialogs.rs touches.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSObject", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSApplication", "NSOpenPanel", "NSPanel", "NSResponder", "NSSavePanel", "NSWindow"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "CFRunLoop"] }
 
 [dev-dependencies]
 tempfile = "3"

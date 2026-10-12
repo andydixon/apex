@@ -174,7 +174,7 @@ repaint when something arrives:
 | LSP server I/O | reader thread per server | message size limit; restart backoff |
 | File watcher | `notify` | coalesced into a rescan timer |
 | Second invocation / Apple Events | `open_requests` channel | polled every frame |
-| Native file dialogs | `file_dialogs.rs`: rfd's blocking dialog started from a worker thread (on macOS rfd runs the panel from the main dispatch queue) | latest request wins; no AppKit panel is ever started from inside winit's event handler |
+| Native file dialogs | `file_dialogs.rs`: rfd's blocking dialog on a worker thread (Linux, Windows); on macOS `macos_dialogs.rs` queues an AppKit panel on the main run loop with `CFRunLoopPerformBlock` and shows it as a sheet (rfd's `dispatch_sync` path deadlocks: the panel service's reply cannot reach a nested run loop inside a main-queue block) | latest request wins (Linux, Windows); one sheet at a time (macOS); the window keeps repainting |
 
 The side-by-side diff is not a separate widget: a diff tab's own view shows
 the base text and a second view (in no tab) shows the other side, usually

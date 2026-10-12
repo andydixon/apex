@@ -189,11 +189,8 @@ Last full run (`cargo test --workspace`, 12 October 2026, after the Git work):
 
 ## Next step
 
-1. macOS: find why AppKit's open/save panel service never attaches to Apex
-   (the sample shows `-[NSSavePanel _initBridgeAndStuff]` waiting); try an
-   unbundled `cargo run`, check `codesign --verify`, and read the
-   `com.apple.ViewBridge` log during the hang. Then make the native dialog
-   the macOS default again.
-2. Check Finder "Open With" and the Dock icon on macOS.
-3. Try the GitHub features against a real repository after `gh auth login`.
-4. Tag the next release following `docs/development/release-process.md`.
+1. macOS: confirm the native dialogs now open (`macos_dialogs.rs`, written
+   from the `sample` trace of the hang but not yet run on a Mac), and check
+   Finder "Open With" and the Dock icon.
+2. Try the GitHub features against a real repository after `gh auth login`.
+3. Tag the next release following `docs/development/release-process.md`.

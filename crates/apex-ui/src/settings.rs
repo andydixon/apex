@@ -194,7 +194,7 @@ impl Default for Settings {
             git_gutter: true,
             // ponytail: the system panel hangs Apex on macOS for reasons not yet
             // found; the in-app prompt is the default there until it is fixed.
-            native_file_dialogs: !cfg!(target_os = "macos"),
+            native_file_dialogs: true,
             git_sidebar: true,
             git_blame_inline: false,
             git_pull_mode: "ff-only".into(),
