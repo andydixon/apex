@@ -6,8 +6,8 @@ workflow: instant start-up, excellent multi-cursor editing, powerful search
 and navigation, configurable themes and key bindings, and careful handling
 of your files. It runs on Linux (X11 and Wayland), Windows 10/11 and macOS.
 
-Apex is deliberately a text editor, not an IDE: there is no plugin system,
-no scripting runtime, no telemetry, no account and no network dependency.
+Apex is deliberately a text editor, not an IDE: there is no plugin system (yet),
+no scripting runtime (yet), no telemetry, no account and no network dependency.
 Everything works offline.
 
 ![The editor with a Rust project open](docs/screenshots/editor.png)

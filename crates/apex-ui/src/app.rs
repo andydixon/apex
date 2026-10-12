@@ -3311,7 +3311,7 @@ impl ApexApp {
                     ui.heading(format!("{} {}", apex_project::paths::APP_NAME, env!("CARGO_PKG_VERSION")));
                     ui.label("A native, high-performance text editor.");
                     ui.add_space(4.0);
-                    ui.label("Licensed under the GNU Affero General Public License v3.0 or later.");
+                    ui.label("Developed by Andy Dixon - www.dixon.cx");
                     ui.label(format!("Configuration: {}", self.config_dir.display()));
                     ui.add_space(8.0);
                     ui.button("Close").clicked()
