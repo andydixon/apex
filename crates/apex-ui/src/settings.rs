@@ -96,6 +96,8 @@ pub struct Settings {
     pub lsp_servers: std::collections::BTreeMap<String, Vec<String>>,
     pub large_file_mb: usize,
     pub git_gutter: bool,
+    /// Source Control in the lower part of the sidebar.
+    pub git_sidebar: bool,
     pub completion: bool,
     pub completion_delay_ms: u64,
 }
@@ -182,6 +184,7 @@ impl Default for Settings {
             lsp_servers: std::collections::BTreeMap::new(),
             large_file_mb: 64,
             git_gutter: true,
+            git_sidebar: true,
             completion: true,
             completion_delay_ms: 150,
         }

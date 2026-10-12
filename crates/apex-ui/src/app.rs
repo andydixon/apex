@@ -915,6 +915,7 @@ impl ApexApp {
         }
         if self.git_command(ctx, cmd)
             || self.git_ops_command(cmd, arg.clone())
+            || self.git_commit_command(ctx, cmd, arg.clone())
             || self.tasks_command(ctx, cmd, arg.clone())
             || self.lsp_command(ctx, cmd, arg.clone())
             || self.spell_command(cmd)
@@ -2580,7 +2581,11 @@ impl ApexApp {
                 }
             });
             ui.menu_button("Git", |ui| {
-                for c in [Command::GitStatusPanel, Command::GitShowOutput] {
+                for c in [Command::GitToggleSourceControl, Command::GitStatusPanel, Command::GitShowOutput] {
+                    item(ui, &mut q, c);
+                }
+                ui.separator();
+                for c in [Command::GitCommit, Command::GitCommitAmend, Command::GitUndoCommit] {
                     item(ui, &mut q, c);
                 }
                 ui.separator();
@@ -2592,6 +2597,8 @@ impl ApexApp {
                     Command::GitStageAll,
                     Command::GitUnstageAll,
                     Command::GitDiscardFile,
+                    Command::GitOpenChanges,
+                    Command::GitOpenStagedChanges,
                 ] {
                     item(ui, &mut q, c);
                 }

@@ -130,7 +130,14 @@ const ENTRIES: &[Entry] = &[
     Entry { key: "menu_bar", category: "Display", label: "Menu bar", help: "Alt shows it temporarily when hidden.", kind: Kind::Bool },
     Entry { key: "tabs", category: "Display", label: "Tab bar", help: "", kind: Kind::Bool },
     Entry { key: "breadcrumbs", category: "Display", label: "Breadcrumbs", help: "", kind: Kind::Bool },
-    Entry { key: "git_gutter", category: "Display", label: "Git gutter marks", help: "", kind: Kind::Bool },
+    Entry { key: "git_gutter", category: "Git", label: "Git gutter marks", help: "", kind: Kind::Bool },
+    Entry {
+        key: "git_sidebar",
+        category: "Git",
+        label: "Source Control in the sidebar",
+        help: "Changed files and the commit box below the folders.",
+        kind: Kind::Bool,
+    },
     Entry { key: "trim_trailing_whitespace_on_save", category: "Files", label: "Trim trailing whitespace on save", help: "", kind: Kind::Bool },
     Entry { key: "ensure_final_newline_on_save", category: "Files", label: "Ensure final newline on save", help: "", kind: Kind::Bool },
     Entry {
@@ -606,6 +613,7 @@ fn bool_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut bool> {
         "tabs" => &mut s.tabs,
         "breadcrumbs" => &mut s.breadcrumbs,
         "git_gutter" => &mut s.git_gutter,
+        "git_sidebar" => &mut s.git_sidebar,
         "trim_trailing_whitespace_on_save" => &mut s.trim_trailing_whitespace_on_save,
         "ensure_final_newline_on_save" => &mut s.ensure_final_newline_on_save,
         "format_on_save" => &mut s.format_on_save,

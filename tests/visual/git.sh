@@ -76,5 +76,23 @@ pass "stage selected lines"
 
 command "Show Git Output"
 shot g1-git-output
+
+# G2: commit the staged line from the Source Control panel's message box.
+before=$(git -C "$REPO" rev-list --count HEAD)
+command "Commit"            # empty message: focuses the commit box
+type_text "Shout line fifteen"
+key ctrl+Return
+sleep 2
+[ "$(git -C "$REPO" log -1 --format=%s)" = "Shout line fifteen" ] || fail "commit message"
+[ "$(git -C "$REPO" rev-list --count HEAD)" = $((before + 1)) ] || fail "commit count"
+git -C "$REPO" diff | grep -q '^+LINE TWO' || fail "unstaged change was committed"
+pass "commit from the panel"
+shot g2-after-commit
+command "Commit"
+type_text "Shout line 15"
+command "Amend Last Commit"
+[ "$(git -C "$REPO" log -1 --format=%s)" = "Shout line 15" ] || fail "amend message"
+[ "$(git -C "$REPO" rev-list --count HEAD)" = $((before + 1)) ] || fail "amend created a commit"
+pass "amend"
 grep -q "fatal\|panicked" "$OUT/app.log" && fail "errors in app log"
 echo "all git checks passed"

@@ -339,6 +339,12 @@ commands! {
     GitUnstageAll => "git.unstage_all", "Unstage All Changes", Git;
     GitDiscardFile => "git.discard_file", "Discard File Changes…", Git;
     GitShowOutput => "git.output", "Show Git Output", Git;
+    GitToggleSourceControl => "git.toggle_panel", "Toggle Source Control Panel", Git;
+    GitCommit => "git.commit", "Commit", Git;
+    GitCommitAmend => "git.commit_amend", "Amend Last Commit", Git;
+    GitUndoCommit => "git.undo_commit", "Undo Last Commit…", Git;
+    GitOpenChanges => "git.open_changes", "Open Changes", Git;
+    GitOpenStagedChanges => "git.open_staged_changes", "Open Staged Changes", Git;
     GitCancel => "git.cancel", "Cancel Git Command", Git;
 
     // Tools

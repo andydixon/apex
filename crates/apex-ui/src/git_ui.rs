@@ -39,6 +39,8 @@ pub struct GitUi {
     pub last_hunk_message: Option<String>,
     /// Command-line jobs (`git_ops.rs`).
     pub(crate) ops: crate::git_ops::GitOps,
+    /// Source Control panel state (`git_panel.rs`).
+    pub(crate) sc: crate::git_panel::SourceControl,
 }
 
 impl GitUi {

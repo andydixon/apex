@@ -239,6 +239,13 @@ pub fn file_at(workdir: &Path, path: &Path, head: bool) -> Result<Option<String>
     Ok(Some(String::from_utf8_lossy(blob.content()).into_owned()))
 }
 
+/// Full message of the HEAD commit, if there is one.
+pub fn head_message(workdir: &Path) -> Option<String> {
+    let repo = git2::Repository::open(workdir).ok()?;
+    let c = repo.head().ok()?.peel_to_commit().ok()?;
+    c.message().map(str::to_string)
+}
+
 /// A changed region of the working text relative to the base text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hunk {

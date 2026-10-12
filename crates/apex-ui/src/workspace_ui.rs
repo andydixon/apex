@@ -235,6 +235,16 @@ impl ApexApp {
         {
             self.sidebar.reveal(p);
         }
+        if self.git_panel_visible() {
+            let half = (ui.available_height() * 0.5).max(160.0);
+            egui::Panel::bottom("apex-source-control")
+                .resizable(true)
+                .default_size(half)
+                .min_size(120.0)
+                .max_size((ui.available_height() - 80.0).max(120.0))
+                .frame(egui::Frame::new().fill(theme.ui.sidebar))
+                .show(ui, |ui| self.show_source_control(ui));
+        }
         let actions = self.sidebar.ui(ui, &theme, ui_font, active_file.as_deref());
         for a in actions {
             self.handle_sidebar_action(ui.ctx(), a);
