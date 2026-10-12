@@ -100,6 +100,14 @@ pub(crate) enum Dialog {
         kind: crate::workspace_ui::PromptKind,
     },
     Recovery(Vec<apex_project::session::RecoveryEntry>),
+    /// Confirm a destructive command, then run `then` again (it checks
+    /// `git.ops.confirmed`).
+    Confirm {
+        title: String,
+        body: String,
+        button: String,
+        then: (Command, Option<String>),
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -906,6 +914,7 @@ impl ApexApp {
             self.record_step(crate::workspace_ui::MacroStep::Command(cmd, arg.clone()));
         }
         if self.git_command(ctx, cmd)
+            || self.git_ops_command(cmd, arg.clone())
             || self.tasks_command(ctx, cmd, arg.clone())
             || self.lsp_command(ctx, cmd, arg.clone())
             || self.spell_command(cmd)
@@ -2570,6 +2579,33 @@ impl ApexApp {
                     item(ui, &mut q, c);
                 }
             });
+            ui.menu_button("Git", |ui| {
+                for c in [Command::GitStatusPanel, Command::GitShowOutput] {
+                    item(ui, &mut q, c);
+                }
+                ui.separator();
+                for c in [
+                    Command::GitStageFile,
+                    Command::GitUnstageFile,
+                    Command::GitStageHunk,
+                    Command::GitStageLines,
+                    Command::GitStageAll,
+                    Command::GitUnstageAll,
+                    Command::GitDiscardFile,
+                ] {
+                    item(ui, &mut q, c);
+                }
+                ui.separator();
+                for c in [Command::NextChange, Command::PrevChange, Command::ShowHunkDiff, Command::RevertHunk] {
+                    item(ui, &mut q, c);
+                }
+                ui.separator();
+                for c in [Command::CompareWithSaved, Command::CompareWithIndex, Command::CompareWithHead, Command::FileHistory] {
+                    item(ui, &mut q, c);
+                }
+                ui.separator();
+                item(ui, &mut q, Command::GitCancel);
+            });
             ui.menu_button("Tools", |ui| {
                 for c in [
                     Command::CommandPalette,
@@ -2854,6 +2890,9 @@ impl ApexApp {
         if self.tasks.running.is_some() {
             left.push_str("    Running task…");
         }
+        if let Some(g) = self.git_ops_status() {
+            left.push_str(&format!("    {g}"));
+        }
         if self.macro_recording.is_some() {
             left.push_str("    ● REC");
         }
@@ -3077,6 +3116,7 @@ impl ApexApp {
                 | Dialog::ConfirmRevertHunk { .. }
                 | Dialog::Trust { .. }
                 | Dialog::ConfirmWorkspaceEdit { .. }
+                | Dialog::Confirm { .. }
         ) {
             self.show_workspace_dialog(ctx, dialog);
             return;
@@ -3280,7 +3320,8 @@ impl ApexApp {
             | Dialog::Info { .. }
             | Dialog::ConfirmRevertHunk { .. }
             | Dialog::Trust { .. }
-            | Dialog::ConfirmWorkspaceEdit { .. } => {}
+            | Dialog::ConfirmWorkspaceEdit { .. }
+            | Dialog::Confirm { .. } => {}
             Dialog::Issues(issues) => {
                 let r = egui::Modal::new(egui::Id::new("issues")).show(ctx, |ui| {
                     ui.set_width(520.0);
@@ -3310,6 +3351,7 @@ impl ApexApp {
         let spelling = self.views.get(&vid).map(|v| (v.doc, v.sels.primary().head)).and_then(|(d, head)| self.spell_suggestions_at(d, head));
         let mut spell_action: Option<(usize, usize, String, Option<String>)> = None;
         let muted = self.theme.ui.text_muted;
+        let in_repo = self.views.get(&vid).map(|v| v.doc).and_then(|d| self.git_workdir_for_doc(d)).is_some();
         let shortcuts: Vec<(Command, String)> = [
             Command::Cut,
             Command::Copy,
@@ -3320,8 +3362,12 @@ impl ApexApp {
             Command::DeleteLine,
             Command::ToggleBookmark,
             Command::CopyFilePath,
+            Command::GitStageHunk,
+            Command::GitStageLines,
+            Command::RevertHunk,
         ]
         .into_iter()
+        .filter(|c| in_repo || c.category() != crate::command::Category::Git)
         .map(|c| (c, self.keymap.shortcut_for(c).unwrap_or_default()))
         .collect();
         let popup = egui::Popup::new(id, ctx.clone(), egui::PopupAnchor::Position(pos), egui::LayerId::new(egui::Order::Foreground, id))

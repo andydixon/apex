@@ -1,9 +1,8 @@
 //! Lightweight Git awareness: repository discovery, branch, status, and line
 //! diffs against the index or HEAD for gutter markers and hunk navigation.
 //!
-//! Every operation here is read-only except [`revert_hunk_text`], which only
-//! computes replacement text; the editor applies it as an undoable edit. No
-//! staging, committing or history rewriting ever happens.
+//! Every operation here is read-only; anything that writes to a repository
+//! runs the user's `git` through [`crate::git_cli`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,6 +33,35 @@ pub struct RepoStatus {
     pub files: HashMap<PathBuf, FileStatus>,
     /// Directories containing changes (for sidebar tinting).
     pub dirs: HashMap<PathBuf, FileStatus>,
+    /// Per-file index and working-tree state, sorted by path.
+    pub entries: Vec<StatusEntry>,
+    /// Upstream branch (`origin/main`) and commits ahead/behind it.
+    pub upstream: Option<String>,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+/// One changed path: what is staged and what is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub path: PathBuf,
+    /// Index vs HEAD: Added, Modified, Deleted or Renamed.
+    pub staged: Option<FileStatus>,
+    /// Working tree vs index: Modified, Deleted, Renamed or Untracked.
+    pub unstaged: Option<FileStatus>,
+    pub conflict: bool,
+}
+
+fn upstream_info(repo: &git2::Repository) -> Option<(String, usize, usize)> {
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+    let local = git2::Branch::wrap(head);
+    let up = local.upstream().ok()?;
+    let name = up.name().ok()??.to_string();
+    let (a, b) = repo.graph_ahead_behind(local.get().target()?, up.get().target()?).ok()?;
+    Some((name, a, b))
 }
 
 /// Find the repository containing `path`, if any. Never follows into a
@@ -83,9 +111,35 @@ pub fn status(workdir: &Path, include_ignored: bool) -> Result<RepoStatus, git2:
     let root = repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| workdir.to_path_buf());
     let mut files = HashMap::new();
     let mut dirs: HashMap<PathBuf, FileStatus> = HashMap::new();
+    let mut entries = Vec::new();
     for e in statuses.iter() {
         let Some(rel) = e.path() else { continue };
         let s = e.status();
+        if !s.is_ignored() {
+            let staged = if s.is_index_new() {
+                Some(FileStatus::Added)
+            } else if s.is_index_deleted() {
+                Some(FileStatus::Deleted)
+            } else if s.is_index_renamed() {
+                Some(FileStatus::Renamed)
+            } else if s.is_index_modified() || s.is_index_typechange() {
+                Some(FileStatus::Modified)
+            } else {
+                None
+            };
+            let unstaged = if s.is_wt_new() {
+                Some(FileStatus::Untracked)
+            } else if s.is_wt_deleted() {
+                Some(FileStatus::Deleted)
+            } else if s.is_wt_renamed() {
+                Some(FileStatus::Renamed)
+            } else if s.is_wt_modified() || s.is_wt_typechange() {
+                Some(FileStatus::Modified)
+            } else {
+                None
+            };
+            entries.push(StatusEntry { path: root.join(rel), staged, unstaged, conflict: s.is_conflicted() });
+        }
         let kind = if s.is_conflicted() {
             FileStatus::Conflict
         } else if s.is_wt_new() {
@@ -121,7 +175,12 @@ pub fn status(workdir: &Path, include_ignored: bool) -> Result<RepoStatus, git2:
         }
         files.insert(path, kind);
     }
-    Ok(RepoStatus { workdir: root, branch, detached, unborn, files, dirs })
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let (upstream, ahead, behind) = match upstream_info(&repo) {
+        Some((u, a, b)) => (Some(u), a, b),
+        None => (None, 0, 0),
+    };
+    Ok(RepoStatus { workdir: root, branch, detached, unborn, files, dirs, entries, upstream, ahead, behind })
 }
 
 pub struct StatusScan {
@@ -287,6 +346,14 @@ mod tests {
         }
         std::fs::write(root.join("tracked.txt"), "one\ntwo\n").unwrap();
         let st = status(root, false).unwrap();
+        assert_eq!(
+            st.entries,
+            vec![
+                StatusEntry { path: root.join("new.txt"), staged: None, unstaged: Some(FileStatus::Untracked), conflict: false },
+                StatusEntry { path: root.join("tracked.txt"), staged: None, unstaged: Some(FileStatus::Modified), conflict: false },
+            ]
+        );
+        assert_eq!(st.upstream, None);
         assert!(!st.unborn);
         assert_eq!(st.files.get(&root.join("tracked.txt")), Some(&FileStatus::Modified));
         assert_eq!(st.files.get(&root.join("new.txt")), Some(&FileStatus::Untracked));

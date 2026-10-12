@@ -404,7 +404,7 @@ pub fn run(def: &TaskDef, root: &Path) -> Result<RunningTask, String> {
     Ok(RunningTask { name: def.name.clone(), rx, cancel, started })
 }
 
-fn kill_tree(child: &mut std::process::Child) {
+pub(crate) fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         // SAFETY: killpg only signals; the pgid is the child's pid because of process_group(0).

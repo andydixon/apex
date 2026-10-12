@@ -13,8 +13,8 @@ use crate::command::Command;
 use crate::palette::{PaletteItem, PaletteMode, Payload};
 use crate::sidebar::GitMark;
 
-struct RepoEntry {
-    status: RepoStatus,
+pub(crate) struct RepoEntry {
+    pub(crate) status: RepoStatus,
     scan: Option<StatusScan>,
     refreshed: Instant,
     dirty: bool,
@@ -29,7 +29,7 @@ struct BaseText {
 
 #[derive(Default)]
 pub struct GitUi {
-    repos: HashMap<PathBuf, RepoEntry>,
+    pub(crate) repos: HashMap<PathBuf, RepoEntry>,
     root_workdir: HashMap<PathBuf, Option<PathBuf>>,
     doc_workdir: HashMap<DocId, Option<PathBuf>>,
     base: HashMap<DocId, BaseText>,
@@ -37,6 +37,8 @@ pub struct GitUi {
     /// Compare the buffer with HEAD instead of the index.
     pub compare_head: bool,
     pub last_hunk_message: Option<String>,
+    /// Command-line jobs (`git_ops.rs`).
+    pub(crate) ops: crate::git_ops::GitOps,
 }
 
 impl GitUi {
@@ -243,7 +245,7 @@ impl ApexApp {
         out
     }
 
-    fn git_hunk_at_caret(&mut self, v: crate::view::ViewId, d: DocId) -> Option<Hunk> {
+    pub(crate) fn git_hunk_at_caret(&mut self, v: crate::view::ViewId, d: DocId) -> Option<Hunk> {
         let line = self.views[&v].primary_line(&self.docs[&d]);
         self.git_hunks(d).into_iter().find(|h| {
             (h.new_lines.start..h.new_lines.end.max(h.new_lines.start + 1)).contains(&line) || (h.kind == HunkKind::Deleted && h.new_lines.start == line)

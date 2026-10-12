@@ -18,6 +18,7 @@ pub enum PanelTab {
     Find,
     Output,
     Problems,
+    Git,
 }
 
 #[derive(Default)]

@@ -197,6 +197,9 @@ impl ApexApp {
         if self.git_poll() {
             repaint = true;
         }
+        if self.git_ops_poll() {
+            repaint = true;
+        }
         if self.git.has_repos() && self.last_git_tick.elapsed() >= Duration::from_secs(4) {
             self.last_git_tick = Instant::now();
             self.git_mark_dirty_status_only();
@@ -959,7 +962,7 @@ impl ApexApp {
         let roots = self.roots.clone();
         let ui_font = self.settings.ui_font_size;
         ui.horizontal(|ui| {
-            for (tab, label) in [(PanelTab::Find, "FIND IN FILES"), (PanelTab::Output, "OUTPUT"), (PanelTab::Problems, "PROBLEMS")] {
+            for (tab, label) in [(PanelTab::Find, "FIND IN FILES"), (PanelTab::Output, "OUTPUT"), (PanelTab::Problems, "PROBLEMS"), (PanelTab::Git, "GIT")] {
                 let selected = self.panel_tab == tab;
                 let text = egui::RichText::new(label).size(ui_font - 2.0).color(if selected { theme.ui.text } else { theme.ui.text_muted }).strong();
                 if ui.selectable_label(selected, text).clicked() {
@@ -980,6 +983,10 @@ impl ApexApp {
             }
             PanelTab::Problems => {
                 self.show_problems_panel(ui);
+                return;
+            }
+            PanelTab::Git => {
+                self.show_git_output_panel(ui);
                 return;
             }
             PanelTab::Find => {}
@@ -1709,12 +1716,44 @@ impl ApexApp {
                     }
                 }
             }
+            Dialog::Confirm { title, body, button, then } => {
+                let r = egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
+                    ui.set_width(440.0);
+                    ui.heading(&title);
+                    ui.label(&body);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(&button).clicked() {
+                            1
+                        } else if ui.button("Cancel").clicked() {
+                            2
+                        } else {
+                            0
+                        }
+                    })
+                    .inner
+                });
+                match r.inner {
+                    1 => {
+                        self.dialog = None;
+                        self.git.ops.confirmed = true;
+                        self.execute(ctx, then.0, then.1);
+                        self.git.ops.confirmed = false;
+                    }
+                    2 => self.dialog = None,
+                    _ => {
+                        if r.should_close() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            self.dialog = None;
+                        }
+                    }
+                }
+            }
             Dialog::Trust { root, then } => {
                 let r = egui::Modal::new(egui::Id::new("trust")).show(ctx, |ui| {
                     ui.set_width(480.0);
                     ui.heading("Trust this workspace?");
                     ui.label(format!("{}", root.display()));
-                    ui.label("Trusting allows build tasks and language servers defined in this folder's project configuration to be started. Programs run with your user's permissions. Editing files never requires trust.");
+                    ui.label("Trusting allows build tasks and language servers defined in this folder's project configuration to be started, and Git commands (which run the repository's hooks) to be run. Programs run with your user's permissions. Editing files never requires trust.");
                     ui.add_space(8.0);
                     ui.horizontal(|ui| if ui.button("Trust").clicked() { 1 } else if ui.button("Not now").clicked() { 2 } else { 0 }).inner
                 });

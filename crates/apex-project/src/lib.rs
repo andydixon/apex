@@ -2,6 +2,7 @@
 
 pub mod fileio;
 pub mod git;
+pub mod git_cli;
 pub mod index;
 pub mod lsp;
 pub mod paths;

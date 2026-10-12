@@ -43,6 +43,7 @@ pub enum Category {
     Goto,
     Tools,
     Project,
+    Git,
     Window,
     Help,
 }
@@ -58,6 +59,7 @@ impl Category {
             Self::Goto => "Goto",
             Self::Tools => "Tools",
             Self::Project => "Project",
+            Self::Git => "Git",
             Self::Window => "Window",
             Self::Help => "Help",
         }
@@ -322,13 +324,22 @@ commands! {
     PrevDiagnostic => "goto.prev_diagnostic", "Previous Problem", Goto;
     NextChange => "git.next_hunk", "Next Change", Goto;
     PrevChange => "git.prev_hunk", "Previous Change", Goto;
-    RevertHunk => "git.revert_hunk", "Revert Change…", Tools;
-    ShowHunkDiff => "git.show_hunk", "Show Inline Diff", Tools;
-    CompareWithSaved => "git.compare_saved", "Compare with Saved", Tools;
-    CompareWithHead => "git.compare_head", "Compare with HEAD", Tools;
-    CompareWithIndex => "git.compare_index", "Compare with Index", Tools;
-    FileHistory => "git.file_history", "File History", Tools;
-    GitStatusPanel => "git.status", "Git Status", Tools;
+    RevertHunk => "git.revert_hunk", "Revert Change…", Git;
+    ShowHunkDiff => "git.show_hunk", "Show Inline Diff", Git;
+    CompareWithSaved => "git.compare_saved", "Compare with Saved", Git;
+    CompareWithHead => "git.compare_head", "Compare with HEAD", Git;
+    CompareWithIndex => "git.compare_index", "Compare with Index", Git;
+    FileHistory => "git.file_history", "File History", Git;
+    GitStatusPanel => "git.status", "Git Status", Git;
+    GitStageFile => "git.stage_file", "Stage File", Git;
+    GitUnstageFile => "git.unstage_file", "Unstage File", Git;
+    GitStageHunk => "git.stage_hunk", "Stage Change at Caret", Git;
+    GitStageLines => "git.stage_lines", "Stage Selected Lines", Git;
+    GitStageAll => "git.stage_all", "Stage All Changes", Git;
+    GitUnstageAll => "git.unstage_all", "Unstage All Changes", Git;
+    GitDiscardFile => "git.discard_file", "Discard File Changes…", Git;
+    GitShowOutput => "git.output", "Show Git Output", Git;
+    GitCancel => "git.cancel", "Cancel Git Command", Git;
 
     // Tools
     Settings => "tools.settings", "Settings…", Tools;

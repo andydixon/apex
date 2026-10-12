@@ -5,6 +5,7 @@ pub mod command;
 pub mod editor;
 pub mod file_dialogs;
 pub mod find_in_files;
+pub mod git_ops;
 pub mod git_ui;
 pub mod keymap;
 pub mod lsp_ui;
