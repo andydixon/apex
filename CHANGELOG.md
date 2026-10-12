@@ -5,6 +5,8 @@ All notable changes to Apex are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.0.1] - 2026-10-12
+
 ### Added
 - Rope-based document engine with transactional, coalescing undo/redo.
 - Unicode-correct caret motion (grapheme clusters, wide characters, tabs).

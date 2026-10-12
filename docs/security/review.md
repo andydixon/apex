@@ -1,6 +1,6 @@
 # Security review
 
-Scope: Apex 0.1 as built from this repository. This is a review of the
+Scope: Apex 0.0.1 as built from this repository. This is a review of the
 trust boundaries in the code, what each one relies on, and what is known to
 be missing. It complements `SECURITY.md` (reporting, threat model) and
 `docs/security/file-handling.md` (data integrity).

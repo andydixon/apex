@@ -153,5 +153,5 @@ Last full run (`cargo test --workspace`, 12 October 2026):
 ## Next step
 
 Verify the macOS and Windows packaging scripts on those platforms (CI will
-exercise them on the next push), then tag 0.1.0 following
+exercise them on the next push), then tag v0.0.1 following
 `docs/development/release-process.md`.

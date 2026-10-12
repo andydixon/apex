@@ -12,7 +12,7 @@ Everything works offline.
 
 ![The editor with a Rust project open](docs/screenshots/editor.png)
 
-> Status: 0.1, pre-release. `FEATURE_MATRIX.md` lists every feature with its
+> Status: 0.0.1, pre-release. `FEATURE_MATRIX.md` lists every feature with its
 > verification status; `PROGRESS.md` is the milestone log with real test
 > results; `CHANGELOG.md` tracks releases.
 
