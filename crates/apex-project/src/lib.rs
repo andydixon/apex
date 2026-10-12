@@ -6,6 +6,7 @@ pub mod forge;
 pub mod git;
 pub mod git_cli;
 pub mod git_history;
+pub mod git_repo;
 pub mod index;
 pub mod lsp;
 pub mod paths;

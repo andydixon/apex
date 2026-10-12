@@ -175,6 +175,56 @@ pass "create pull request (published the branch first)"
 git -C "$REPO" switch -q main
 sleep 5
 
+# G5: log, branches, stash, a merge conflict resolved in the editor.
+command "Show Log"
+sleep 3
+shot g5-log
+key Escape; sleep 0.3
+xdotool mousemove 700 300 click 1; sleep 0.3
+command "Switch Branch…"
+type_text "fast-search"; sleep 0.5; key Return; sleep 2.5
+[ "$(git -C "$REPO" branch --show-current)" = "feature/fast-search" ] || fail "switch branch"
+command "Switch Branch…"
+type_text "main"; sleep 0.5; key Return; sleep 2.5
+[ "$(git -C "$REPO" branch --show-current)" = "main" ] || fail "switch back"
+pass "switch branch"
+command "Create Branch…"
+type_text "topic/e2e"; key Return; sleep 2.5
+[ "$(git -C "$REPO" branch --show-current)" = "topic/e2e" ] || fail "create branch"
+git -C "$REPO" switch -q main; sleep 4
+pass "create branch"
+echo scratch > "$REPO/scratch.txt"; sleep 1
+command "Stash Changes…"
+type_text "e2e stash"; key Return; sleep 2.5
+git -C "$REPO" stash list | grep -q "e2e stash" || fail "stash"
+[ ! -e "$REPO/scratch.txt" ] || fail "stash kept the untracked file"
+command "Stashes…"
+sleep 0.5; key Return; sleep 1; key Return; sleep 2.5   # stash@{0} -> Apply
+[ -e "$REPO/scratch.txt" ] || fail "stash apply"
+git -C "$REPO" stash drop -q && rm -f "$REPO/scratch.txt"
+pass "stash and apply"
+printf 'one\ntwo\n' > "$REPO/c.txt" && git -C "$REPO" add c.txt && git -C "$REPO" commit -q -m "add c"
+git -C "$REPO" switch -q -c clash && printf 'CLASH ONE\ntwo\n' > "$REPO/c.txt" && git -C "$REPO" commit -q -am "clash"
+git -C "$REPO" switch -q main && printf 'MAIN ONE\ntwo\n' > "$REPO/c.txt" && git -C "$REPO" commit -q -am "main one"
+sleep 5
+command "Merge Branch into Current…"
+type_text "clash"; sleep 0.5; key Return; sleep 3
+grep -q '^<<<<<<<' "$REPO/c.txt" || fail "merge did not conflict"
+xdotool mousemove 89 101 click 1; sleep 2   # c.txt in the folder tree
+xdotool mousemove 700 300 click 1; sleep 0.3
+key ctrl+Home; sleep 0.3
+shot g5-conflict
+command "Accept Incoming Change"
+key ctrl+s; sleep 1
+[ "$(cat "$REPO/c.txt")" = "$(printf 'CLASH ONE\ntwo')" ] || fail "accept incoming: $(cat "$REPO/c.txt")"
+command "Mark Resolved"
+sleep 4
+command "Continue Merge/Rebase"
+sleep 3
+[ "$(git -C "$REPO" log -1 --format=%P | wc -w)" = 2 ] || fail "merge not concluded"
+pass "merge conflict resolved in the editor and continued"
+key ctrl+w; sleep 0.5
+
 # History editor: replace the author of every commit, apply, check git.
 git -C "$REPO" add -A && git -C "$REPO" commit -q --allow-empty -m "Work in progress"
 command "Edit Commit History"

@@ -115,6 +115,10 @@ impl ApexApp {
                         Command::GitForcePush,
                         Command::GhCreatePr,
                         Command::GitOpenBranchOnRemote,
+                        Command::GitSwitchBranch,
+                        Command::GitStash,
+                        Command::GitStashes,
+                        Command::GitLog,
                         Command::GitHistoryEditor,
                         Command::GitShowOutput,
                     ] {
@@ -140,9 +144,21 @@ impl ApexApp {
                     (0, b) => format!("  ({b} behind)"),
                     (a, b) => format!("  ({a} ahead, {b} behind)"),
                 };
-                ui.label(egui::RichText::new(format!("{branch}{ab}")).size(ui_font - 1.0)).on_hover_text(format!("Branch {} tracking {u}", status.branch));
+                if ui
+                    .add(egui::Label::new(egui::RichText::new(format!("{branch}{ab}")).size(ui_font - 1.0)).sense(egui::Sense::click()))
+                    .on_hover_text(format!("Branch {} tracking {u}; click to switch branch", status.branch))
+                    .clicked()
+                {
+                    cmds.push((Command::GitSwitchBranch, None));
+                }
             } else {
-                ui.label(egui::RichText::new(branch).size(ui_font - 1.0)).on_hover_text("Branch (no upstream)");
+                if ui
+                    .add(egui::Label::new(egui::RichText::new(branch).size(ui_font - 1.0)).sense(egui::Sense::click()))
+                    .on_hover_text("Branch (no upstream); click to switch branch")
+                    .clicked()
+                {
+                    cmds.push((Command::GitSwitchBranch, None));
+                }
             }
             if status.upstream.is_some() || !status.unborn {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -172,6 +188,24 @@ impl ApexApp {
             }
         });
 
+        // A merge/rebase in progress: what is left and the way out.
+        if let Some((_, op, n)) = self.git_operation() {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(6.0);
+                let text = if n > 0 {
+                    format!("{}: {n} conflicted file{}", op.label(), if n == 1 { "" } else { "s" })
+                } else {
+                    format!("{}: conflicts resolved", op.label())
+                };
+                ui.label(egui::RichText::new(text).color(theme.ui.warning));
+                if ui.add_enabled(n == 0, egui::Button::new("Continue").small()).on_hover_text("Stage every resolved file first").clicked() {
+                    cmds.push((Command::GitContinue, None));
+                }
+                if ui.small_button("Abort").clicked() {
+                    cmds.push((Command::GitAbort, None));
+                }
+            });
+        }
         // Commit box.
         ui.horizontal(|ui| {
             ui.add_space(6.0);

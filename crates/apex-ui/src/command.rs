@@ -369,6 +369,34 @@ commands! {
     GhPrDiff => "github.pr_diff", "Show Pull Request Diff", Git;
     GhOpenUrl => "github.open_url", "Open Link", Git;
     GhSubmitPr => "github.submit_pr", "Submit Pull Request", Git;
+    GitSwitchBranch => "git.switch_branch", "Switch Branch…", Git;
+    GitSwitchTo => "git.switch_to", "Switch to Branch", Git;
+    GitCreateBranch => "git.create_branch", "Create Branch…", Git;
+    GitRenameBranch => "git.rename_branch", "Rename Branch…", Git;
+    GitDeleteBranch => "git.delete_branch", "Delete Branch…", Git;
+    GitDeleteBranchNamed => "git.delete_branch_named", "Delete Named Branch", Git;
+    GitMergeBranch => "git.merge_branch", "Merge Branch into Current…", Git;
+    GitMergeBranchNamed => "git.merge_branch_named", "Merge Named Branch", Git;
+    GitCheckoutCommit => "git.checkout_commit", "Check Out Commit", Git;
+    GitCherryPick => "git.cherry_pick", "Cherry-pick Commit", Git;
+    GitRevertCommit => "git.revert_commit", "Revert Commit", Git;
+    GitStash => "git.stash", "Stash Changes…", Git;
+    GitStashes => "git.stashes", "Stashes…", Git;
+    GitStashActions => "git.stash_actions", "Stash Actions", Git;
+    GitStashApply => "git.stash_apply", "Apply Stash", Git;
+    GitStashPop => "git.stash_pop", "Pop Stash", Git;
+    GitStashDrop => "git.stash_drop", "Drop Stash", Git;
+    GitStashShow => "git.stash_show", "Show Stash", Git;
+    GitContinue => "git.continue", "Continue Merge/Rebase", Git;
+    GitAbort => "git.abort", "Abort Merge/Rebase…", Git;
+    GitAcceptOurs => "git.accept_ours", "Accept Current Change (Ours)", Git;
+    GitAcceptTheirs => "git.accept_theirs", "Accept Incoming Change (Theirs)", Git;
+    GitAcceptBoth => "git.accept_both", "Accept Both Changes", Git;
+    GitNextConflict => "git.next_conflict", "Next Conflict", Git;
+    GitPrevConflict => "git.prev_conflict", "Previous Conflict", Git;
+    GitMarkResolved => "git.mark_resolved", "Mark Resolved (Stage File)", Git;
+    GitLineHistory => "git.line_history", "Line History of Selection", Git;
+    GitLog => "git.log", "Show Log", Git;
     GitCancel => "git.cancel", "Cancel Git Command", Git;
 
     // Tools

@@ -30,6 +30,8 @@ pub enum MacroStep {
 /// What a text prompt dialog is for.
 #[derive(Debug, Clone)]
 pub(crate) enum PromptKind {
+    /// Run a Git command with the text (packed with an optional extra argument).
+    GitArg(Command, Option<String>),
     /// A typed path standing in for a file dialog (folder only = true).
     Path(Box<crate::file_dialogs::FileDialogKind>, bool),
     NewFile(PathBuf),
@@ -204,6 +206,7 @@ impl ApexApp {
         }
         self.git_auto_fetch();
         self.forge_poll(ctx);
+        self.git_text_poll(ctx);
         if self.git_blame_poll() {
             repaint = true;
         }
@@ -1538,6 +1541,13 @@ impl ApexApp {
                 self.save_project_file(&path);
             }
             PromptKind::Rename => self.execute(ctx, Command::LspRename, Some(text)),
+            PromptKind::GitArg(cmd, extra) => {
+                let arg = match extra {
+                    Some(e) => format!("{text}{}{e}", crate::git_branches::SEP),
+                    None => text,
+                };
+                self.execute(ctx, cmd, Some(arg));
+            }
             PromptKind::Path(kind, folder) => {
                 let raw = text.trim();
                 let path = match raw.strip_prefix('~') {

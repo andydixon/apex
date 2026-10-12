@@ -941,6 +941,8 @@ impl ApexApp {
             || self.git_blame_command(ctx, cmd, arg.clone())
             || self.history_command(cmd, arg.clone())
             || self.forge_command(ctx, cmd, arg.clone())
+            || self.git_branch_command(ctx, cmd, arg.clone())
+            || self.git_log_command(cmd)
             || self.tasks_command(ctx, cmd, arg.clone())
             || self.lsp_command(ctx, cmd, arg.clone())
             || self.spell_command(cmd)
@@ -2632,7 +2634,7 @@ impl ApexApp {
                     item(ui, &mut q, c);
                 }
                 ui.separator();
-                for c in [Command::GitToggleBlame, Command::GitShowCommit] {
+                for c in [Command::GitLog, Command::GitToggleBlame, Command::GitShowCommit, Command::GitLineHistory] {
                     item(ui, &mut q, c);
                 }
                 ui.separator();
@@ -2644,6 +2646,30 @@ impl ApexApp {
                     item(ui, &mut q, c);
                 }
                 ui.separator();
+                ui.menu_button("Branches", |ui| {
+                    for c in [Command::GitSwitchBranch, Command::GitCreateBranch, Command::GitRenameBranch, Command::GitDeleteBranch, Command::GitMergeBranch] {
+                        item(ui, &mut q, c);
+                    }
+                });
+                ui.menu_button("Stash", |ui| {
+                    for c in [Command::GitStash, Command::GitStashes] {
+                        item(ui, &mut q, c);
+                    }
+                });
+                ui.menu_button("Conflicts", |ui| {
+                    for c in [
+                        Command::GitNextConflict,
+                        Command::GitPrevConflict,
+                        Command::GitAcceptOurs,
+                        Command::GitAcceptTheirs,
+                        Command::GitAcceptBoth,
+                        Command::GitMarkResolved,
+                        Command::GitContinue,
+                        Command::GitAbort,
+                    ] {
+                        item(ui, &mut q, c);
+                    }
+                });
                 ui.menu_button("Remote", |ui| {
                     for c in [
                         Command::GitOpenOnRemote,
@@ -2933,6 +2959,9 @@ impl ApexApp {
         }
         if let Some(pr) = self.forge_status_label() {
             right.insert(0, pr);
+        }
+        if let Some((_, op, n)) = self.git_operation() {
+            right.insert(0, if n > 0 { format!("{}: {n} conflicted", op.label()) } else { format!("{}: ready to continue", op.label()) });
         }
         if let Some((_, note)) = self.git_blame_caret_note() {
             left.push_str(&format!("    {}", note.chars().take(80).collect::<String>()));
@@ -3424,6 +3453,11 @@ impl ApexApp {
         let mut spell_action: Option<(usize, usize, String, Option<String>)> = None;
         let muted = self.theme.ui.text_muted;
         let in_repo = self.views.get(&vid).map(|v| v.doc).and_then(|d| self.git_workdir_for_doc(d)).is_some();
+        let in_conflict = self
+            .views
+            .get(&vid)
+            .map(|v| (v.doc, v.primary_line(&self.docs[&v.doc])))
+            .is_some_and(|(d, line)| self.git_conflicts(d).is_some_and(|(_, cs)| cs.iter().any(|c| (c.start..=c.end).contains(&line))));
         let shortcuts: Vec<(Command, String)> = [
             Command::Cut,
             Command::Copy,
@@ -3437,9 +3471,13 @@ impl ApexApp {
             Command::GitStageHunk,
             Command::GitStageLines,
             Command::RevertHunk,
+            Command::GitAcceptOurs,
+            Command::GitAcceptTheirs,
+            Command::GitAcceptBoth,
         ]
         .into_iter()
         .filter(|c| in_repo || c.category() != crate::command::Category::Git)
+        .filter(|c| in_conflict || !matches!(c, Command::GitAcceptOurs | Command::GitAcceptTheirs | Command::GitAcceptBoth))
         .map(|c| (c, self.keymap.shortcut_for(c).unwrap_or_default()))
         .collect();
         let popup = egui::Popup::new(id, ctx.clone(), egui::PopupAnchor::Position(pos), egui::LayerId::new(egui::Order::Foreground, id))
@@ -3553,6 +3591,7 @@ impl ApexApp {
         let fold_regions = self.fold_regions_for(did);
         let git_marks = self.git_marks_for(did);
         let blame = self.git_blame_column(did, char_width);
+        let conflict_tints = if tints.is_none() { self.git_conflicts(did).map(|(t, _)| t) } else { None };
         let inline_note = if self.settings.git_blame_inline && focused { self.git_blame_caret_note() } else { None };
         let mut diagnostics = self.diagnostics_for(did);
         if self.spell_enabled_for(did) {
@@ -3584,7 +3623,7 @@ impl ApexApp {
             block_caret: self.vim_block_caret(),
             blame: blame.as_deref(),
             inline_note: inline_note.as_ref().map(|(l, s)| (*l, s.as_str())),
-            line_tints: tints.map(|t| t.0).unwrap_or(&[]),
+            line_tints: tints.map(|t| t.0).or(conflict_tints.as_deref().map(|v| v.as_slice())).unwrap_or(&[]),
             span_tints: tints.map(|t| t.1).unwrap_or(&[]),
         };
         let muted = settings.muted_syntax || settings.low_distraction;
@@ -3969,6 +4008,7 @@ impl eframe::App for ApexApp {
         self.lsp_overlays(&ctx);
         self.show_settings_panel(&ctx);
         self.show_history_editor(&ctx);
+        self.show_git_log(&ctx);
         self.show_palette(&ctx);
         self.show_dialogs(&ctx);
         self.show_editor_context_menu(&ctx);

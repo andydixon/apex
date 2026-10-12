@@ -138,6 +138,45 @@ holds your GitHub login; Apex stores no tokens. Install it and run
 * **Pull Request Checks…** lists the checks; Enter opens one's details.
 * **Open Pull Request in Browser**.
 
+## Branches, log and stash
+
+* **Switch Branch…** (or click the branch name in the Source Control panel)
+  lists local branches and remote ones without a local copy; choosing a
+  remote branch creates a local branch tracking it. The first entry creates
+  a new branch from the current commit. Git refuses to switch when your
+  changes would be overwritten: stash them first.
+* **Create / Rename / Delete Branch…** and **Merge Branch into Current…**
+  (Git > Branches). Deleting refuses a branch with unmerged commits.
+* **Show Log** opens every commit of every branch and tag with a lane
+  graph, branch and tag labels, author and age. Type to filter (by message,
+  author, id or ref); double-click or Enter shows a commit; right-click to
+  copy its id, create a branch there, check it out (detached), cherry-pick
+  it onto the current branch, revert it, or open it on the remote. The log
+  refreshes after each command.
+* **Line History of Selection** shows how the selected lines changed over
+  time (`git log -L`).
+* **Stash Changes…** stashes everything, including untracked files, with an
+  optional message; **Stashes…** lists them with Apply, Pop, Show (as a
+  diff) and Drop (confirmed).
+
+## Merge conflicts
+
+When a merge, rebase, cherry-pick or revert stops on conflicts, the status
+bar and the Source Control panel say so, and the conflicted files are listed
+under **Merge conflicts**.
+
+* Conflict blocks are tinted: the current side (ours), the incoming side
+  (theirs) and the marker lines differ. **Next / Previous Conflict** move
+  between them.
+* With the caret in a block, **Accept Current Change**, **Accept Incoming
+  Change** or **Accept Both Changes** (Git > Conflicts or right-click)
+  replace the block; each is an ordinary undoable edit.
+* Save, then **Mark Resolved** to stage the file (it warns if markers are
+  left). When nothing is conflicted, **Continue** in the panel (or
+  Git > Conflicts) finishes the merge or moves the rebase on, keeping
+  git's prepared message. **Abort** returns to where you started, after
+  confirming.
+
 ## Blame
 
 **Git > Toggle Blame** (Ctrl+K Ctrl+G) adds a column to the gutter with the

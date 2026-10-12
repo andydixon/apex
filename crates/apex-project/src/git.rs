@@ -39,6 +39,8 @@ pub struct RepoStatus {
     pub upstream: Option<String>,
     pub ahead: usize,
     pub behind: usize,
+    /// A merge, rebase, cherry-pick or revert waiting for Continue/Abort.
+    pub operation: Option<crate::git_repo::Operation>,
 }
 
 /// One changed path: what is staged and what is not.
@@ -180,7 +182,8 @@ pub fn status(workdir: &Path, include_ignored: bool) -> Result<RepoStatus, git2:
         Some((u, a, b)) => (Some(u), a, b),
         None => (None, 0, 0),
     };
-    Ok(RepoStatus { workdir: root, branch, detached, unborn, files, dirs, entries, upstream, ahead, behind })
+    let operation = crate::git_repo::operation(&root);
+    Ok(RepoStatus { workdir: root, branch, detached, unborn, files, dirs, entries, upstream, ahead, behind, operation })
 }
 
 pub struct StatusScan {

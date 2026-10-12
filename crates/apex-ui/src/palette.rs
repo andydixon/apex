@@ -160,6 +160,9 @@ impl Palette {
             out.extend(idx.into_iter().take(500).map(|i| ScoredItem { index: i, score: self.items[i].boost, indices: Vec::new() }));
         } else {
             let pattern = Pattern::parse(&text, CaseMatching::Smart, Normalization::Smart);
+            // Typing a whole label picks that item, whatever the recency boosts.
+            let bare = |t: &str| t.trim().trim_end_matches(['…', '.']).trim().to_lowercase();
+            let exact = bare(&text);
             let mut buf = Vec::new();
             let mut indices = Vec::new();
             for (i, item) in self.items.iter().enumerate() {
@@ -168,7 +171,10 @@ impl Palette {
                 if let Some(score) = pattern.indices(hay, &mut self.matcher, &mut indices) {
                     indices.sort_unstable();
                     indices.dedup();
-                    out.push(ScoredItem { index: i, score: score + item.boost, indices: indices.clone() });
+                    // Commands are listed as "Category: Name"; either form counts.
+                    let named = item.label.split_once(": ").map(|(_, n)| n).unwrap_or(&item.label);
+                    let bonus = if bare(&item.label) == exact || bare(named) == exact { 1_000_000 } else { 0 };
+                    out.push(ScoredItem { index: i, score: score + item.boost + bonus, indices: indices.clone() });
                 } else if !item.detail.is_empty() {
                     // Also match against the detail (path directory etc.) at a penalty.
                     let hay = Utf32Str::new(&item.detail, &mut buf);
@@ -377,6 +383,11 @@ mod tests {
     fn fuzzy_scoring_and_operators() {
         let mut p = Palette::default();
         p.show_with(PaletteMode::Anything, vec![item("src/main.rs", "", 0), item("src/app/model.rs", "", 0), item("README.md", "", 50)], "", "");
+        // An exact label beats a boosted near match.
+        let mut p2 = Palette::default();
+        p2.show_with(PaletteMode::Commands, vec![item("Git: Stash Changes…", "", 500), item("Git: Stashes…", "", 0)], "t", "Stashes");
+        p2.rescore();
+        assert_eq!(p2.items[p2.results[0].index].label, "Git: Stashes…");
         // Empty query: boosted first.
         assert_eq!(p.items[p.results[0].index].label, "README.md");
         p.query = "mainrs:12".into();

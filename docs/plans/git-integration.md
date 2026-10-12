@@ -1,6 +1,6 @@
 # Plan: Git and GitHub integration
 
-Status: in progress. Done: G1, G2, G3, G4, G6, G7, G8. G3 leaves for later: folding long
+Status: done: G1–G8. G3 leaves for later: folding long
 unchanged regions, and a multi-file commit view (the commit view is a
 unified diff). Order: G1 → G2 → G4 → G6 → G7 (small,
 then medium) → G3 → G5 (large). `FEATURE_MATRIX.md` tracks what exists.

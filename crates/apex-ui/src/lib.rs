@@ -8,6 +8,8 @@ pub mod file_dialogs;
 pub mod find_in_files;
 pub mod forge_ui;
 pub mod git_blame;
+pub mod git_branches;
+pub mod git_log_ui;
 pub mod git_ops;
 pub mod git_panel;
 pub mod git_ui;

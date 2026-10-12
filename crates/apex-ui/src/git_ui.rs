@@ -46,6 +46,11 @@ pub struct GitUi {
     pub(crate) forge: crate::forge_ui::ForgeUi,
     /// The Create Pull Request form's contents, handed to `GhSubmitPr`.
     pub(crate) forge_pending_submit: Option<crate::app::Dialog>,
+    pub(crate) conflicts: crate::git_branches::ConflictCache,
+    pub(crate) log: crate::git_log_ui::LogWindow,
+    /// Jobs that produce text for a read-only tab (stash show, line history).
+    pub(crate) text_tx: Option<std::sync::mpsc::Sender<(String, String)>>,
+    pub(crate) text_rx: Option<std::sync::mpsc::Receiver<(String, String)>>,
 }
 
 impl GitUi {

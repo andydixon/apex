@@ -120,6 +120,11 @@ packaging, benchmarks, fuzzing, documentation).
 | Askpass: credential/passphrase prompts relayed to an Apex dialog, never stored | V | `git_cli::askpass_relays_prompts_to_the_ui` (real `git credential fill`) |
 | Remote links: open file (lines, pinned to commit), permalink, commit, branch, compare; GitHub/GitLab/Bitbucket/Gitea URL schemes | V | `forge` tests |
 | GitHub via `gh`: create PR (prefilled, pushes/publishes first), PR status in status bar, PR list → check out / diff / open, checks list | V | `forge` tests; `tests/visual/git.sh` with a fake `gh` (status, list, check out, create); real GitHub checked by hand only |
+| Branches: switch (incl. tracking a remote branch), create, rename, delete, merge | V | `git_repo` tests; `tests/visual/git.sh` (switch, create, merge) |
+| Log with lane graph, refs, filter, commit actions (show, branch here, check out, cherry-pick, revert, open on remote) | V | `git_repo` graph test; screenshot from `tests/visual/git.sh` |
+| Stash push (incl. untracked), list, apply/pop/show/drop | V | `tests/visual/git.sh` (stash, apply) |
+| Merge conflicts: tinting, accept ours/theirs/both, next/previous, mark resolved, continue/abort with state in panel and status bar | V | `git_repo` tests (parse, resolve, merge state); `tests/visual/git.sh` (full conflict resolution) |
+| Line history of a selection | I | |
 | Edit Commit History: per-commit author/committer/date/message, search, Claude/Codex filter, bulk author replace, date spread, co-author removal | V | `git_history` tests; `tests/visual/git.sh` (bulk replace + apply) |
 | History rewrite: clean-tree check, backup tag kept on the old history, local refs only, cleanup, optional force push with lease (typed FORCE) | V | `git_history::applies_edits_with_real_git`; push path untested |
 

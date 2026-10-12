@@ -24,6 +24,10 @@ All notable changes to Apex are recorded here. The format follows
   Saved/Index/HEAD and `apex --diff`: synchronised scrolling, changed lines
   and words highlighted, the working copy editable on the right, and per
   change revert, stage and unstage buttons.
+- Branches (switch, create, rename, delete, merge), a log with lane graph
+  and commit actions, line history, stash, and merge-conflict resolution in
+  the editor with Continue/Abort for merges, rebases, cherry-picks and
+  reverts.
 - Blame (Ctrl+K Ctrl+G): gutter column with author and age, unsaved edits
   shown as not committed, click for the commit view; optional inline blame.
 - Edit Commit History: edit authors, committers, dates and messages across
@@ -79,6 +83,8 @@ All notable changes to Apex are recorded here. The format follows
   targets, security review, user guide and developer documentation.
 
 ### Fixed
+- Typing a command's full name in the palette picks it even when a
+  recently used command would otherwise rank higher.
 - Ctrl+Enter in the commit box was missed when a slow frame saw Ctrl already
   released; the key event's own modifiers are used.
 - Open Folder / Open File / Save As no longer hang the editor on macOS:

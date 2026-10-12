@@ -119,6 +119,9 @@ impl ApexApp {
                 }
             }
             self.git_mark_dirty();
+            if self.git.log.open {
+                self.git.log.reload_after_job = true;
+            }
             // After publishing commits, the branch's pull request may have changed.
             if ok
                 && matches!(label.as_str(), "Push" | "Publish" | "Sync" | "Force push")
