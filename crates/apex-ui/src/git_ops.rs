@@ -27,6 +27,31 @@ pub struct GitOps {
     scroll_log: bool,
     /// Set while re-running a command the user has just confirmed.
     pub(crate) confirmed: bool,
+    last_auto_fetch: Option<std::time::Instant>,
+}
+
+/// `origin` if present, else the first configured remote.
+fn first_remote(workdir: &Path) -> Option<String> {
+    let repo = git2::Repository::open(workdir).ok()?;
+    let remotes = repo.remotes().ok()?;
+    let names: Vec<String> = remotes.iter().flatten().map(str::to_string).collect();
+    names.iter().find(|n| *n == "origin").or(names.first()).cloned()
+}
+
+/// Advice for errors that mean git could not authenticate.
+fn auth_hint(e: &str) -> Option<&'static str> {
+    let l = e.to_lowercase();
+    if l.contains("permission denied (publickey") || l.contains("host key verification failed") {
+        Some("check that your SSH key is loaded in ssh-agent and the host is known")
+    } else if l.contains("authentication failed")
+        || l.contains("could not read username")
+        || l.contains("could not read password")
+        || l.contains("terminal prompts disabled")
+    {
+        Some("set up a credential helper, or use a personal access token as the password")
+    } else {
+        None
+    }
 }
 
 /// `path` relative to `workdir` with `/` separators, as git expects.
@@ -66,6 +91,14 @@ impl ApexApp {
                     self.git.ops.scroll_log = true;
                 }
                 JobEvent::Progress(p) => self.git.ops.progress = Some(p),
+                JobEvent::Prompt(prompt, reply) => {
+                    // A dialog already open (rare) cancels the prompt rather than losing it.
+                    if self.dialog.is_some() {
+                        let _ = reply.send(None);
+                    } else {
+                        self.dialog = Some(Dialog::Askpass { prompt, text: String::new(), reply });
+                    }
+                }
                 JobEvent::Finished(r) => {
                     finished = Some(r);
                     break;
@@ -76,10 +109,12 @@ impl ApexApp {
             let label = self.git.ops.running.take().map(|j| j.label).unwrap_or_default();
             self.git.ops.progress = None;
             match r {
-                Ok(msg) => self.set_status(if msg.is_empty() { format!("{label}: done") } else { msg }, false),
+                Ok(msg) if msg.is_empty() => {}
+                Ok(msg) => self.set_status(msg, false),
                 Err(e) => {
                     self.git.ops.log.push_back(format!("[{label} failed: {e}]"));
-                    self.set_status(format!("{label} failed: {e}"), true);
+                    let hint = auth_hint(&e).map(|h| format!(" ({h})")).unwrap_or_default();
+                    self.set_status(format!("{label} failed: {e}{hint}"), true);
                 }
             }
             self.git_mark_dirty();
@@ -143,6 +178,10 @@ impl ApexApp {
                     None => self.set_status("No Git command is running".into(), false),
                 }
                 self.git.ops.queued.clear();
+                return true;
+            }
+            Command::GitFetch | Command::GitPull | Command::GitPush | Command::GitForcePush | Command::GitSync => {
+                self.git_remote_command(cmd, arg);
                 return true;
             }
             Command::GitStageFile
@@ -263,6 +302,86 @@ impl ApexApp {
         true
     }
 
+    /// Fetch, pull, push, force push and sync for the panel's repository.
+    fn git_remote_command(&mut self, cmd: Command, arg: Option<String>) {
+        let Some(workdir) = self.git_panel_repo().or_else(|| self.git_target(None).map(|t| t.0)) else { return };
+        if !self.git_trusted(&workdir, cmd, &arg) {
+            return;
+        }
+        let status = self.git.repos.get(&workdir).map(|e| e.status.clone()).unwrap_or_default();
+        let branch = status.branch.clone();
+        let pull_args: Vec<&'static str> = match self.settings.git_pull_mode.as_str() {
+            "rebase" => vec!["pull", "--rebase", "--progress"],
+            "merge" => vec!["pull", "--no-rebase", "--no-edit", "--progress"],
+            _ => vec!["pull", "--ff-only", "--progress"],
+        };
+        match cmd {
+            Command::GitFetch => self.git_run("Fetch", workdir, |c| c.git(&["fetch", "--all", "--prune", "--progress"], None).map(|_| "Fetched".into())),
+            Command::GitPull => self.git_run("Pull", workdir, move |c| c.git(&pull_args, None).map(|_| "Pulled".into())),
+            Command::GitPush | Command::GitSync => {
+                if status.detached || status.unborn {
+                    self.set_status("Check out a branch with commits before pushing".into(), false);
+                    return;
+                }
+                let sync = cmd == Command::GitSync;
+                if status.upstream.is_none() {
+                    // First push of this branch: publish it, after asking.
+                    let remote = first_remote(&workdir);
+                    let Some(remote) = remote else {
+                        self.set_status("This repository has no remote to push to".into(), false);
+                        return;
+                    };
+                    let body = format!("{branch} has no upstream branch. Push it to {remote}/{branch} and track it?");
+                    if !self.git_confirm("Publish branch?", body, "Publish", cmd, &arg) {
+                        return;
+                    }
+                    self.git_run("Publish", workdir, move |c| {
+                        c.git(&["push", "--set-upstream", "--progress", &remote, &branch], None).map(|_| format!("Published {branch} to {remote}"))
+                    });
+                    return;
+                }
+                self.git_run(if sync { "Sync" } else { "Push" }, workdir, move |c| {
+                    if sync {
+                        c.git(&pull_args, None)?;
+                    }
+                    c.git(&["push", "--progress"], None).map(|_| if sync { "Synced".into() } else { "Pushed".into() })
+                });
+            }
+            Command::GitForcePush => {
+                if status.upstream.is_none() {
+                    self.set_status("This branch has no upstream; use Push to publish it".into(), false);
+                    return;
+                }
+                let up = status.upstream.clone().unwrap_or_default();
+                let body = format!(
+                    "Replace {up} with your local {branch}? Commits on {up} that you do not have are lost. --force-with-lease refuses if {up} changed since you last fetched."
+                );
+                if !self.git_confirm("Force push?", body, "Force Push", cmd, &arg) {
+                    return;
+                }
+                self.git_run("Force push", workdir, |c| c.git(&["push", "--force-with-lease", "--progress"], None).map(|_| "Force-pushed".into()));
+            }
+            _ => {}
+        }
+    }
+
+    /// Background fetch every `git_auto_fetch_minutes` (trusted repositories only).
+    pub(crate) fn git_auto_fetch(&mut self) {
+        let minutes = self.settings.git_auto_fetch_minutes;
+        if minutes == 0 || self.git.ops.running.is_some() || !self.git.ops.queued.is_empty() {
+            return;
+        }
+        if self.git.ops.last_auto_fetch.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(minutes * 60)) {
+            return;
+        }
+        self.git.ops.last_auto_fetch = Some(std::time::Instant::now());
+        let Some(workdir) = self.git_panel_repo() else { return };
+        if !self.trust.is_trusted(&workdir) || first_remote(&workdir).is_none() {
+            return;
+        }
+        self.git_run("Auto-fetch", workdir, |c| c.git(&["fetch", "--all", "--prune", "--quiet"], None).map(|_| String::new()));
+    }
+
     /// Bottom panel "GIT" tab: the command log.
     pub(crate) fn show_git_output_panel(&mut self, ui: &mut Ui) {
         let theme = self.theme.clone();
@@ -323,6 +442,13 @@ impl ApexApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_hints() {
+        assert!(auth_hint("git@github.com: Permission denied (publickey).").is_some());
+        assert!(auth_hint("fatal: could not read Username for 'https://github.com': terminal prompts disabled").is_some());
+        assert!(auth_hint("fatal: not a git repository").is_none());
+    }
 
     #[test]
     fn relative_paths_use_slashes() {

@@ -64,7 +64,7 @@ fn base_command(program: &Path, workdir: Option<&Path>) -> Command {
 }
 
 /// Output of a background job, in order.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum JobEvent {
     /// A line for the Git log (commands, their output).
     Log(String),
@@ -72,6 +72,8 @@ pub enum JobEvent {
     Progress(String),
     /// The job ended: a short success message, or the error.
     Finished(Result<String, String>),
+    /// git or ssh asks for a credential (askpass); send `None` to cancel.
+    Prompt(String, Sender<Option<String>>),
 }
 
 /// Handle to a running job; dropping it does not cancel.
@@ -93,6 +95,8 @@ pub struct JobCtx {
     pub workdir: PathBuf,
     tx: Sender<JobEvent>,
     cancel: Arc<AtomicBool>,
+    /// (port, token) of this job's askpass listener.
+    askpass: Option<(u16, String)>,
 }
 
 impl JobCtx {
@@ -121,6 +125,17 @@ impl JobCtx {
         self.log(format!("$ git {}", args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")));
         let mut cmd = base_command(&program(), Some(&self.workdir));
         cmd.args(["-c", "color.ui=false", "-c", "core.quotepath=false"]).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some((port, token)) = &self.askpass
+            && let Some(exe) = askpass_program()
+        {
+            // git and ssh run Apex itself as the askpass helper, which relays
+            // the prompt to the editor (see `askpass_client`).
+            cmd.env("GIT_ASKPASS", &exe)
+                .env("SSH_ASKPASS", &exe)
+                .env("SSH_ASKPASS_REQUIRE", "force")
+                .env(ASKPASS_PORT, port.to_string())
+                .env(ASKPASS_TOKEN, token);
+        }
         if stdin.is_some() {
             cmd.stdin(Stdio::piped());
         }
@@ -233,15 +248,105 @@ fn shell_quote(a: &str) -> String {
 pub fn start_job(label: &str, workdir: PathBuf, body: impl FnOnce(&JobCtx) -> Result<String, String> + Send + 'static) -> GitJob {
     let (tx, rx) = unbounded();
     let cancel = Arc::new(AtomicBool::new(false));
-    let ctx = JobCtx { workdir, tx: tx.clone(), cancel: cancel.clone() };
+    let done = Arc::new(AtomicBool::new(false));
+    let askpass = askpass_server(tx.clone(), cancel.clone(), done.clone());
+    let ctx = JobCtx { workdir, tx: tx.clone(), cancel: cancel.clone(), askpass };
     let spawned = std::thread::Builder::new().name("apex-git-job".into()).spawn(move || {
         let r = if available() { body(&ctx) } else { Err("the git command-line tool was not found (install Git or set APEX_GIT)".into()) };
+        done.store(true, Ordering::Relaxed);
         let _ = ctx.tx.send(JobEvent::Finished(r));
     });
     if let Err(e) = spawned {
         let _ = tx.send(JobEvent::Finished(Err(format!("could not start a thread: {e}"))));
     }
     GitJob { label: label.to_string(), rx, started: Instant::now(), cancel }
+}
+
+// ----- askpass -------------------------------------------------------------------
+
+/// Environment variables that switch Apex into askpass helper mode.
+pub const ASKPASS_PORT: &str = "APEX_ASKPASS_PORT";
+pub const ASKPASS_TOKEN: &str = "APEX_ASKPASS_TOKEN";
+
+/// The helper git and ssh run: `APEX_ASKPASS_EXE` (tests) or this executable.
+fn askpass_program() -> Option<PathBuf> {
+    std::env::var_os("APEX_ASKPASS_EXE").map(PathBuf::from).or_else(|| std::env::current_exe().ok())
+}
+
+fn random_token() -> String {
+    use std::hash::BuildHasher;
+    let s = std::collections::hash_map::RandomState::new();
+    (0..4u64).map(|salt| format!("{:016x}", s.hash_one((std::process::id(), salt, Instant::now())))).collect()
+}
+
+/// A loopback listener for one job. Each connection sends `token\nprompt\n`
+/// and gets back `OK <answer>\n` or `CANCEL\n`. The prompt goes to the UI as
+/// [`JobEvent::Prompt`]; the listener stops when the job ends.
+fn askpass_server(tx: Sender<JobEvent>, cancel: Arc<AtomicBool>, done: Arc<AtomicBool>) -> Option<(u16, String)> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok()?;
+    listener.set_nonblocking(true).ok()?;
+    let port = listener.local_addr().ok()?.port();
+    let token = random_token();
+    let expected = token.clone();
+    std::thread::Builder::new()
+        .name("apex-askpass".into())
+        .spawn(move || {
+            while !done.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(30));
+                    continue;
+                };
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut reader = BufReader::new(&stream);
+                let (mut tok, mut prompt) = (String::new(), String::new());
+                if reader.read_line(&mut tok).is_err() || tok.trim_end() != expected || reader.read_line(&mut prompt).is_err() {
+                    continue;
+                }
+                let (rtx, rrx) = crossbeam_channel::bounded(1);
+                let _ = tx.send(JobEvent::Prompt(prompt.trim_end().to_string(), rtx));
+                // Wait for the user, but not forever, and not past cancellation.
+                let started = Instant::now();
+                let answer = loop {
+                    match rrx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(a) => break a,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                            if started.elapsed() < Duration::from_secs(600) && !cancel.load(Ordering::Relaxed) => {}
+                        Err(_) => break None,
+                    }
+                };
+                let reply = match answer {
+                    Some(a) => format!("OK {}\n", a.replace(['\n', '\r'], "")),
+                    None => "CANCEL\n".to_string(),
+                };
+                let _ = (&stream).write_all(reply.as_bytes());
+            }
+        })
+        .ok()?;
+    Some((port, token))
+}
+
+/// Askpass helper mode (`apex` run by git/ssh with the variables above):
+/// relay `prompt` to the editor and print the answer. Exit code 0 = answer.
+pub fn askpass_client(prompt: &str) -> i32 {
+    let (Ok(port), Ok(token)) = (std::env::var(ASKPASS_PORT), std::env::var(ASKPASS_TOKEN)) else { return 1 };
+    let Ok(port) = port.parse::<u16>() else { return 1 };
+    let Ok(mut stream) = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)) else { return 1 };
+    let prompt = prompt.replace(['\n', '\r'], " ");
+    if stream.write_all(format!("{token}\n{prompt}\n").as_bytes()).is_err() {
+        return 1;
+    }
+    let mut line = String::new();
+    if BufReader::new(&stream).read_line(&mut line).is_err() {
+        return 1;
+    }
+    match line.trim_end_matches(['\n', '\r']).strip_prefix("OK ") {
+        Some(answer) => {
+            println!("{answer}");
+            0
+        }
+        None => 1,
+    }
 }
 
 // ----- partial patches ---------------------------------------------------------
@@ -449,7 +554,7 @@ mod tests {
     }
 
     fn apply(dir: &Path, patch: &str, args: &[&str]) {
-        let ctx = JobCtx { workdir: dir.to_path_buf(), tx: unbounded().0, cancel: Arc::new(AtomicBool::new(false)) };
+        let ctx = JobCtx { workdir: dir.to_path_buf(), tx: unbounded().0, cancel: Arc::new(AtomicBool::new(false)), askpass: None };
         let mut a = vec!["apply"];
         a.extend_from_slice(args);
         a.push("-");
@@ -518,6 +623,42 @@ mod tests {
         let patch = select_new_lines(f, false, std::slice::from_ref(&(2..3))).unwrap();
         apply(p, &patch, &["--cached"]);
         assert_eq!(index_text(p), "a\nb\nC\nc\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn askpass_relays_prompts_to_the_ui() {
+        let Some(dir) = repo_with("x\n") else { return };
+        // A shell stand-in for `apex` in helper mode, speaking the same protocol.
+        let helper = dir.path().join("askpass.sh");
+        std::fs::write(
+            &helper,
+            "#!/bin/bash\nexec 3<>/dev/tcp/127.0.0.1/$APEX_ASKPASS_PORT\nprintf '%s\\n%s\\n' \"$APEX_ASKPASS_TOKEN\" \"$1\" >&3\nread -r line <&3\ncase \"$line\" in OK\\ *) printf '%s\\n' \"${line#OK }\";; *) exit 1;; esac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: single-threaded at this point of the test; only this test reads it.
+        unsafe { std::env::set_var("APEX_ASKPASS_EXE", &helper) };
+        let job = start_job("credential", dir.path().to_path_buf(), |c| {
+            c.git_quiet(&["-c", "credential.helper=", "credential", "fill"], Some(b"protocol=https\nhost=example.invalid\n\n"))
+        });
+        let mut prompts = Vec::new();
+        let out = loop {
+            match job.rx.recv_timeout(Duration::from_secs(30)).expect("job event") {
+                JobEvent::Prompt(p, reply) => {
+                    let answer = if p.starts_with("Username") { "ada" } else { "s3cret" };
+                    prompts.push(p);
+                    reply.send(Some(answer.into())).unwrap();
+                }
+                JobEvent::Finished(r) => break r,
+                _ => {}
+            }
+        };
+        let out = out.expect("credential fill succeeds");
+        assert!(out.contains("username=ada") && out.contains("password=s3cret"), "{out}");
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        assert!(prompts[1].starts_with("Password for"), "{prompts:?}");
     }
 
     #[test]

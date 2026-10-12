@@ -106,7 +106,16 @@ impl ApexApp {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button("…", |ui| {
-                    for c in [Command::GitStageAll, Command::GitUnstageAll, Command::GitCommitAmend, Command::GitUndoCommit, Command::GitShowOutput] {
+                    for c in [
+                        Command::GitStageAll,
+                        Command::GitUnstageAll,
+                        Command::GitCommitAmend,
+                        Command::GitUndoCommit,
+                        Command::GitSync,
+                        Command::GitForcePush,
+                        Command::GitHistoryEditor,
+                        Command::GitShowOutput,
+                    ] {
                         if ui.button(c.name()).clicked() {
                             cmds.push((c, None));
                             ui.close();
@@ -132,6 +141,20 @@ impl ApexApp {
                 ui.label(egui::RichText::new(format!("{branch}{ab}")).size(ui_font - 1.0)).on_hover_text(format!("Branch {} tracking {u}", status.branch));
             } else {
                 ui.label(egui::RichText::new(branch).size(ui_font - 1.0)).on_hover_text("Branch (no upstream)");
+            }
+            if status.upstream.is_some() || !status.unborn {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let busy = self.git.ops.running.is_some();
+                    for (label, tip, c) in [
+                        ("Push", "Push commits to the upstream branch (publishes the branch the first time)", Command::GitPush),
+                        ("Pull", "Pull from the upstream branch", Command::GitPull),
+                        ("Fetch", "Fetch from all remotes", Command::GitFetch),
+                    ] {
+                        if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(label).size(ui_font - 2.0)).small()).on_hover_text(tip).clicked() {
+                            cmds.push((c, None));
+                        }
+                    }
+                });
             }
             if self.git.repos.len() > 1 {
                 let mut repos: Vec<PathBuf> = self.git.repos.keys().cloned().collect();
@@ -162,9 +185,12 @@ impl ApexApp {
                 r.request_focus();
             }
             if r.has_focus() {
-                let (enter, up, down) = ui.input(|i| {
-                    (i.modifiers.command && i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown))
+                // The modifiers on the event itself: with a slow frame, Ctrl can
+                // already be released by the time the frame is processed.
+                let enter = ui.input(|i| {
+                    i.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } if modifiers.command))
                 });
+                let (up, down) = ui.input(|i| (i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown)));
                 if enter {
                     cmds.push((Command::GitCommit, None));
                 }

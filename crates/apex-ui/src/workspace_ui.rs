@@ -202,6 +202,7 @@ impl ApexApp {
         if self.git_ops_poll() {
             repaint = true;
         }
+        self.git_auto_fetch();
         if self.git_blame_poll() {
             repaint = true;
         }
@@ -1816,6 +1817,37 @@ impl ApexApp {
                             self.dialog = None;
                         }
                     }
+                }
+            }
+            Dialog::Askpass { prompt, mut text, reply } => {
+                let secret = ["assword", "assphrase", "PIN", "token"].iter().any(|k| prompt.contains(k));
+                let mut done: Option<Option<String>> = None;
+                egui::Modal::new(egui::Id::new("askpass")).show(ctx, |ui| {
+                    ui.set_width(440.0);
+                    ui.heading("Git needs a credential");
+                    ui.label(&prompt);
+                    let r = ui.add(egui::TextEdit::singleline(&mut text).password(secret).desired_width(f32::INFINITY));
+                    r.request_focus();
+                    ui.label(egui::RichText::new("Sent once to git; Apex does not store it.").color(self.theme.ui.text_muted));
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() || enter {
+                            done = Some(Some(std::mem::take(&mut text)));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            done = Some(None);
+                        }
+                    });
+                });
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    done = Some(None);
+                }
+                match done {
+                    Some(answer) => {
+                        let _ = reply.send(answer);
+                        self.dialog = None;
+                    }
+                    None => self.dialog = Some(Dialog::Askpass { prompt, text, reply }),
                 }
             }
             Dialog::Confirm { title, body, button, then } => {

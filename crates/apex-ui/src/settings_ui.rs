@@ -146,6 +146,20 @@ const ENTRIES: &[Entry] = &[
         kind: Kind::Bool,
     },
     Entry {
+        key: "git_pull_mode",
+        category: "Git",
+        label: "Pull mode",
+        help: "ff-only refuses to create merge commits; rebase replays your commits; merge creates a merge commit.",
+        kind: Kind::Choice(&["ff-only", "rebase", "merge"]),
+    },
+    Entry {
+        key: "git_auto_fetch_minutes",
+        category: "Git",
+        label: "Fetch automatically every (minutes)",
+        help: "0 never fetches on its own: Apex reaches the network only when you ask.",
+        kind: Kind::U64(0, 1440),
+    },
+    Entry {
         key: "native_file_dialogs",
         category: "Files",
         label: "System file dialogs",
@@ -669,6 +683,7 @@ fn u64_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut u64> {
         "completion_delay_ms" => &mut s.completion_delay_ms,
         "auto_save_delay_ms" => &mut s.auto_save_delay_ms,
         "recovery_interval_ms" => &mut s.recovery_interval_ms,
+        "git_auto_fetch_minutes" => &mut s.git_auto_fetch_minutes,
         _ => return None,
     })
 }
@@ -694,6 +709,7 @@ fn string_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut String> {
         "fallback_encoding" => &mut s.fallback_encoding,
         "default_line_ending" => &mut s.default_line_ending,
         "spell_language" => &mut s.spell_language,
+        "git_pull_mode" => &mut s.git_pull_mode,
         _ => return None,
     })
 }

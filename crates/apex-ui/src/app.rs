@@ -100,6 +100,12 @@ pub(crate) enum Dialog {
         kind: crate::workspace_ui::PromptKind,
     },
     Recovery(Vec<apex_project::session::RecoveryEntry>),
+    /// A credential prompt from git or ssh (askpass).
+    Askpass {
+        prompt: String,
+        text: String,
+        reply: crossbeam_channel::Sender<Option<String>>,
+    },
     /// Confirm a destructive command, then run `then` again (it checks
     /// `git.ops.confirmed`).
     Confirm {
@@ -2594,6 +2600,10 @@ impl ApexApp {
                     item(ui, &mut q, c);
                 }
                 ui.separator();
+                for c in [Command::GitFetch, Command::GitPull, Command::GitPush, Command::GitSync, Command::GitForcePush] {
+                    item(ui, &mut q, c);
+                }
+                ui.separator();
                 for c in [
                     Command::GitStageFile,
                     Command::GitUnstageFile,
@@ -3138,6 +3148,7 @@ impl ApexApp {
                 | Dialog::Trust { .. }
                 | Dialog::ConfirmWorkspaceEdit { .. }
                 | Dialog::Confirm { .. }
+                | Dialog::Askpass { .. }
         ) {
             self.show_workspace_dialog(ctx, dialog);
             return;
@@ -3342,7 +3353,8 @@ impl ApexApp {
             | Dialog::ConfirmRevertHunk { .. }
             | Dialog::Trust { .. }
             | Dialog::ConfirmWorkspaceEdit { .. }
-            | Dialog::Confirm { .. } => {}
+            | Dialog::Confirm { .. }
+            | Dialog::Askpass { .. } => {}
             Dialog::Issues(issues) => {
                 let r = egui::Modal::new(egui::Id::new("issues")).show(ctx, |ui| {
                     ui.set_width(520.0);

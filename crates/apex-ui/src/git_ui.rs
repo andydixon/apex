@@ -194,6 +194,12 @@ impl ApexApp {
         if e.status.unborn {
             s.push_str(" (no commits)");
         }
+        match (e.status.ahead, e.status.behind) {
+            (0, 0) => {}
+            (a, 0) => s.push_str(&format!(", {a} to push")),
+            (0, b) => s.push_str(&format!(", {b} to pull")),
+            (a, b) => s.push_str(&format!(", {a} to push, {b} to pull")),
+        }
         Some(s)
     }
 

@@ -52,6 +52,12 @@ fn parse_path_arg(arg: &str) -> (PathBuf, Option<usize>, Option<usize>) {
 }
 
 fn main() -> std::process::ExitCode {
+    // Run by git or ssh as the askpass helper for a command Apex started:
+    // relay the prompt to the editor and print the answer. No window.
+    if std::env::var_os(apex_project::git_cli::ASKPASS_PORT).is_some() {
+        let prompt = std::env::args().nth(1).unwrap_or_default();
+        return std::process::ExitCode::from(apex_project::git_cli::askpass_client(&prompt) as u8);
+    }
     // Finder may still pass a process serial number on old systems; it is not an argument.
     let argv = std::env::args_os().filter(|a| !a.to_string_lossy().starts_with("-psn_"));
     let cli = Cli::parse_from(argv);

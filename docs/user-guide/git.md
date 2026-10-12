@@ -68,6 +68,28 @@ Source Control Panel**) hides it.
 * Right-click in the editor for Stage Change / Stage Selected Lines /
   Revert Change.
 
+## Fetch, pull and push
+
+Apex only talks to the network when you ask (or when
+`git_auto_fetch_minutes` is above 0). Fetch, Pull and Push are on the
+Source Control panel's branch line and in the Git menu; the status bar shows
+how many commits there are to push and to pull.
+
+* **Fetch** fetches every remote and prunes deleted branches.
+* **Pull** follows `git_pull_mode`: `ff-only` (default) refuses to create a
+  merge commit, `rebase` replays your commits, `merge` merges.
+* **Push** pushes to the upstream branch. A branch without one is
+  published (`push --set-upstream`) to `origin`, or the only remote, after
+  asking.
+* **Sync** pulls and then pushes. **Force Push (with Lease)…** replaces the
+  upstream branch after confirming; it refuses if the remote changed since
+  your last fetch.
+* **Credentials**: your credential helper and SSH agent are used as usual.
+  When git or ssh needs a password, passphrase or host-key answer, Apex
+  shows a dialog (it acts as the askpass helper); the answer goes to git
+  once and is never stored. Progress appears in the status bar; **Cancel
+  Git Command** stops a slow transfer.
+
 ## Blame
 
 **Git > Toggle Blame** (Ctrl+K Ctrl+G) adds a column to the gutter with the

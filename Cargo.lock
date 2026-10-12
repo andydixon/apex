@@ -370,6 +370,7 @@ dependencies = [
  "egui",
  "encoding_rs",
  "fastrand",
+ "git2",
  "libc",
  "nucleo-matcher",
  "regex",

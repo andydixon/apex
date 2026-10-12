@@ -13,6 +13,9 @@ All notable changes to Apex are recorded here. The format follows
 - Source Control panel in the lower half of the sidebar (`git_sidebar`):
   staged, unstaged and conflicted files with inline actions, a commit box
   (Ctrl+Enter, amend, sign-off, message history), undo last commit.
+- Fetch, Pull (`git_pull_mode`), Push (publishes new branches after asking),
+  Sync and Force Push with lease; ahead/behind counts; optional auto-fetch;
+  password and passphrase prompts from git/ssh appear as an Apex dialog.
 - Blame (Ctrl+K Ctrl+G): gutter column with author and age, unsaved edits
   shown as not committed, click for the commit view; optional inline blame.
 - Edit Commit History: edit authors, committers, dates and messages across
@@ -68,6 +71,8 @@ All notable changes to Apex are recorded here. The format follows
   targets, security review, user guide and developer documentation.
 
 ### Fixed
+- Ctrl+Enter in the commit box was missed when a slow frame saw Ctrl already
+  released; the key event's own modifiers are used.
 - Open Folder / Open File / Save As no longer hang the editor on macOS:
   dialogs are started from a worker thread, so AppKit runs the panel from
   the main queue outside winit's event handler (starting it inside the

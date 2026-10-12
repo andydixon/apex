@@ -114,6 +114,9 @@ packaging, benchmarks, fuzzing, documentation).
 | Undo last commit (soft reset, message restored), open staged/unstaged changes | I | |
 | Blame column (age shading, tooltip, click opens commit), blame of unsaved buffer, status-bar/inline blame | V | `git::blame_tests`, `git_blame` tests; `tests/visual/git.sh` |
 | Commit view (header, message, patch) | V | `git::blame_tests`; `tests/visual/git.sh` |
+| Fetch, pull (ff-only/rebase/merge), push, sync, force push with lease (confirmed), publish branch (confirmed) | V | `tests/visual/git.sh` (push, pull); publish/force push not scripted |
+| Ahead/behind in panel and status bar, optional auto-fetch | I | |
+| Askpass: credential/passphrase prompts relayed to an Apex dialog, never stored | V | `git_cli::askpass_relays_prompts_to_the_ui` (real `git credential fill`) |
 | Edit Commit History: per-commit author/committer/date/message, search, Claude/Codex filter, bulk author replace, date spread, co-author removal | V | `git_history` tests; `tests/visual/git.sh` (bulk replace + apply) |
 | History rewrite: clean-tree check, backup tag kept on the old history, local refs only, cleanup, optional force push with lease (typed FORCE) | V | `git_history::applies_edits_with_real_git`; push path untested |
 

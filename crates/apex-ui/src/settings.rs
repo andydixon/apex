@@ -102,6 +102,10 @@ pub struct Settings {
     pub git_sidebar: bool,
     /// Dim author/date/summary after the caret line.
     pub git_blame_inline: bool,
+    /// `ff-only`, `rebase` or `merge`.
+    pub git_pull_mode: String,
+    /// Fetch in the background every N minutes (0 = never).
+    pub git_auto_fetch_minutes: u64,
     pub completion: bool,
     pub completion_delay_ms: u64,
 }
@@ -193,6 +197,8 @@ impl Default for Settings {
             native_file_dialogs: !cfg!(target_os = "macos"),
             git_sidebar: true,
             git_blame_inline: false,
+            git_pull_mode: "ff-only".into(),
+            git_auto_fetch_minutes: 0,
             completion: true,
             completion_delay_ms: 150,
         }

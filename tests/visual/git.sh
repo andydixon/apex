@@ -104,6 +104,20 @@ title=$(xdotool getwindowname "$WID")
 case "$title" in *commit*) pass "blame opens the commit ($title)";; *) fail "commit view not opened: $title";; esac
 shot g4-commit-view
 key ctrl+w
+# G6: push the local commits, then pull a commit made in another clone.
+command "Push"
+sleep 2
+[ "$(git -C "$REMOTE" log -1 --format=%s main)" = "$(git -C "$REPO" log -1 --format=%s)" ] || fail "push"
+pass "push"
+OTHER="$OUT/other"
+git clone -q "$REMOTE" "$OTHER"
+echo other > "$OTHER/other.txt"
+git -C "$OTHER" add other.txt && git -C "$OTHER" commit -q -m "From another clone" && git -C "$OTHER" push -q
+command "Pull"
+sleep 2
+[ "$(git -C "$REPO" log -1 --format=%s)" = "From another clone" ] || fail "pull"
+pass "pull (fast-forward)"
+
 # History editor: replace the author of every commit, apply, check git.
 git -C "$REPO" add -A && git -C "$REPO" commit -q -m "Work in progress"
 command "Edit Commit History"

@@ -349,6 +349,11 @@ commands! {
     GitToggleBlame => "git.toggle_blame", "Toggle Blame", Git;
     GitShowCommit => "git.show_commit", "Show Commit", Git;
     GitHistoryEditor => "git.edit_history", "Edit Commit History…", Git;
+    GitFetch => "git.fetch", "Fetch", Git;
+    GitPull => "git.pull", "Pull", Git;
+    GitPush => "git.push", "Push", Git;
+    GitForcePush => "git.force_push", "Force Push (with Lease)…", Git;
+    GitSync => "git.sync", "Sync (Pull then Push)", Git;
     GitCancel => "git.cancel", "Cancel Git Command", Git;
 
     // Tools
