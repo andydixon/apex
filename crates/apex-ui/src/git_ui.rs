@@ -166,6 +166,7 @@ impl ApexApp {
         for e in self.git.repos.values_mut() {
             e.dirty = true;
         }
+        self.diff_refresh_bases();
         self.git.base.clear();
         self.git.hunks.clear();
     }
@@ -268,6 +269,10 @@ impl ApexApp {
     pub(crate) fn git_command(&mut self, ctx: &egui::Context, cmd: Command) -> bool {
         match cmd {
             Command::NextChange | Command::PrevChange => {
+                if let Some(tab) = self.active_view_id().and_then(|v| self.diff_tab_of(v)) {
+                    self.diff_jump(tab, cmd == Command::NextChange, false);
+                    return true;
+                }
                 let Some((v, d)) = self.active_ids() else { return true };
                 let hunks = self.git_hunks(d);
                 if hunks.is_empty() {
@@ -318,48 +323,7 @@ impl ApexApp {
                     None => self.set_status("No change at the caret".into(), false),
                 }
             }
-            Command::CompareWithHead | Command::CompareWithIndex | Command::CompareWithSaved => {
-                let Some((_, d)) = self.active_ids() else { return true };
-                let Some(doc) = self.docs.get(&d) else { return true };
-                let Some(path) = doc.path.clone() else {
-                    self.set_status("Save the file first".into(), false);
-                    return true;
-                };
-                let current = doc.text();
-                let (base, label) = match cmd {
-                    Command::CompareWithSaved => {
-                        let fallback = apex_buffer::Encoding::Legacy(encoding_rs::WINDOWS_1252);
-                        (apex_project::fileio::load(&path, None, fallback).ok().map(|l| l.text), "saved")
-                    }
-                    Command::CompareWithHead => {
-                        let prev = self.git.compare_head;
-                        self.git.compare_head = true;
-                        let b = self.git_base_text(d);
-                        self.git.compare_head = prev;
-                        self.git.base.remove(&d);
-                        (b, "HEAD")
-                    }
-                    _ => {
-                        let prev = self.git.compare_head;
-                        self.git.compare_head = false;
-                        let b = self.git_base_text(d);
-                        self.git.compare_head = prev;
-                        self.git.base.remove(&d);
-                        (b, "index")
-                    }
-                };
-                let Some(base) = base else {
-                    self.set_status(format!("No {label} version of this file"), false);
-                    return true;
-                };
-                if base == current {
-                    self.set_status(format!("No differences against {label}"), false);
-                    return true;
-                }
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let diff = git::unified_diff(&base, &current, &format!("{name} ({label})"), &format!("{name} (buffer)"));
-                self.open_scratch_doc(&format!("{name} vs {label}.diff"), &diff, Some("diff"), true, ctx);
-            }
+            Command::CompareWithHead | Command::CompareWithIndex | Command::CompareWithSaved => self.diff_compare_active(ctx, cmd),
             Command::FileHistory => {
                 let Some((_, d)) = self.active_ids() else { return true };
                 let Some(path) = self.docs.get(&d).and_then(|doc| doc.path.clone()) else { return true };

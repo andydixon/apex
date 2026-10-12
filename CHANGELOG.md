@@ -20,6 +20,10 @@ All notable changes to Apex are recorded here. The format follows
   GitHub, GitLab, Bitbucket and Gitea; GitHub pull requests through the
   GitHub CLI: create, status and checks in the status bar, list, check out,
   diff.
+- Side-by-side diff view for Open Changes, staged changes, Compare with
+  Saved/Index/HEAD and `apex --diff`: synchronised scrolling, changed lines
+  and words highlighted, the working copy editable on the right, and per
+  change revert, stage and unstage buttons.
 - Blame (Ctrl+K Ctrl+G): gutter column with author and age, unsaved edits
   shown as not committed, click for the commit view; optional inline blame.
 - Edit Commit History: edit authors, committers, dates and messages across

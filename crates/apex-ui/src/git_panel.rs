@@ -397,7 +397,9 @@ impl ApexApp {
                 return true;
             }
             Command::GitOpenChanges | Command::GitOpenStagedChanges => {
-                self.git_open_changes(ctx, arg.as_deref(), cmd == Command::GitOpenStagedChanges);
+                if let Some((workdir, Some(path))) = self.git_target(arg.as_deref()) {
+                    self.diff_open_changes(ctx, workdir, path, cmd == Command::GitOpenStagedChanges);
+                }
                 return true;
             }
             Command::GitCommit | Command::GitCommitAmend | Command::GitUndoCommit => {}
@@ -496,28 +498,6 @@ impl ApexApp {
 
     fn dirty_docs_in(&self, workdir: &Path) -> usize {
         self.docs.values().filter(|d| d.is_dirty() && d.path.as_ref().is_some_and(|p| p.starts_with(workdir))).count()
-    }
-
-    /// Unified diff of a file's unstaged (index → working tree) or staged
-    /// (HEAD → index) changes in a read-only tab.
-    fn git_open_changes(&mut self, ctx: &egui::Context, arg: Option<&str>, staged: bool) {
-        let Some((workdir, Some(path))) = self.git_target(arg) else { return };
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let index = apex_project::git::file_at(&workdir, &path, false).ok().flatten();
-        let (base, current, labels) = if staged {
-            (apex_project::git::file_at(&workdir, &path, true).ok().flatten(), index, ("HEAD", "index"))
-        } else {
-            let fallback = apex_buffer::Encoding::Legacy(encoding_rs::WINDOWS_1252);
-            let disk = apex_project::fileio::load(&path, None, fallback).ok().map(|l| l.text);
-            (index, disk, ("index", "working tree"))
-        };
-        let (base, current) = (base.unwrap_or_default(), current.unwrap_or_default());
-        if base == current {
-            self.set_status(format!("No {} changes in {name}", if staged { "staged" } else { "unstaged" }), false);
-            return;
-        }
-        let diff = apex_project::git::unified_diff(&base, &current, &format!("{name} ({})", labels.0), &format!("{name} ({})", labels.1));
-        self.open_scratch_doc(&format!("{name} ({} changes).diff", if staged { "staged" } else { "unstaged" }), &diff, Some("diff"), true, ctx);
     }
 }
 

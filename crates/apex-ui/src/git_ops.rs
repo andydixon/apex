@@ -293,21 +293,49 @@ impl ApexApp {
                 let untracked =
                     self.git_entry_for(&workdir, file.as_deref().unwrap_or(Path::new(""))).is_some_and(|e| e.unstaged == Some(FileStatus::Untracked));
                 let what = if cmd == Command::GitStageHunk { "change" } else { "selected lines" };
-                self.git_run("Stage", workdir, move |c| {
-                    if untracked {
-                        c.git(&["add", "-N", "--", &rel], None)?;
-                    }
-                    let diff = c.git_quiet(&["diff", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "-U3", "--", &rel], None)?;
-                    let files = git_cli::parse_patch(&diff);
-                    let f = files.first().ok_or_else(|| format!("{name} has no unstaged changes"))?;
-                    let patch = git_cli::select_new_lines(f, false, &ranges).ok_or_else(|| format!("no unstaged changes in the {what}"))?;
-                    c.git_quiet(&["apply", "--cached", "--whitespace=nowarn", "-"], Some(patch.as_bytes()))?;
-                    Ok(format!("Staged {what} in {name}"))
-                });
+                self.git_stage_ranges(workdir, rel, name, ranges, untracked, what, false);
             }
             _ => {}
         }
         true
+    }
+
+    /// Stage (or, with `unstage`, unstage) the changes touching zero-based
+    /// lines `ranges` of the working file (unstage: of the index version).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn git_stage_ranges(
+        &mut self,
+        workdir: PathBuf,
+        rel: String,
+        name: String,
+        ranges: Vec<std::ops::Range<usize>>,
+        untracked: bool,
+        what: &str,
+        unstage: bool,
+    ) {
+        let what = what.to_string();
+        self.git_run(if unstage { "Unstage" } else { "Stage" }, workdir, move |c| {
+            if untracked && !unstage {
+                c.git(&["add", "-N", "--", &rel], None)?;
+            }
+            let mut diff_args = vec!["diff", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "-U3"];
+            if unstage {
+                diff_args.push("--cached");
+            }
+            diff_args.extend(["--", rel.as_str()]);
+            let diff = c.git_quiet(&diff_args, None)?;
+            let files = git_cli::parse_patch(&diff);
+            let kind = if unstage { "staged" } else { "unstaged" };
+            let f = files.first().ok_or_else(|| format!("{name} has no {kind} changes"))?;
+            let patch = git_cli::select_new_lines(f, unstage, &ranges).ok_or_else(|| format!("no {kind} changes in the {what}"))?;
+            let mut apply = vec!["apply", "--cached", "--whitespace=nowarn"];
+            if unstage {
+                apply.push("--reverse");
+            }
+            apply.push("-");
+            c.git_quiet(&apply, Some(patch.as_bytes()))?;
+            Ok(format!("{} {what} in {name}", if unstage { "Unstaged" } else { "Staged" }))
+        });
     }
 
     /// Fetch, pull, push, force push and sync for the panel's repository.

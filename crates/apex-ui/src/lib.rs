@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod command;
+pub mod diff_ui;
 pub mod editor;
 pub mod file_dialogs;
 pub mod find_in_files;

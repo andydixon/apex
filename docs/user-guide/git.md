@@ -21,9 +21,9 @@ Everything is in the **Git** menu and the command palette.
 * **Revert Hunk** (Edit menu or the gutter's right-click) restores the hunk
   under the caret from the index after confirming. This is the only write.
 * **Show Hunk Diff** pops up the hunk as a unified diff.
-* **Compare with Saved / with Index / with HEAD** opens a read-only unified
-  diff tab with syntax highlighting. `apex --diff old new` does the same for
-  two arbitrary files.
+* **Compare with Saved / with Index / with HEAD** opens a side-by-side diff
+  of the buffer against that version (see below). `apex --diff old new`
+  compares two files the same way.
 * **File History** lists the commits that touched the file; choosing one
   opens that version read-only.
 * **Git Status** opens a palette of changed files; choose one to open it.
@@ -54,6 +54,26 @@ Source Control Panel**) hides it.
   commit after confirming, keeps its changes staged and puts its message
   back in the box.
 * Your hooks run as usual; their output is in the GIT tab.
+
+## Side-by-side diffs
+
+**Open Changes** (double-click a file in the Source Control panel, or the
+Git menu), **Open Staged Changes**, the Compare commands and
+`apex --diff old new` show the two versions next to each other:
+
+* Both sides have syntax colours; removed lines are tinted on the left,
+  added lines on the right, and changed words more strongly. A strip
+  between the sides links each change.
+* When the right side is your file (unstaged changes, Compare with…,
+  `--diff`), it is the real document: edit, undo and save there as usual.
+* The strip's buttons act on one change: **>** replaces it with the left
+  side (an undoable edit), **+** stages it (unstaged changes), **−**
+  unstages it (staged changes). The left side refreshes after staging.
+* The sides scroll together. **Next / Previous** in the header (or Goto >
+  Next Change) jump between changes; **Unified** opens the same comparison
+  as a unified diff.
+* Closing the tab closes both sides; unsaved edits on the right are asked
+  about first.
 
 ## Staging
 

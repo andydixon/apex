@@ -59,7 +59,7 @@ APID=$!
 shot() { import -window root "$OUT/$1.png"; }
 key() { xdotool key --delay 60 "$@"; sleep 0.3; }
 type_text() { xdotool type --delay 30 "$1"; sleep 0.3; }
-command() { key ctrl+shift+p; sleep 0.6; xdotool type --delay 60 "$1"; sleep 0.8; key Return; sleep 1.8; }
+command() { key ctrl+shift+p; sleep 1; xdotool type --delay 80 "$1"; sleep 1; key Return; sleep 2; }
 fail() { echo "FAIL: $*"; shot failure; exit 1; }
 pass() { echo "ok - $*"; }
 
@@ -124,6 +124,17 @@ title=$(xdotool getwindowname "$WID")
 case "$title" in *commit*) pass "blame opens the commit ($title)";; *) fail "commit view not opened: $title";; esac
 shot g4-commit-view
 key ctrl+w
+# G3: side-by-side changes of f.txt; stage the line-2 change from the strip.
+xdotool mousemove 700 300 click 1; sleep 0.3
+command "Open Changes"
+sleep 1.5
+shot g3-side-by-side
+xdotool mousemove 770 107 click 1; sleep 2.5
+git -C "$REPO" diff --cached | grep -q '^+LINE TWO' || fail "stage from the diff view"
+pass "side-by-side diff: stage a change from the strip"
+shot g3-after-stage
+key ctrl+w; sleep 0.5
+
 # G6: push the local commits, then pull a commit made in another clone.
 command "Push"
 sleep 2
@@ -144,9 +155,9 @@ sleep 1
 grep -q "^pr view --json" "$OUT/gh.log" || fail "pr status not requested"
 shot g7-pr-status
 command "Pull Requests…"
-sleep 2
+sleep 4
 shot g7-pr-list
-key Return; sleep 1      # pull request #7 -> its actions
+key Return; sleep 2      # pull request #7 -> its actions
 key Return; sleep 1.5    # "Check out"
 grep -q "^pr checkout 7" "$OUT/gh.log" || fail "pr checkout"
 pass "pull request list and check out"
@@ -165,7 +176,7 @@ git -C "$REPO" switch -q main
 sleep 5
 
 # History editor: replace the author of every commit, apply, check git.
-git -C "$REPO" add -A && git -C "$REPO" commit -q -m "Work in progress"
+git -C "$REPO" add -A && git -C "$REPO" commit -q --allow-empty -m "Work in progress"
 command "Edit Commit History"
 sleep 2
 shot h1-history-editor

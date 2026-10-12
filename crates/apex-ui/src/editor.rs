@@ -64,6 +64,10 @@ pub struct EditorStyle<'a> {
     pub blame: Option<&'a BlameColumn>,
     /// Dim text after the end of this line (current-line blame).
     pub inline_note: Option<(usize, &'a str)>,
+    /// Background tints for whole lines, sorted by line (diff view).
+    pub line_tints: &'a [(usize, egui::Color32)],
+    /// Background tints for character ranges (word-level diff).
+    pub span_tints: &'a [(std::ops::Range<usize>, egui::Color32)],
 }
 
 /// One line's blame annotation.
@@ -998,6 +1002,24 @@ pub fn paint(ui: &mut Ui, rect: Rect, view: &mut View, doc: &Document, style: &E
             if let (Some(first), Some(last)) = (rows_of_line.first(), rows_of_line.last()) {
                 painter.rect_filled(Rect::from_min_max(pos2(geo.text.min.x, first.y), pos2(geo.text.max.x, last.y + lh)), 0.0, ed.current_line);
             }
+        }
+    }
+
+    // Diff tints: whole lines, then changed words.
+    if !style.line_tints.is_empty() {
+        for vr in &rows {
+            if let Ok(i) = style.line_tints.binary_search_by_key(&vr.line, |t| t.0) {
+                painter.rect_filled(Rect::from_min_size(pos2(geo.text.min.x, vr.y), vec2(geo.text.width(), lh)), 0.0, style.line_tints[i].1);
+            }
+        }
+    }
+    if let (Some(first), Some(last)) = (rows.first(), rows.last())
+        && !style.span_tints.is_empty()
+    {
+        let lo = rope.line_to_char(first.line.min(rope.len_lines().saturating_sub(1)));
+        let hi = if last.line + 1 < rope.len_lines() { rope.line_to_char(last.line + 1) } else { rope.len_chars() };
+        for (r, colour) in style.span_tints.iter().filter(|(r, _)| r.end > lo && r.start < hi) {
+            paint_range(ui, &geo, view, doc, style, highlight, &text_painter, &rows, r.start, r.end, *colour, x0, false);
         }
     }
 

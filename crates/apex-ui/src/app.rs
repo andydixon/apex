@@ -229,6 +229,8 @@ pub struct ApexApp {
     pub(crate) file_dialog: Option<crate::file_dialogs::PendingFileDialog>,
     /// For waking the UI from worker threads.
     pub(crate) egui_ctx: Option<egui::Context>,
+    /// Side-by-side diff tabs, keyed by the tab's (left) view.
+    pub(crate) diffs: HashMap<ViewId, crate::diff_ui::DiffState>,
     pub(crate) inbox: Option<crossbeam_channel::Receiver<OpenRequest>>,
     pub(crate) on_view_closed: Option<ViewClosedHook>,
     /// `APEX_FRAME_TIME=1`: show the frame interval in the status bar.
@@ -326,6 +328,7 @@ impl ApexApp {
             settings_panel: Default::default(),
             file_dialog: None,
             egui_ctx: Some(cc.egui_ctx.clone()),
+            diffs: HashMap::new(),
             inbox: args.inbox.clone(),
             on_view_closed: args.on_view_closed.clone(),
             show_frame_time: std::env::var_os("APEX_FRAME_TIME").is_some(),
@@ -401,7 +404,12 @@ impl ApexApp {
     // ----- documents and views ------------------------------------------
 
     pub(crate) fn active_view_id(&self) -> Option<ViewId> {
-        self.panes.get(&self.active_pane)?.active_view()
+        let v = self.panes.get(&self.active_pane)?.active_view()?;
+        // In a diff tab, the side that has focus.
+        match self.diffs.get(&v) {
+            Some(d) if d.right_focused => Some(d.right_view),
+            _ => Some(v),
+        }
     }
 
     pub(crate) fn active_ids(&self) -> Option<(ViewId, DocId)> {
@@ -428,26 +436,9 @@ impl ApexApp {
 
     /// Open a read-only unified diff of two files (`apex --diff old new`).
     pub(crate) fn open_diff(&mut self, ctx: &egui::Context, old: &Path, new: &Path) {
-        let fallback = apex_buffer::Encoding::Legacy(encoding_rs::WINDOWS_1252);
-        let load = |p: &Path| apex_project::fileio::load(p, None, fallback).map(|l| l.text);
-        let (a, b) = match (load(old), load(new)) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Err(e), _) => {
-                self.set_status(format!("Could not read {}: {e}", old.display()), true);
-                return;
-            }
-            (_, Err(e)) => {
-                self.set_status(format!("Could not read {}: {e}", new.display()), true);
-                return;
-            }
-        };
-        let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string());
-        if a == b {
-            self.set_status(format!("{} and {} are identical", name(old), name(new)), false);
-            return;
+        if let Err(e) = self.diff_files(ctx, old, new) {
+            self.set_status(e, true);
         }
-        let diff = apex_project::git::unified_diff(&a, &b, &old.display().to_string(), &new.display().to_string());
-        self.open_scratch_doc(&format!("{} vs {}.diff", name(old), name(new)), &diff, Some("diff"), true, ctx);
     }
 
     /// Requests queued by the platform or a second invocation since the last frame.
@@ -601,6 +592,14 @@ impl ApexApp {
     }
 
     pub(crate) fn close_view_now(&mut self, vid: ViewId) {
+        // Closing either side of a diff closes both.
+        if let Some(tab) = self.diffs.iter().find(|(_, d)| d.right_view == vid).map(|(k, _)| *k) {
+            self.diffs.remove(&tab);
+            self.close_view_now(tab);
+        }
+        if let Some(d) = self.diffs.remove(&vid) {
+            self.close_view_now(d.right_view);
+        }
         let Some(view) = self.views.remove(&vid) else { return };
         for pane in self.panes.values_mut() {
             pane.remove(vid);
@@ -626,6 +625,11 @@ impl ApexApp {
 
     /// Close views, prompting for each dirty document.
     pub(crate) fn request_close(&mut self, views: Vec<ViewId>, then: AfterClose) {
+        // A diff closes as a whole: its tab plus the right-hand view.
+        let mut views: Vec<ViewId> = views.into_iter().map(|v| self.diff_tab_of(v).unwrap_or(v)).collect();
+        views.dedup();
+        let rights: Vec<ViewId> = views.iter().filter_map(|v| self.diffs.get(v).map(|d| d.right_view)).collect();
+        views.extend(rights);
         let dirty: Vec<ViewId> = views
             .iter()
             .copied()
@@ -3509,14 +3513,36 @@ impl ApexApp {
             return;
         };
         let font = editor::font_for(&self.settings, self.font_zoom);
-        let (line_height, char_width) = editor::metrics(ui.ctx(), &font, self.settings.line_height);
+        let (_, char_width) = editor::metrics(ui.ctx(), &font, self.settings.line_height);
         if self.distraction_free {
             let width = (self.settings.distraction_free_width * char_width).min(inner.width());
             let cx = inner.center().x;
             ui.painter().rect_filled(rect, 0.0, self.theme.editor.background);
             inner = Rect::from_min_max(pos2(cx - width / 2.0 - 60.0, inner.min.y), pos2(cx + width / 2.0, inner.max.y));
         }
+        if self.diffs.contains_key(&vid) {
+            self.show_diff(&mut ui, pane_id, vid, inner);
+            return;
+        }
         let focused = pane_id == self.active_pane;
+        self.show_view(&mut ui, pane_id, vid, inner, focused, None, None);
+    }
+
+    /// Draw one editor view into `inner`. `diff_side` = (diff tab, is right
+    /// side) for the two halves of a diff view.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn show_view(
+        &mut self,
+        ui: &mut Ui,
+        pane_id: PaneId,
+        vid: ViewId,
+        inner: Rect,
+        focused: bool,
+        tints: Option<crate::diff_ui::Tints<'_>>,
+        diff_side: Option<(ViewId, bool)>,
+    ) {
+        let font = editor::font_for(&self.settings, self.font_zoom);
+        let (line_height, char_width) = editor::metrics(ui.ctx(), &font, self.settings.line_height);
         let Some(did) = self.views.get(&vid).map(|v| v.doc) else { return };
         let matches: Vec<std::ops::Range<usize>> =
             if self.find.open && self.find.rev.as_ref().is_some_and(|r| r.0 == did) { self.find.matches.clone() } else { Vec::new() };
@@ -3558,6 +3584,8 @@ impl ApexApp {
             block_caret: self.vim_block_caret(),
             blame: blame.as_deref(),
             inline_note: inline_note.as_ref().map(|(l, s)| (*l, s.as_str())),
+            line_tints: tints.map(|t| t.0).unwrap_or(&[]),
+            span_tints: tints.map(|t| t.1).unwrap_or(&[]),
         };
         let muted = settings.muted_syntax || settings.low_distraction;
         let mut actions = Vec::new();
@@ -3567,11 +3595,18 @@ impl ApexApp {
             let highlight = make_highlight(&syntax_cell, doc, &theme, muted);
             let view = self.views.get_mut(&vid).expect("view");
             view.sync(doc);
-            editor::input(&mut ui, inner, view, doc, &style, &mut self.keymap, Some(&highlight), &mut actions);
+            editor::input(ui, inner, view, doc, &style, &mut self.keymap, Some(&highlight), &mut actions);
         }
         for a in actions {
             match a {
-                Action::Focus => self.active_pane = pane_id,
+                Action::Focus => {
+                    self.active_pane = pane_id;
+                    if let Some((tab, right)) = diff_side
+                        && let Some(d) = self.diffs.get_mut(&tab)
+                    {
+                        d.right_focused = right;
+                    }
+                }
                 Action::Insert(t) | Action::ImeCommit(t) => self.insert_text(vid, &t),
                 Action::Paste(t) => {
                     let mode = self.pending_paste_mode.take().unwrap_or_default();
@@ -3611,7 +3646,7 @@ impl ApexApp {
         let highlight = make_highlight(&syntax_cell, doc, &theme, muted);
         let view = self.views.get_mut(&vid).expect("view");
         view.sync(doc);
-        editor::paint(&mut ui, inner, view, doc, &style, Some(&highlight));
+        editor::paint(ui, inner, view, doc, &style, Some(&highlight));
     }
 
     /// Git gutter marks for a document.

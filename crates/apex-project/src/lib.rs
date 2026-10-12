@@ -1,5 +1,6 @@
 //! Workspace-level services that do not depend on the GUI.
 
+pub mod diff_align;
 pub mod fileio;
 pub mod forge;
 pub mod git;
