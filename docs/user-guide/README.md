@@ -1,5 +1,8 @@
 # Apex user guide
 
+A printable PDF of this guide is built from `latex/apex-user-guide.tex`
+with `make guide` (needs pdflatex) into `dist/apex-user-guide.pdf`.
+
 * [Getting started and the command line](getting-started.md)
 * [Editing and multiple cursors](editing.md)
 * [Navigation, Goto Anything and the command palette](navigation.md)

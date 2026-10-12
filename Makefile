@@ -4,7 +4,7 @@
 
 CARGO ?= cargo
 
-.PHONY: build release run test lint fmt check bench fuzz package clean doc
+.PHONY: build release run test lint fmt check bench fuzz package clean doc guide
 
 build:
 	$(CARGO) build --workspace
@@ -35,6 +35,10 @@ bench:
 
 doc:
 	$(CARGO) doc --workspace --no-deps
+
+# PDF user guide (pdflatex) into dist/apex-user-guide.pdf.
+guide:
+	docs/user-guide/latex/build.sh
 
 fuzz:
 	cd fuzz && for t in transactions offsets settings search session; do cargo +nightly fuzz run $$t -- -max_total_time=60; done
