@@ -42,6 +42,7 @@ pub struct GitUi {
     /// Source Control panel state (`git_panel.rs`).
     pub(crate) sc: crate::git_panel::SourceControl,
     pub(crate) blame: crate::git_blame::BlameUi,
+    pub(crate) history: crate::history_ui::HistoryEditor,
 }
 
 impl GitUi {

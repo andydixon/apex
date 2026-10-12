@@ -13,6 +13,14 @@ All notable changes to Apex are recorded here. The format follows
 - Source Control panel in the lower half of the sidebar (`git_sidebar`):
   staged, unstaged and conflicted files with inline actions, a commit box
   (Ctrl+Enter, amend, sign-off, message history), undo last commit.
+- Blame (Ctrl+K Ctrl+G): gutter column with author and age, unsaved edits
+  shown as not committed, click for the commit view; optional inline blame.
+- Edit Commit History: edit authors, committers, dates and messages across
+  the repository, bulk author replacement, date spreading, co-author line
+  removal and a Claude/Codex filter; applies with `git filter-branch` after
+  a backup tag, optionally force-pushing with lease.
+- Open Folder by Path… and the `native_file_dialogs` setting: an in-app path
+  prompt with Tab completion (the default on macOS for now).
 
 ## [0.0.1] - 2026-10-12
 

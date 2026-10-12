@@ -39,7 +39,7 @@ APID=$!
 shot() { import -window root "$OUT/$1.png"; }
 key() { xdotool key --delay 60 "$@"; sleep 0.3; }
 type_text() { xdotool type --delay 30 "$1"; sleep 0.3; }
-command() { key ctrl+shift+p; type_text "$1"; sleep 0.3; key Return; sleep 1.5; }
+command() { key ctrl+shift+p; sleep 0.6; xdotool type --delay 60 "$1"; sleep 0.8; key Return; sleep 1.8; }
 fail() { echo "FAIL: $*"; shot failure; exit 1; }
 pass() { echo "ok - $*"; }
 
@@ -80,7 +80,7 @@ shot g1-git-output
 # G2: commit the staged line from the Source Control panel's message box.
 before=$(git -C "$REPO" rev-list --count HEAD)
 command "Commit"            # empty message: focuses the commit box
-type_text "Shout line fifteen"
+type_text "Shout line fifteen"; sleep 0.7
 key ctrl+Return
 sleep 2
 [ "$(git -C "$REPO" log -1 --format=%s)" = "Shout line fifteen" ] || fail "commit message"
@@ -104,6 +104,28 @@ title=$(xdotool getwindowname "$WID")
 case "$title" in *commit*) pass "blame opens the commit ($title)";; *) fail "commit view not opened: $title";; esac
 shot g4-commit-view
 key ctrl+w
+# History editor: replace the author of every commit, apply, check git.
+git -C "$REPO" add -A && git -C "$REPO" commit -q -m "Work in progress"
+command "Edit Commit History"
+sleep 2
+shot h1-history-editor
+xdotool mousemove 517 100 click 1; sleep 1
+shot h2-replace-author
+xdotool mousemove 637 375 click 1; type_text "tester"
+xdotool mousemove 637 398 click 1; type_text "Renamed Person"
+xdotool mousemove 637 421 click 1; type_text "renamed@example.com"
+xdotool mousemove 460 467 click 1; sleep 1
+xdotool mousemove 107 125 click 1; sleep 1
+shot h3-confirm
+xdotool mousemove 410 457 click 1; sleep 5
+authors=$(git -C "$REPO" log --branches --format=%an | sort -u)
+[ "$authors" = "Renamed Person" ] || fail "history rewrite: authors are $authors"
+tag=$(git -C "$REPO" tag -l 'apex-backup-*' | head -1)
+[ -n "$tag" ] || fail "no backup tag"
+[ "$(git -C "$REPO" log -1 --format=%an "$tag")" = "Tester" ] || fail "backup tag was rewritten"
+[ "$(git -C "$REPO" log --format=%ae -1)" = "renamed@example.com" ] || fail "author email"
+pass "history editor rewrites authors (backup tag kept)"
+shot h4-after-rewrite
 echo new > "$REPO/new.txt"
 sleep 5
 xdotool mousemove 150 306; sleep 1

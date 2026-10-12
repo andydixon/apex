@@ -188,7 +188,9 @@ impl Default for Settings {
             lsp_servers: std::collections::BTreeMap::new(),
             large_file_mb: 64,
             git_gutter: true,
-            native_file_dialogs: true,
+            // ponytail: the system panel hangs Apex on macOS for reasons not yet
+            // found; the in-app prompt is the default there until it is fixed.
+            native_file_dialogs: !cfg!(target_os = "macos"),
             git_sidebar: true,
             git_blame_inline: false,
             completion: true,

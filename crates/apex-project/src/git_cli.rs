@@ -37,6 +37,7 @@ fn base_command(program: &Path, workdir: Option<&Path>) -> Command {
         .env("GIT_PAGER", "cat")
         .env("PAGER", "cat")
         .env("GIT_MERGE_AUTOEDIT", "no")
+        .env("FILTER_BRANCH_SQUELCH_WARNING", "1")
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
         .stdin(Stdio::null());

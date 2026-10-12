@@ -348,6 +348,7 @@ commands! {
     GitOpenStagedChanges => "git.open_staged_changes", "Open Staged Changes", Git;
     GitToggleBlame => "git.toggle_blame", "Toggle Blame", Git;
     GitShowCommit => "git.show_commit", "Show Commit", Git;
+    GitHistoryEditor => "git.edit_history", "Edit Commit History…", Git;
     GitCancel => "git.cancel", "Cancel Git Command", Git;
 
     // Tools

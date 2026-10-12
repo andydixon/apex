@@ -112,6 +112,10 @@ packaging, benchmarks, fuzzing, documentation).
 | Source Control panel in the sidebar (repository chooser, ahead/behind, grouped files, inline actions) | I | screenshot from `tests/visual/git.sh` |
 | Commit (Ctrl+Enter), commit all when nothing staged (confirmed), amend, sign-off, message history | V | `tests/visual/git.sh` (commit, amend) |
 | Undo last commit (soft reset, message restored), open staged/unstaged changes | I | |
+| Blame column (age shading, tooltip, click opens commit), blame of unsaved buffer, status-bar/inline blame | V | `git::blame_tests`, `git_blame` tests; `tests/visual/git.sh` |
+| Commit view (header, message, patch) | V | `git::blame_tests`; `tests/visual/git.sh` |
+| Edit Commit History: per-commit author/committer/date/message, search, Claude/Codex filter, bulk author replace, date spread, co-author removal | V | `git_history` tests; `tests/visual/git.sh` (bulk replace + apply) |
+| History rewrite: clean-tree check, backup tag kept on the old history, local refs only, cleanup, optional force push with lease (typed FORCE) | V | `git_history::applies_edits_with_real_git`; push path untested |
 
 ## Build tasks and language servers
 

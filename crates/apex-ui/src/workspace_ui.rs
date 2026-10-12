@@ -240,17 +240,36 @@ impl ApexApp {
         {
             self.sidebar.reveal(p);
         }
-        if self.git_panel_visible() {
-            let half = (ui.available_height() * 0.5).max(160.0);
-            egui::Panel::bottom("apex-source-control")
-                .resizable(true)
-                .default_size(half)
-                .min_size(120.0)
-                .max_size((ui.available_height() - 80.0).max(120.0))
-                .frame(egui::Frame::new().fill(theme.ui.sidebar))
-                .show(ui, |ui| self.show_source_control(ui));
-        }
-        let actions = self.sidebar.ui(ui, &theme, ui_font, active_file.as_deref());
+        let actions = if self.git_panel_visible() {
+            // Folders above, Source Control below, split by a draggable handle.
+            let full = ui.available_rect_before_wrap();
+            let frac = self.git.sc.split.clamp(0.15, 0.85);
+            let sc_h = (full.height() * frac).clamp(120.0_f32.min(full.height() * 0.5), (full.height() - 80.0).max(120.0));
+            let split_y = full.max.y - sc_h;
+            let top = egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, split_y - 2.0));
+            let bottom = egui::Rect::from_min_max(egui::pos2(full.min.x, split_y + 2.0), full.max);
+            let actions = ui.scope_builder(egui::UiBuilder::new().max_rect(top), |ui| {
+                ui.set_clip_rect(top.intersect(ui.clip_rect()));
+                self.sidebar.ui(ui, &theme, ui_font, active_file.as_deref())
+            });
+            let handle = egui::Rect::from_min_max(egui::pos2(full.min.x, split_y - 3.0), egui::pos2(full.max.x, split_y + 3.0));
+            let r = ui.interact(handle, ui.id().with("git-split"), egui::Sense::drag());
+            if r.dragged() && full.height() > 0.0 {
+                self.git.sc.split = ((full.max.y - r.interact_pointer_pos().map(|p| p.y).unwrap_or(split_y)) / full.height()).clamp(0.15, 0.85);
+            }
+            if r.hovered() || r.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            }
+            ui.painter().hline(full.x_range(), split_y, egui::Stroke::new(1.0, if r.hovered() || r.dragged() { theme.ui.accent } else { theme.ui.border }));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(bottom), |ui| {
+                ui.set_clip_rect(bottom.intersect(ui.clip_rect()));
+                self.show_source_control(ui);
+            });
+            ui.allocate_rect(full, egui::Sense::hover());
+            actions.inner
+        } else {
+            self.sidebar.ui(ui, &theme, ui_font, active_file.as_deref())
+        };
         for a in actions {
             self.handle_sidebar_action(ui.ctx(), a);
         }

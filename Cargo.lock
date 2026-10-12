@@ -369,6 +369,7 @@ dependencies = [
  "eframe",
  "egui",
  "encoding_rs",
+ "fastrand",
  "libc",
  "nucleo-matcher",
  "regex",

@@ -12,8 +12,9 @@ use crate::app::ApexApp;
 use crate::command::Command;
 use crate::git_ops::rel_path;
 
-#[derive(Default)]
 pub struct SourceControl {
+    /// Share of the sidebar height given to the panel.
+    pub split: f32,
     /// Repository shown (work tree); follows the active file when unset.
     pub repo: Option<PathBuf>,
     pub message: String,
@@ -24,6 +25,22 @@ pub struct SourceControl {
     history_pos: Option<usize>,
     pub focus_message: bool,
     selected: Option<PathBuf>,
+}
+
+impl Default for SourceControl {
+    fn default() -> Self {
+        Self {
+            split: 0.5,
+            repo: None,
+            message: String::new(),
+            amend: false,
+            signoff: false,
+            history: Vec::new(),
+            history_pos: None,
+            focus_message: false,
+            selected: None,
+        }
+    }
 }
 
 fn letter(s: FileStatus) -> &'static str {

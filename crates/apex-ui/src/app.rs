@@ -920,6 +920,7 @@ impl ApexApp {
             || self.git_ops_command(cmd, arg.clone())
             || self.git_commit_command(ctx, cmd, arg.clone())
             || self.git_blame_command(ctx, cmd, arg.clone())
+            || self.history_command(cmd, arg.clone())
             || self.tasks_command(ctx, cmd, arg.clone())
             || self.lsp_command(ctx, cmd, arg.clone())
             || self.spell_command(cmd)
@@ -2619,6 +2620,8 @@ impl ApexApp {
                     item(ui, &mut q, c);
                 }
                 ui.separator();
+                item(ui, &mut q, Command::GitHistoryEditor);
+                ui.separator();
                 item(ui, &mut q, Command::GitCancel);
             });
             ui.menu_button("Tools", |ui| {
@@ -3883,6 +3886,7 @@ impl eframe::App for ApexApp {
         }
         self.lsp_overlays(&ctx);
         self.show_settings_panel(&ctx);
+        self.show_history_editor(&ctx);
         self.show_palette(&ctx);
         self.show_dialogs(&ctx);
         self.show_editor_context_menu(&ctx);

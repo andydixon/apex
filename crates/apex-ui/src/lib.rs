@@ -9,6 +9,7 @@ pub mod git_blame;
 pub mod git_ops;
 pub mod git_panel;
 pub mod git_ui;
+pub mod history_ui;
 pub mod keymap;
 pub mod lsp_ui;
 pub mod palette;

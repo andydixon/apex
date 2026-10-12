@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+fastrand = "2"
 directories.workspace = true
 rfd.workspace = true
 apex-buffer.workspace = true

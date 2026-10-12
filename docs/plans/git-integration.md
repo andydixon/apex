@@ -1,6 +1,6 @@
 # Plan: Git and GitHub integration
 
-Status: in progress. Done: G1, G2. Order: G1 → G2 → G4 → G6 → G7 (small,
+Status: in progress. Done: G1, G2, G4, G8. Order: G1 → G2 → G4 → G6 → G7 (small,
 then medium) → G3 → G5 (large). `FEATURE_MATRIX.md` tracks what exists.
 
 ## Where we start
@@ -135,6 +135,13 @@ and changelog updates, and a commit.
   * Checks: list check runs for the branch with links.
 * Later (not in this plan): inline PR review comments, Actions logs,
   issue creation.
+
+### G8 — Edit Commit History (requested)
+
+A GUI version of the Nexus history editor for the workspace repository:
+per-commit metadata and message edits, bulk author replace, date spread,
+co-author/session line removal, Claude/Codex filter, apply via
+`git filter-branch` with a backup tag, optional force push with lease.
 
 ## Testing
 

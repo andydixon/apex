@@ -68,6 +68,50 @@ Source Control Panel**) hides it.
 * Right-click in the editor for Stage Change / Stage Selected Lines /
   Revert Change.
 
+## Blame
+
+**Git > Toggle Blame** (Ctrl+K Ctrl+G) adds a column to the gutter with the
+author and age of the commit that last changed each line, shaded so newer
+changes stand out. Unsaved edits show as *Not committed*. Hover for the full
+commit message; click to open the commit (header, message and patch) in a
+read-only tab, as does **Git > Show Commit** for the caret line. With blame
+on, the status bar shows the caret line's author, age and summary;
+`git_blame_inline = true` also writes it after the caret line.
+
+## Edit Commit History
+
+**Git > Edit Commit History…** opens an editor for the metadata of every
+commit in the workspace folder's repository (all branches and tags), newest
+first. Nothing changes until you apply.
+
+* Select a commit to edit its author and committer (name, email, date) and
+  its message. Dates take `YYYY-MM-DD HH:MM[:SS]` with an optional
+  `±HH:MM` offset (without one, your local time zone applies); **Calendar…**
+  picks a day and time, **Now** sets the current time. Edited commits are
+  marked with a dot; **Reset commit** undoes the edits to one commit.
+* Search filters by hash, author, email or message. **Claude/Codex only**
+  lists commits whose author, committer or message mentions Claude, Codex
+  or Anthropic, and merges that brought such commits in.
+* **Replace author…** sets a new author on every commit whose author name or
+  email matches (any part, ignoring case, or exactly).
+* **Rewrite dates…** gives every commit a random time on a day in a range,
+  inside a daily window (for example 09:00–17:00), keeping the order of
+  commits.
+* **Remove co-author lines** drops `Co-authored-by:` trailers and
+  `Claude-Session:` lines from every message on apply; Claude/Codex
+  attribution blocks are removed whole.
+* **Apply** lists the commits that will change and asks first. The
+  repository must have no uncommitted changes. Apex tags the current HEAD
+  as `apex-backup-<time>`, rewrites local branches and tags with
+  `git filter-branch`, then removes filter-branch's `refs/original` and
+  prunes. To go back: `git reset --hard apex-backup-<time>`.
+* **Force push** (and **Push tags**) then pushes every branch to `origin`
+  with `--force-with-lease`; you must type `FORCE` to confirm. Anyone who
+  has the old history must re-clone or reset.
+
+Rewriting history gives every changed commit, and every commit after it, a
+new hash. Coordinate with anyone else using the repository first.
+
 ## Git output
 
 Every command Apex runs, with its output, is shown in the **GIT** tab of the
