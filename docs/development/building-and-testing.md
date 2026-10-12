@@ -21,6 +21,9 @@ README. No other system libraries: the GUI stack (egui, wgpu, winit), git
 | `make package` | `packaging/package.sh` for the current platform |
 | `make doc` | `cargo doc --workspace --no-deps` |
 
+`tests/check-macos.sh` type-checks and lints the macOS-only code from Linux
+(needs `rustup target add aarch64-apple-darwin`; nothing is linked).
+
 CI (`.github/workflows/ci.yml`) runs format check, clippy, tests and a
 release build on Linux, Windows and macOS.
 

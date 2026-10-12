@@ -65,6 +65,10 @@ All notable changes to Apex are recorded here. The format follows
   the main queue outside winit's event handler (starting it inside the
   handler hung before the panel appeared). A dialog that never answers no
   longer blocks the next one.
+- macOS: double-clicking a document or Finder's Open With reached AppKit's
+  default handler ("Apex cannot open files in the … format"); Apex's
+  open-documents handler is now installed as launching finishes, after
+  AppKit's own.
 - The macOS Dock icon (and the window icon elsewhere) is Apex's icon instead
   of egui's default logo, which eframe installed at run time.
 - `make release` now also produces the platform package (`Apex.app` and DMG
