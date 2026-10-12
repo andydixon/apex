@@ -1,6 +1,6 @@
 # Security review
 
-Scope: Apex 0.0.1 as built from this repository. This is a review of the
+Scope: Apex 0.0.1 as built from this repository, including the Git and GitHub integration added after the 0.0.1 tag. This is a review of the
 trust boundaries in the code, what each one relies on, and what is known to
 be missing. It complements `SECURITY.md` (reporting, threat model) and
 `docs/security/file-handling.md` (data integrity).
@@ -128,11 +128,38 @@ and open files in the editor — equivalent to what it could do by running
   directory and are deleted when the file is saved or the restore is
   declined.
 
-## 7. Git
+## 7. Git and GitHub
 
-* libgit2 is used read-only except **Revert Hunk**, which rewrites the
-  buffer (not the repository) and requires confirmation. Hooks are never
-  executed because Apex never commits, checks out or merges.
+* **Reading** (status, gutter marks, blame, log, branches, diffs) uses
+  libgit2 and runs no programs, so it works in untrusted folders.
+* **Writing and network** (staging, commits, branches, merges, stash,
+  fetch/pull/push, history rewriting) run the user's `git`, and GitHub
+  features run the GitHub CLI `gh`. `git` executes repository hooks and
+  config-named programs (`core.fsmonitor`, `core.sshCommand`, filters), so
+  every such command requires the folder to be **trusted** (the same
+  prompt as build tasks). Arguments are passed as an argv list, never
+  through a shell; commit messages and patches go through stdin.
+* Commands run with `GIT_TERMINAL_PROMPT=0`, `GH_PROMPT_DISABLED=1`, no
+  stdin and, on Unix, in a new session (`setsid`) so nothing can wait on a
+  terminal the user cannot see; a job can be cancelled (process group
+  killed).
+* **Credentials**: Apex never stores passwords or tokens. When git or ssh
+  needs one, it runs Apex itself as `GIT_ASKPASS`/`SSH_ASKPASS`; the helper
+  connects to a loopback listener opened for that one job (random port,
+  random token checked per connection), the prompt is shown in a dialog,
+  and the answer is written back once. The listener closes when the job
+  ends; an unanswered prompt times out after ten minutes. `gh` keeps its
+  own login.
+* **Destructive operations ask first**: discard changes, undo commit,
+  force push (with lease), branch delete, stash drop, abort merge/rebase,
+  revert commit, detached checkout. **Edit Commit History** refuses a dirty
+  tree, tags a backup that keeps pointing at the old history, rewrites only
+  local branches and tags, and needs `FORCE` typed before a force push.
+  Its filter scripts are written to a private (0700) temporary directory
+  with every value single-quoted for `sh`, and deleted afterwards.
+* **Links**: remote URLs are built from the configured remote and only
+  `https://` links are passed to the system's opener; path segments are
+  percent-encoded.
 
 ## 8. Dependencies and build
 
@@ -162,6 +189,12 @@ and open files in the editor — equivalent to what it could do by running
    open files, which is the platform's normal behaviour.
 6. **Windows runtime directory permissions** rely on the profile ACLs
    rather than explicit 0600 modes.
+7. **Askpass token strength.** The per-job token comes from the standard
+   library's randomly keyed hasher rather than a dedicated CSPRNG. The
+   listener is loopback-only and lives for one job, so another local
+   process would need to guess it during that window.
+8. **Trusted repositories run hooks.** Trusting a folder lets its hooks
+   run whenever Apex runs `git` there, exactly as on the command line.
 
 ## Verification performed
 

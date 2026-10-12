@@ -89,7 +89,7 @@ pub fn load(c: &JobCtx) -> Result<(RepoFacts, Vec<CommitRecord>), String> {
     let origin = c.git_quiet(&["remote", "get-url", "origin"], None).ok().map(|s| s.trim().to_string());
     let ident = c.git_quiet(&["var", "GIT_COMMITTER_IDENT"], None).unwrap_or_default();
     let local_offset = ident.split_whitespace().last().and_then(parse_offset).unwrap_or(0);
-    let log = match c.git_quiet(&["log", "--all", "--reverse", "--date=iso-strict", LOG_FORMAT], None) {
+    let log = match c.git_quiet(&["log", "--all", "--topo-order", "--reverse", "--date=iso-strict", LOG_FORMAT], None) {
         Ok(l) => l,
         // A repository without commits has nothing to edit.
         Err(e) if e.contains("does not have any commits") => String::new(),

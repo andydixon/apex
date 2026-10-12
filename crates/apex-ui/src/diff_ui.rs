@@ -305,9 +305,12 @@ impl ApexApp {
 
     fn diff_sync_scroll(&mut self, tab: ViewId, blocks: &[Block]) -> bool {
         let (Some(now), Some(st)) = (self.diff_positions(tab), self.diffs.get(&tab)) else { return false };
-        let Some(last) = st.last else { return false };
         let right_view = st.right_view;
-        let (left_moved, right_moved) = (now.0 != last.0 || now.1 != last.1, now.2 != last.2 || now.3 != last.3);
+        // First frame: the focused side (where the first change was put in view) leads.
+        let (left_moved, right_moved) = match st.last {
+            Some(last) => (now.0 != last.0 || now.1 != last.1, now.2 != last.2 || now.3 != last.3),
+            None => (!st.right_focused, st.right_focused),
+        };
         if left_moved {
             let target = diff_align::map_line(blocks, now.0 as f32, true).round() as usize;
             if let Some(r) = self.views.get_mut(&right_view) {

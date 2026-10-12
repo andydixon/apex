@@ -3590,9 +3590,10 @@ impl ApexApp {
         self.syntax_tick(did);
         let fold_regions = self.fold_regions_for(did);
         let git_marks = self.git_marks_for(did);
-        let blame = self.git_blame_column(did, char_width);
+        // Blame belongs to the file's own tab, not to the halves of a diff.
+        let blame = if diff_side.is_none() { self.git_blame_column(did, char_width) } else { None };
         let conflict_tints = if tints.is_none() { self.git_conflicts(did).map(|(t, _)| t) } else { None };
-        let inline_note = if self.settings.git_blame_inline && focused { self.git_blame_caret_note() } else { None };
+        let inline_note = if self.settings.git_blame_inline && focused && diff_side.is_none() { self.git_blame_caret_note() } else { None };
         let mut diagnostics = self.diagnostics_for(did);
         if self.spell_enabled_for(did) {
             let (first, count) = {

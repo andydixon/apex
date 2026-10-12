@@ -39,8 +39,11 @@ Everything works offline.
 * **Files**: encodings (UTF-8/16, Windows-125x, ISO-8859, CJK) and line
   endings detected, converted and preserved; atomic saves that never
   overwrite a file another program changed; large-file mode; hex preview.
-* **Git**: gutter marks, branch in the status bar, hunk navigation, revert
-  hunk, compare with index/HEAD/saved, file history, status palette.
+* **Git**: gutter marks, a Source Control panel (stage files, hunks or
+  lines, commit, amend), side-by-side diffs with per-change stage/revert,
+  blame, branches, log graph, stash, merge-conflict resolution,
+  fetch/pull/push with a credential prompt, commit-history editing, and
+  GitHub pull requests through the GitHub CLI.
 * **Build tasks** with trust gating, problem matchers and a Problems panel.
 * **Language servers** (optional): completion, diagnostics, hover, signature
   help, go to definition/references, rename, code actions, formatting.
@@ -58,6 +61,8 @@ Everything works offline.
 | ![Multiple cursors](docs/screenshots/multi-cursor.png) | ![Goto Anything](docs/screenshots/goto-anything.png) |
 | ![Find in Files](docs/screenshots/find-in-files.png) | ![Settings](docs/screenshots/settings.png) |
 | ![Light theme, split panes](docs/screenshots/light-theme-split.png) | ![Vim mode](docs/screenshots/vim-mode.png) |
+| ![Side-by-side diff and Source Control](docs/screenshots/git-side-by-side.png) | ![Git log](docs/screenshots/git-log.png) |
+| ![Merge conflict](docs/screenshots/git-conflict.png) | ![Edit commit history](docs/screenshots/git-history-editor.png) |
 
 ## Installation
 

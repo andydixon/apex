@@ -345,11 +345,11 @@ impl ApexApp {
                                 label: format!("{}  {}", e.short_id, e.summary),
                                 detail: format!("{}  {}", e.date, e.author),
                                 shortcut: String::new(),
-                                payload: Payload::Text(e.id.clone()),
+                                payload: Payload::Command(Command::GitShowCommit, Some(e.id.clone())),
                                 boost: 0,
                             })
                             .collect();
-                        self.palette.show_with(PaletteMode::Prompt("history".into()), items, "File history (Enter copies the commit id)", "");
+                        self.palette.show_with(PaletteMode::Prompt("history".into()), items, "File history (Enter shows the commit)", "");
                     }
                     Err(e) => self.set_status(format!("History failed: {}", e.message()), true),
                 }

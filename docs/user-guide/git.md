@@ -12,20 +12,24 @@ tasks). Untrusted folders keep the read-only features.
 
 Everything is in the **Git** menu and the command palette.
 
+![Side-by-side diff with the Source Control panel](../screenshots/git-side-by-side.png)
+
 * **Gutter marks** next to the line numbers show added, modified and deleted
   lines relative to the index (or `HEAD`, see below). They update as you
   type and after each save; the minimap shows them too.
 * **Status bar** shows the current branch (or a short commit id when
-  detached). The sidebar marks changed, added and untracked files.
+  detached) with commits to push and pull, the branch's pull request, and
+  any merge or rebase in progress. The folder tree marks changed, added,
+  untracked and conflicted files.
 * **Goto > Next Change / Previous Change** jump between hunks.
-* **Revert Hunk** (Edit menu or the gutter's right-click) restores the hunk
-  under the caret from the index after confirming. This is the only write.
+* **Revert Change…** (Git menu or right-click) restores the hunk under the
+  caret from the index after confirming, as an undoable edit of the buffer.
 * **Show Hunk Diff** pops up the hunk as a unified diff.
 * **Compare with Saved / with Index / with HEAD** opens a side-by-side diff
   of the buffer against that version (see below). `apex --diff old new`
   compares two files the same way.
 * **File History** lists the commits that touched the file; choosing one
-  opens that version read-only.
+  shows that commit.
 * **Git Status** opens a palette of changed files; choose one to open it.
 
 Settings: `git_gutter = false` turns the marks off. Large repositories are
@@ -161,6 +165,8 @@ holds your GitHub login; Apex stores no tokens. Install it and run
 
 ## Merge conflicts
 
+![A merge conflict in the editor](../screenshots/git-conflict.png)
+
 When a merge, rebase, cherry-pick or revert stops on conflicts, the status
 bar and the Source Control panel say so, and the conflicted files are listed
 under **Merge conflicts**.
@@ -188,6 +194,8 @@ on, the status bar shows the caret line's author, age and summary;
 `git_blame_inline = true` also writes it after the caret line.
 
 ## Edit Commit History
+
+![Edit Commit History](../screenshots/git-history-editor.png)
 
 **Git > Edit Commit History…** opens an editor for the metadata of every
 commit in the workspace folder's repository (all branches and tags), newest

@@ -87,4 +87,72 @@ start "$ROOT/crates/apex-edit/src/ops.rs"
 type_text "20jVjj"
 shot vim-mode 1.0
 stop
+# 9–12. Git: a small demo repository with a merged feature branch.
+export GIT_AUTHOR_NAME="Ada Lovelace" GIT_AUTHOR_EMAIL=ada@example.com GIT_COMMITTER_NAME="Ada Lovelace" GIT_COMMITTER_EMAIL=ada@example.com
+DEMO="$WORK/demo"
+g() { git -C "$DEMO" "$@"; }
+mkdir -p "$DEMO/src"
+g init -q -b main && g config commit.gpgsign false
+cat > "$DEMO/src/search.rs" <<'RS'
+//! Simple substring search over lines.
+
+pub struct Match {
+    pub line: usize,
+    pub column: usize,
+}
+
+/// Every occurrence of `needle` in `text`.
+pub fn find_all(text: &str, needle: &str) -> Vec<Match> {
+    let mut out = Vec::new();
+    for (line, l) in text.lines().enumerate() {
+        let mut start = 0;
+        while let Some(i) = l[start..].find(needle) {
+            out.push(Match { line, column: start + i });
+            start += i + needle.len();
+        }
+    }
+    out
+}
+
+/// The first occurrence, if any.
+pub fn find_first(text: &str, needle: &str) -> Option<Match> {
+    find_all(text, needle).into_iter().next()
+}
+RS
+printf '# demo\n' > "$DEMO/README.md"
+g add -A && g commit -q -m "Add substring search"
+g switch -q -c feature/case-insensitive
+sed -i 's|/// Every occurrence of `needle` in `text`.|/// Every occurrence of `needle` in `text`, ignoring case.|; s|        while let Some(i) = l\[start..\].find(needle) {|        let l = l.to_lowercase();\n        while let Some(i) = l[start..].find(\&needle.to_lowercase()) {|' "$DEMO/src/search.rs"
+g commit -q -am "Ignore case when searching"
+printf '# demo\n\nCase-insensitive search.\n' > "$DEMO/README.md"
+g commit -q -am "Document case-insensitive search"
+g switch -q main
+printf '# demo\n' > "$DEMO/README.md"; printf 'MIT\n' > "$DEMO/LICENSE"
+g add -A && g commit -q -m "Add licence"
+g merge -q --no-edit feature/case-insensitive
+g tag v0.1.0
+# A working change to show side by side.
+sed -i 's|    find_all(text, needle).into_iter().next()|    // Stop at the first match instead of collecting them all.\n    find_all(text, needle).into_iter().min_by_key(\|m\| (m.line, m.column))|' "$DEMO/src/search.rs"
+mkdir -p "$WORK/data-$((RUN + 1))" && printf '["%s"]' "$DEMO" > "$WORK/data-$((RUN + 1))/trusted.json"
+printf 'minimap = false\n' > "$APEX_CONFIG_DIR/settings.toml"
+start "$DEMO" "$DEMO/src/search.rs"
+xdotool mousemove 700 300 click 1; sleep 0.3
+keys ctrl+shift+p; type_text "Open Changes"; keys Return
+shot git-side-by-side 2.0
+keys ctrl+shift+p; type_text "Show Log"; keys Return
+shot git-log 2.5
+keys Escape
+keys ctrl+shift+p; type_text "Edit Commit History"; keys Return
+shot git-history-editor 3.0
+stop
+# A conflicting merge, resolved in the editor.
+g stash -q
+g switch -q -c topic && sed -i 's|pub line: usize,|pub line: u32,|' "$DEMO/src/search.rs" && g commit -q -am "Narrow line numbers"
+g switch -q main && sed -i 's|pub line: usize,|pub row: usize,|' "$DEMO/src/search.rs" && g commit -q -am "Rename line to row"
+g merge -q topic >/dev/null 2>&1 || true
+start "$DEMO" "$DEMO/src/search.rs"
+xdotool mousemove 700 300 click 1; sleep 0.3
+keys ctrl+shift+p; type_text "Next Conflict"; keys Return
+shot git-conflict 1.5
+stop
 echo "screenshots in $OUT"

@@ -134,24 +134,66 @@ Not done on the authors' machines (needs the platform):
 Known gaps carried in `FEATURE_MATRIX.md`: one OS window per process,
 screen-reader access to the editor text, whole-file loading.
 
+## Milestone 13 — Git and GitHub integration (complete)
+
+Plan: `docs/plans/git-integration.md` (phases G1–G8). Reads stay on libgit2;
+everything that writes or reaches a remote runs the user's `git` (or `gh`)
+as a background job, trust-gated, with output in the GIT tab.
+
+* G1 staging (file, hunk, selected lines via partial patches), Git menu.
+* G2 Source Control panel in the lower sidebar; commit, amend, sign-off,
+  undo commit.
+* G3 side-by-side diff: two editor views, aligned scrolling, line and word
+  tints, per-change revert/stage/unstage.
+* G4 blame column, inline blame, commit view.
+* G5 branches, log with lane graph, line history, stash, merge conflicts
+  with continue/abort.
+* G6 fetch/pull/push/sync/force-push with lease, askpass dialog.
+* G7 remote links (GitHub, GitLab, Bitbucket, Gitea) and GitHub pull
+  requests through `gh`.
+* G8 Edit Commit History (requested): metadata/message editing, bulk author
+  replace, date spread, co-author removal, Claude/Codex filter.
+
+Verification: unit tests against real `git` in temporary repositories
+(partial staging round trips, askpass via `git credential fill`, history
+rewrite and backup tag, merge state and conflict parsing, log graph);
+`tests/visual/git.sh` drives the real editor under Xvfb through staging,
+commit/amend, blame, side-by-side staging, push/pull against a local bare
+remote, GitHub flows against a fake `gh`, branches, stash, a full conflict
+resolution and a history rewrite, checking every result with `git`.
+Not verified here: real GitHub (needs `gh auth login`), the native macOS file
+dialog (hangs inside AppKit's panel creation; in-app prompt is the macOS
+default meanwhile — see "Next step").
+
+Fixed along the way: the backup tag of a history rewrite was itself
+rewritten (Nexus had the same flaw); remote-tracking refs are no longer
+rewritten; Ctrl+Enter used the frame's modifiers instead of the event's;
+exact command names now win in the palette; Finder "Open With" handler is
+installed after AppKit's own; the Dock icon is Apex's.
+
 ## Test status
 
-Last full run (`cargo test --workspace`, 12 October 2026):
+Last full run (`cargo test --workspace`, 12 October 2026, after the Git work):
 
 | Crate | Passed |
 |---|---|
 | apex-app | 2 |
 | apex-buffer | 16 |
 | apex-edit | 42 (+ 8 property tests) |
-| apex-project | 25 |
+| apex-project | 47 |
 | apex-syntax | 15 (+1 ignored timing probe) |
-| apex-ui | 38 |
+| apex-ui | 44 |
 
 `cargo clippy --workspace --all-targets -- -D warnings` and
 `cargo fmt --all -- --check` clean.
 
 ## Next step
 
-Verify the macOS and Windows packaging scripts on those platforms (CI will
-exercise them on the next push), then tag v0.0.1 following
-`docs/development/release-process.md`.
+1. macOS: find why AppKit's open/save panel service never attaches to Apex
+   (the sample shows `-[NSSavePanel _initBridgeAndStuff]` waiting); try an
+   unbundled `cargo run`, check `codesign --verify`, and read the
+   `com.apple.ViewBridge` log during the hang. Then make the native dialog
+   the macOS default again.
+2. Check Finder "Open With" and the Dock icon on macOS.
+3. Try the GitHub features against a real repository after `gh auth login`.
+4. Tag the next release following `docs/development/release-process.md`.
