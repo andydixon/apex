@@ -24,6 +24,8 @@ globset = "0.4"
 encoding_rs.workspace = true
 git2.workspace = true
 similar = "2"
+# OS CSPRNG for local authentication tokens (token.rs); already in the tree via other crates.
+getrandom = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

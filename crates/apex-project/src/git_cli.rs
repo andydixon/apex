@@ -39,11 +39,17 @@ pub fn available() -> bool {
     *OK.get_or_init(|| base_command(&program(), None).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()))
 }
 
+/// A `Command` for `program` (optionally in `workdir`) set up for unattended use:
+/// no terminal prompts, no pager, no colour, no auto-edited merge messages, and
+/// stdin closed. On Unix the child calls `setsid`; on Windows it gets no console.
 fn base_command(program: &Path, workdir: Option<&Path>) -> Command {
     let mut c = Command::new(program);
     if let Some(w) = workdir {
         c.current_dir(w);
     }
+    // Every variable here stops git (or something it runs) from waiting on
+    // a terminal or an editor the user cannot see, or from decorating output
+    // that is parsed or shown verbatim in the Git log.
     c.env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat")
         .env("PAGER", "cat")
@@ -68,6 +74,7 @@ fn base_command(program: &Path, workdir: Option<&Path>) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        /// Win32 process creation flag: do not open a console window.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         c.creation_flags(CREATE_NO_WINDOW);
     }
@@ -89,13 +96,20 @@ pub enum JobEvent {
 
 /// Handle to a running job; dropping it does not cancel.
 pub struct GitJob {
+    /// Short description shown in the UI (for example `"push"`).
     pub label: String,
+    /// Events from the job, ending with [`JobEvent::Finished`].
     pub rx: Receiver<JobEvent>,
+    /// When the job was started, for elapsed-time display.
     pub started: Instant,
+    /// Shared with the worker; set by [`GitJob::cancel`].
     cancel: Arc<AtomicBool>,
 }
 
 impl GitJob {
+    /// Ask the job to stop: the running command's process group is killed at
+    /// its next poll, later commands fail with `"cancelled"`, and any pending
+    /// askpass prompt is answered with a cancel.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -103,10 +117,14 @@ impl GitJob {
 
 /// Passed to a job's body: runs commands in the repository.
 pub struct JobCtx {
+    /// Working directory for every command the job runs.
     pub workdir: PathBuf,
+    /// Event channel back to the [`GitJob`] handle.
     tx: Sender<JobEvent>,
+    /// Shared cancellation flag, polled while commands run.
     cancel: Arc<AtomicBool>,
-    /// (port, token) of this job's askpass listener.
+    /// (port, token) of this job's askpass listener; `None` if it could not
+    /// be started, in which case prompts are not relayed and simply fail.
     askpass: Option<(u16, String)>,
 }
 
@@ -126,22 +144,31 @@ impl JobCtx {
         self.run_program(&gh_program(), "gh", args, stdin, false)
     }
 
+    /// Send a line to the Git log. Ignored if the UI has dropped the receiver.
     pub fn log(&self, line: impl Into<String>) {
         let _ = self.tx.send(JobEvent::Log(line.into()));
     }
 
+    /// Whether the job has been cancelled; long job bodies should check this.
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
 
+    /// Run `git` with `args`; see [`run_program`](Self::run_program).
     fn run(&self, args: &[&str], stdin: Option<&[u8]>, log_stdout: bool) -> Result<String, String> {
         self.run_program(&program(), "git", args, stdin, log_stdout)
     }
 
+    /// Spawn `prog` (displayed as `name`) in the work directory, wait for it,
+    /// and return its stdout. stderr is streamed to the log as it arrives
+    /// (`\r`-terminated lines as [`JobEvent::Progress`]), stdout is logged after
+    /// exit if `log_stdout`. Errors: spawn failure, cancellation, or a non-zero
+    /// exit, reported as the last `fatal:`/`error:` stderr line if there is one.
     fn run_program(&self, prog: &Path, name: &str, args: &[&str], stdin: Option<&[u8]>, log_stdout: bool) -> Result<String, String> {
         if self.cancelled() {
             return Err("cancelled".into());
         }
+        // Arguments are quoted only for display; the command is not run via a shell.
         self.log(format!("$ {name} {}", args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")));
         let mut cmd = base_command(prog, Some(&self.workdir));
         if name == "git" {
@@ -149,6 +176,8 @@ impl JobCtx {
         } else {
             cmd.env("GH_PROMPT_DISABLED", "1").env("GH_NO_UPDATE_NOTIFIER", "1").env("GH_SPINNER_DISABLED", "1");
         }
+        // Credentials are only relayed, never stored: the helper passes each
+        // answer straight back to git/ssh over the loopback socket.
         cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
         if let Some((port, token)) = &self.askpass
             && let Some(exe) = askpass_program()
@@ -167,11 +196,15 @@ impl JobCtx {
         let mut child = cmd.spawn().map_err(|e| format!("could not run {name}: {e}"))?;
         if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
             // Small payloads (messages, patches); written before reading.
+            // A separate thread avoids deadlock if the child fills its stdout
+            // pipe before consuming all of stdin.
             let data = data.to_vec();
             std::thread::spawn(move || {
                 let _ = pipe.write_all(&data);
             });
         }
+        // Both pipes are drained on their own threads so neither can fill up
+        // and block the child while we poll for exit.
         let out_reader = child.stdout.take().map(|mut s| {
             std::thread::spawn(move || {
                 let mut v = Vec::new();
@@ -207,6 +240,7 @@ impl JobCtx {
                 lines
             })
         });
+        // Poll rather than `wait` so cancellation can kill the process group.
         let code = loop {
             if self.cancelled() {
                 crate::tasks::kill_tree(&mut child);
@@ -237,6 +271,8 @@ impl JobCtx {
     }
 }
 
+/// Append bytes from `r` to `buf` up to and including the next `\r` or `\n`.
+/// Returns the number of bytes read; 0 at end of input or on a read error.
 fn read_until_cr_or_lf(r: &mut impl BufRead, buf: &mut Vec<u8>) -> usize {
     let mut n = 0;
     loop {
@@ -261,6 +297,7 @@ fn read_until_cr_or_lf(r: &mut impl BufRead, buf: &mut Vec<u8>) -> usize {
     }
 }
 
+/// Quote `a` for display as a POSIX shell word; plain words are left as they are.
 fn shell_quote(a: &str) -> String {
     if !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:@,+".contains(c)) {
         a.to_string()
@@ -269,7 +306,11 @@ fn shell_quote(a: &str) -> String {
     }
 }
 
-/// Run `body` on a worker thread in `workdir`.
+/// Run `body` on a worker thread in `workdir` and return a handle to it.
+///
+/// Starts a per-job askpass listener first; it stops once the body returns or
+/// the job is cancelled. The body's result is sent as [`JobEvent::Finished`];
+/// if `git` is unavailable or the thread cannot be spawned, that is an error.
 pub fn start_job(label: &str, workdir: PathBuf, body: impl FnOnce(&JobCtx) -> Result<String, String> + Send + 'static) -> GitJob {
     let (tx, rx) = unbounded();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -290,7 +331,9 @@ pub fn start_job(label: &str, workdir: PathBuf, body: impl FnOnce(&JobCtx) -> Re
 // ----- askpass -------------------------------------------------------------------
 
 /// Environment variables that switch Apex into askpass helper mode.
+/// This one carries the loopback port of the job's listener.
 pub const ASKPASS_PORT: &str = "APEX_ASKPASS_PORT";
+/// Carries the job's secret token, which the listener checks before relaying a prompt.
 pub const ASKPASS_TOKEN: &str = "APEX_ASKPASS_TOKEN";
 
 /// The helper git and ssh run: `APEX_ASKPASS_EXE` (tests) or this executable.
@@ -298,20 +341,20 @@ fn askpass_program() -> Option<PathBuf> {
     std::env::var_os("APEX_ASKPASS_EXE").map(PathBuf::from).or_else(|| std::env::current_exe().ok())
 }
 
-fn random_token() -> String {
-    use std::hash::BuildHasher;
-    let s = std::collections::hash_map::RandomState::new();
-    (0..4u64).map(|salt| format!("{:016x}", s.hash_one((std::process::id(), salt, Instant::now())))).collect()
-}
-
 /// A loopback listener for one job. Each connection sends `token\nprompt\n`
 /// and gets back `OK <answer>\n` or `CANCEL\n`. The prompt goes to the UI as
 /// [`JobEvent::Prompt`]; the listener stops when the job ends.
 fn askpass_server(tx: Sender<JobEvent>, cancel: Arc<AtomicBool>, done: Arc<AtomicBool>) -> Option<(u16, String)> {
+    // Security: bound to 127.0.0.1 only, on an ephemeral port, and every
+    // connection must present the job's random token before its prompt is
+    // shown. Answers go back over the socket and are not kept anywhere.
+    // Returns `None` (no relaying) if the listener cannot be set up.
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok()?;
+    // Non-blocking accept so the loop can notice the job ending.
     listener.set_nonblocking(true).ok()?;
     let port = listener.local_addr().ok()?.port();
-    let token = random_token();
+    // No CSPRNG, no listener: git then fails to ask rather than accept a guessable token.
+    let token = crate::token::random_token()?;
     let expected = token.clone();
     std::thread::Builder::new()
         .name("apex-askpass".into())
@@ -322,10 +365,14 @@ fn askpass_server(tx: Sender<JobEvent>, cancel: Arc<AtomicBool>, done: Arc<Atomi
                     continue;
                 };
                 let _ = stream.set_nonblocking(false);
+                // A client that connects but never sends cannot stall the listener for long.
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-                let mut reader = BufReader::new(&stream);
+                // Bounded: the token and prompt are short, and a local process
+                // must not be able to grow this buffer without limit.
+                let mut reader = BufReader::new((&stream).take(64 * 1024));
                 let (mut tok, mut prompt) = (String::new(), String::new());
-                if reader.read_line(&mut tok).is_err() || tok.trim_end() != expected || reader.read_line(&mut prompt).is_err() {
+                // Wrong or missing token: drop the connection without replying.
+                if reader.read_line(&mut tok).is_err() || !crate::token::tokens_equal(tok.trim_end(), &expected) || reader.read_line(&mut prompt).is_err() {
                     continue;
                 }
                 let (rtx, rrx) = crossbeam_channel::bounded(1);
@@ -341,6 +388,7 @@ fn askpass_server(tx: Sender<JobEvent>, cancel: Arc<AtomicBool>, done: Arc<Atomi
                     }
                 };
                 let reply = match answer {
+                    // Strip line breaks so an answer cannot inject extra protocol lines.
                     Some(a) => format!("OK {}\n", a.replace(['\n', '\r'], "")),
                     None => "CANCEL\n".to_string(),
                 };
@@ -352,7 +400,8 @@ fn askpass_server(tx: Sender<JobEvent>, cancel: Arc<AtomicBool>, done: Arc<Atomi
 }
 
 /// Askpass helper mode (`apex` run by git/ssh with the variables above):
-/// relay `prompt` to the editor and print the answer. Exit code 0 = answer.
+/// relay `prompt` to the editor and print the answer. Exit code 0 = answer;
+/// 1 = cancelled, missing or invalid environment, or a connection failure.
 pub fn askpass_client(prompt: &str) -> i32 {
     let (Ok(port), Ok(token)) = (std::env::var(ASKPASS_PORT), std::env::var(ASKPASS_TOKEN)) else { return 1 };
     let Ok(port) = port.parse::<u16>() else { return 1 };
@@ -381,14 +430,20 @@ pub fn askpass_client(prompt: &str) -> i32 {
 pub struct FilePatch {
     /// `diff --git`, `index`, mode, `---`, `+++` lines.
     pub header: Vec<String>,
+    /// Hunks in file order; empty for binary or mode-only changes.
     pub hunks: Vec<PatchHunk>,
 }
 
+/// One `@@` hunk of a [`FilePatch`], with the ranges from its header line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchHunk {
+    /// One-based first old-side line (or the line before, when `old_len` is 0).
     pub old_start: usize,
+    /// Number of old-side lines covered.
     pub old_len: usize,
+    /// One-based first new-side line (or the line before, when `new_len` is 0).
     pub new_start: usize,
+    /// Number of new-side lines covered.
     pub new_len: usize,
     /// Text after the second `@@` (function context).
     pub section: String,
@@ -396,6 +451,7 @@ pub struct PatchHunk {
     pub lines: Vec<String>,
 }
 
+/// Parse a hunk range `start[,len]`; a missing length means 1, as in unified diff.
 fn parse_range(s: &str) -> Option<(usize, usize)> {
     let mut it = s.splitn(2, ',');
     let start = it.next()?.parse().ok()?;
@@ -420,6 +476,8 @@ pub fn parse_patch(text: &str) -> Vec<FilePatch> {
             let Some((old, new)) = ranges.split_once(" +") else { continue };
             let (Some((os, ol)), Some((ns, nl))) = (parse_range(old), parse_range(new)) else { continue };
             f.hunks.push(PatchHunk { old_start: os, old_len: ol, new_start: ns, new_len: nl, section: section.to_string(), lines: Vec::new() });
+        // Lines after the first hunk header belong to the hunk; lines before it
+        // are file header lines.
         } else if let Some(h) = f.hunks.last_mut() {
             if line.starts_with([' ', '+', '-', '\\']) {
                 h.lines.push(line.to_string());
@@ -442,6 +500,8 @@ pub struct LinePos {
 impl PatchHunk {
     /// Positions of each body line (same indices as `lines`).
     pub fn positions(&self) -> Vec<LinePos> {
+        // An empty range's start names the line before the gap, so it is
+        // already the zero-based index of the following line.
         let mut old = if self.old_len == 0 { self.old_start } else { self.old_start.saturating_sub(1) };
         let mut new = if self.new_len == 0 { self.new_start } else { self.new_start.saturating_sub(1) };
         self.lines
@@ -468,16 +528,20 @@ impl PatchHunk {
 /// `reverse` = the patch will be applied with `--reverse` (unstaging,
 /// discarding): then an unselected `+` line stays as context and an
 /// unselected `-` line is dropped; forwards it is the other way round.
+/// `keep(hunk_index, line_index, position, line)` decides each `+`/`-` line.
+/// Hunk headers are recomputed so the result applies cleanly.
 /// Returns `None` when nothing is selected.
 pub fn select_lines(file: &FilePatch, reverse: bool, mut keep: impl FnMut(usize, usize, LinePos, &str) -> bool) -> Option<String> {
     let mut out = file.header.join("\n");
     out.push('\n');
     let mut any = false;
+    // Net line-count change of the hunks emitted so far, on the shifted side.
     let mut delta: isize = 0;
     for (hi, h) in file.hunks.iter().enumerate() {
         let pos = h.positions();
         let mut body: Vec<String> = Vec::new();
         let mut changed = false;
+        // Whether the previous line was dropped, so its `\ No newline` marker goes too.
         let mut dropped_prev = false;
         for (li, line) in h.lines.iter().enumerate() {
             let tag = line.as_bytes().first().copied().unwrap_or(b' ');
@@ -551,12 +615,14 @@ pub fn select_new_lines(file: &FilePatch, reverse: bool, lines: &[std::ops::Rang
 mod tests {
     use super::*;
 
+    /// Run the system `git` in `dir`, panicking on failure; returns stdout.
     fn git(dir: &Path, args: &[&str]) -> String {
         let o = Command::new("git").current_dir(dir).args(args).output().expect("git runs");
         assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
         String::from_utf8_lossy(&o.stdout).into_owned()
     }
 
+    /// A fresh repository with `f.txt` = `content` committed, or `None` if git is missing.
     fn repo_with(content: &str) -> Option<tempfile::TempDir> {
         if !available() {
             eprintln!("git not installed; skipping");
@@ -574,10 +640,12 @@ mod tests {
         Some(dir)
     }
 
+    /// The staged contents of `f.txt`.
     fn index_text(dir: &Path) -> String {
         git(dir, &["show", ":f.txt"])
     }
 
+    /// `git apply <args> -` with `patch` on stdin, through [`JobCtx::git`].
     fn apply(dir: &Path, patch: &str, args: &[&str]) {
         let ctx = JobCtx { workdir: dir.to_path_buf(), tx: unbounded().0, cancel: Arc::new(AtomicBool::new(false)), askpass: None };
         let mut a = vec!["apply"];
@@ -586,6 +654,7 @@ mod tests {
         ctx.git(&a, Some(patch.as_bytes())).unwrap_or_else(|e| panic!("apply failed: {e}\n{patch}"));
     }
 
+    /// Header, hunk ranges, section text and line positions are parsed.
     #[test]
     fn parses_hunks_and_positions() {
         let d = "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@ fn x\n a\n-b\n+B\n c\n@@ -10,0 +11,2 @@\n+y\n+z\n";
@@ -600,6 +669,7 @@ mod tests {
         assert!(select_lines(f, false, |_, _, _, _| false).is_none());
     }
 
+    /// Partial patches stage and unstage individual changes that `git apply` accepts.
     #[test]
     fn stages_and_unstages_selected_lines_with_real_git() {
         let base: String = (1..=30).map(|i| format!("line {i}\n")).collect();
@@ -637,6 +707,7 @@ mod tests {
         assert_eq!(index_text(p), want.join("\n") + "\n");
     }
 
+    /// An unselected `-` line becomes context when staging part of a hunk.
     #[test]
     fn partial_selection_inside_one_hunk() {
         let Some(dir) = repo_with("a\nb\nc\n") else { return };
@@ -650,6 +721,7 @@ mod tests {
         assert_eq!(index_text(p), "a\nb\nC\nc\n");
     }
 
+    /// Username and password prompts reach the UI and the answers reach git.
     #[cfg(unix)]
     #[test]
     fn askpass_relays_prompts_to_the_ui() {
@@ -686,6 +758,7 @@ mod tests {
         assert!(prompts[1].starts_with("Password for"), "{prompts:?}");
     }
 
+    /// Commands are logged and a failing command's error ends the job.
     #[test]
     fn job_runs_and_reports_errors() {
         let Some(dir) = repo_with("x\n") else { return };

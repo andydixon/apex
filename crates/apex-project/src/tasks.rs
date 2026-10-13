@@ -16,9 +16,11 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::{Deserialize, Serialize};
 
+/// A runnable task, as detected or as loaded from user or project configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TaskDef {
+    /// Display name, for example `Cargo: build`.
     pub name: String,
     /// Program and arguments. Never passed through a shell unless `shell` is set.
     pub command: Vec<String>,
@@ -37,6 +39,7 @@ pub struct TaskDef {
     pub source: TaskSource,
 }
 
+/// Empty command, `generic` matcher, built-in source.
 impl Default for TaskDef {
     fn default() -> Self {
         Self {
@@ -52,15 +55,21 @@ impl Default for TaskDef {
     }
 }
 
+/// Origin of a [`TaskDef`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TaskSource {
+    /// Detected by [`detect_tasks`] or [`task_for_file`].
     #[default]
     BuiltIn,
+    /// From the user's own configuration.
     User,
+    /// From the workspace's configuration; untrusted until the workspace is trusted.
     Project,
 }
 
-/// Detect built-in tasks for a workspace root.
+/// Detect built-in tasks for a workspace root from marker files in it
+/// (`Cargo.toml`, `go.mod`, `package.json`, `Makefile`, `CMakeLists.txt`,
+/// Python project files). Only checks for the files' existence.
 pub fn detect_tasks(root: &Path) -> Vec<TaskDef> {
     let mut v = Vec::new();
     let mk = |name: &str, cmd: &[&str], matcher: &str| TaskDef {
@@ -99,14 +108,16 @@ pub fn detect_tasks(root: &Path) -> Vec<TaskDef> {
     v
 }
 
-/// A task that runs the current file (`python3 file.py`, etc.).
+/// A task that runs the current file (`python3 file.py`, etc.), chosen by
+/// extension; `None` for unknown extensions. A `.rs` file inside a `src`
+/// directory is assumed to belong to a crate and gets no task.
 pub fn task_for_file(path: &Path) -> Option<TaskDef> {
     let ext = path.extension()?.to_string_lossy().to_lowercase();
     let p = path.display().to_string();
     let (name, cmd, matcher): (&str, Vec<String>, &str) = match ext.as_str() {
         "py" => ("Python: run file", vec!["python3".into(), p], "python"),
         "rs" if !path.components().any(|c| c.as_os_str() == "src") => {
-            ("Rust: run file (rustc)", vec!["sh".into(), "-c".into(), format!("rustc {:?} -o /tmp/apex-run && /tmp/apex-run", path)], "rustc")
+            ("Rust: run file (rustc)", rust_run_command(path, &crate::paths::data_dir().join("run-file").join("apex-run")), "rustc")
         }
         "sh" => ("Shell: run file", vec!["sh".into(), p], "generic"),
         "js" | "mjs" => ("Node: run file", vec!["node".into(), p], "generic"),
@@ -118,24 +129,45 @@ pub fn task_for_file(path: &Path) -> Option<TaskDef> {
     Some(TaskDef { name: name.into(), command: cmd, problem_matcher: matcher.into(), ..Default::default() })
 }
 
+/// A diagnostic found in task output by a [`ProblemMatcher`].
+/// `sh` argv that compiles `src` with rustc to `out` and runs it.
+///
+/// The paths are positional parameters (`$1`, `$2`), never spliced into the
+/// script: a file called `$(cmd).rs` in a cloned repository must not run
+/// `cmd`. The binary goes to `out` in the user's own data directory, not a
+/// fixed name in the shared `/tmp`, where another local user could swap it
+/// between compiling and running.
+fn rust_run_command(src: &Path, out: &Path) -> Vec<String> {
+    let script = r#"mkdir -p "$(dirname "$2")" && rustc "$1" -o "$2" && "$2""#;
+    vec!["sh".into(), "-c".into(), script.into(), "sh".into(), src.display().to_string(), out.display().to_string()]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem {
+    /// Absolute, or joined to the task's working directory.
     pub file: PathBuf,
+    /// One-based line number as printed by the tool.
     pub line: usize,
+    /// One-based column, when the tool prints one.
     pub col: Option<usize>,
     pub message: String,
+    /// False for warnings and notes.
     pub is_error: bool,
 }
 
 /// Compiled problem matcher.
 pub struct ProblemMatcher {
+    /// Location pattern with at least `file` and `line` named groups.
     re: regex::Regex,
     /// For rustc: the message is on the line before the `-->` location.
     message_from_previous: bool,
+    /// Pending `(message, is_error)` from the last `error`/`warning` line.
     last_message: Option<(String, bool)>,
 }
 
 impl ProblemMatcher {
+    /// Compile the named built-in matcher, or treat `name` as a custom regex.
+    /// `None` if the regex is invalid or lacks `file` and `line` groups.
     pub fn new(name: &str) -> Option<Self> {
         let (pattern, prev) = match name {
             "rustc" => (r"^\s*--> (?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+)", true),
@@ -147,6 +179,7 @@ impl ProblemMatcher {
             "generic" => (r"^(?P<file>[^:\s][^:\n]*?\.[A-Za-z0-9]+):(?P<line>\d+)(?::(?P<col>\d+))?[:\s]\s*(?P<message>.*)$", false),
             custom => (custom, false),
         };
+        // Size limit bounds the cost of compiling an untrusted custom pattern.
         let re = regex::RegexBuilder::new(pattern).size_limit(1 << 20).build().ok()?;
         if re.capture_names().flatten().filter(|n| *n == "file" || *n == "line").count() < 2 {
             return None;
@@ -155,11 +188,13 @@ impl ProblemMatcher {
     }
 
     /// Feed one output line; returns a problem if this line completes one.
+    /// Relative paths are resolved against `cwd`.
     pub fn feed(&mut self, line: &str, cwd: &Path) -> Option<Problem> {
         if self.message_from_previous {
             let t = line.trim_start();
             if let Some(rest) = t.strip_prefix("error").or_else(|| t.strip_prefix("warning")) {
                 let is_error = t.starts_with("error");
+                // Strip an `[E0308]`-style code before the colon.
                 let msg = rest.trim_start_matches(|c: char| c == '[' || c == ']' || c.is_alphanumeric()).trim_start_matches(':').trim();
                 self.last_message = Some((msg.to_string(), is_error));
                 return None;
@@ -235,28 +270,38 @@ pub fn sanitise_output(s: &str) -> String {
     out
 }
 
+/// Output of a running task, in order; [`TaskEvent::Exited`] is last.
 #[derive(Debug)]
 pub enum TaskEvent {
+    /// One sanitised line of stdout or stderr (the two are interleaved).
     Line(String),
+    /// A problem matched in the line sent just after it.
     Problem(Problem),
+    /// The process ended. `code` is `None` if it was killed by a signal or
+    /// could not be waited for; `killed` is set for cancellation and timeout.
     Exited { code: Option<i32>, elapsed: Duration, timed_out: bool, killed: bool },
+    /// Waiting for the process failed.
     Error(String),
 }
 
+/// Handle to a task started by [`run`]; dropping it cancels the task.
 pub struct RunningTask {
     pub name: String,
     pub rx: Receiver<TaskEvent>,
+    /// Shared with the runner thread, which polls it.
     cancel: Arc<AtomicBool>,
     pub started: Instant,
 }
 
 impl RunningTask {
+    /// Ask the runner to kill the task's process tree; it reports `killed`.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 }
 
 impl Drop for RunningTask {
+    /// Cancels the task so it does not outlive its handle.
     fn drop(&mut self) {
         self.cancel();
     }
@@ -266,6 +311,10 @@ impl Drop for RunningTask {
 pub const MAX_OUTPUT_LINES: usize = 20_000;
 
 /// Start a task. `root` resolves relative working directories.
+///
+/// Spawns the process in its own process group plus a runner thread and two
+/// pipe-reader threads. Errors if the command is empty, the working directory
+/// does not exist, or the process or thread cannot be started.
 pub fn run(def: &TaskDef, root: &Path) -> Result<RunningTask, String> {
     if def.command.is_empty() {
         return Err("task has no command".into());
@@ -279,6 +328,8 @@ pub fn run(def: &TaskDef, root: &Path) -> Result<RunningTask, String> {
         return Err(format!("working directory {} does not exist", cwd.display()));
     }
     let mut cmd = if def.shell {
+        // Explicit opt-in: words are joined unquoted, so the task author is
+        // responsible for shell quoting.
         let joined = def.command.join(" ");
         if cfg!(windows) {
             let mut c = Command::new("cmd");
@@ -312,10 +363,13 @@ pub fn run(def: &TaskDef, root: &Path) -> Result<RunningTask, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        /// Win32 process creation flag: start a new process group.
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
     let mut child = cmd.spawn().map_err(|e| format!("could not start {:?}: {e}", def.command[0]))?;
+    // Bounded channels: a flood of output applies back-pressure to the
+    // readers (and so the child) rather than growing memory without limit.
     let (tx, rx) = bounded::<TaskEvent>(1024);
     let cancel = Arc::new(AtomicBool::new(false));
     let started = Instant::now();
@@ -352,6 +406,7 @@ pub fn run(def: &TaskDef, root: &Path) -> Result<RunningTask, String> {
                     }
                 }));
             }
+            // Only the readers hold senders now, so `lrx` disconnects when both finish.
             drop(ltx);
             let mut matcher = ProblemMatcher::new(&matcher_name);
             let mut timed_out = false;
@@ -386,6 +441,7 @@ pub fn run(def: &TaskDef, root: &Path) -> Result<RunningTask, String> {
                     }
                 }
             };
+            // Drain whatever the readers produced after the last pump.
             for r in readers {
                 let _ = r.join();
             }
@@ -400,10 +456,14 @@ pub fn run(def: &TaskDef, root: &Path) -> Result<RunningTask, String> {
             let _ = tx.send(TaskEvent::Exited { code, elapsed: started.elapsed(), timed_out, killed });
         })
         .map_err(|e| e.to_string())?;
+    // No effect; only keeps the `Sender` import in use.
     let _ = Sender::<()>::clone;
     Ok(RunningTask { name: def.name.clone(), rx, cancel, started })
 }
 
+/// Kill `child` and its process group (Unix: `SIGTERM`, then `SIGKILL` after
+/// 200 ms; Windows: `taskkill /T /F`), then reap it. Relies on the child being
+/// a group leader (`process_group(0)` here, `setsid` in `git_cli`). Blocks.
 pub(crate) fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -431,6 +491,26 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
 mod tests {
     use super::*;
 
+    /// A hostile file name is data, not shell: `$(...)` in it never runs.
+    #[cfg(unix)]
+    #[test]
+    fn run_file_does_not_interpret_the_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pwned");
+        // Relative `touch` target (a name cannot hold `/`); the shell runs in `dir`.
+        let src = dir.path().join("$(touch pwned).rs");
+        std::fs::write(&src, "fn main() {}").unwrap();
+        // `rustc` may be absent; replace it with `true` so only the quoting is tested.
+        let mut argv = rust_run_command(&src, &dir.path().join("out/bin"));
+        argv[2] = argv[2].replace("rustc", "true");
+        let st = std::process::Command::new(&argv[0]).args(&argv[1..]).current_dir(dir.path()).status().unwrap();
+        assert!(!marker.exists(), "the file name was executed as a command");
+        // The out directory was created, and `true` "built" nothing to run.
+        assert!(dir.path().join("out").is_dir());
+        assert!(!st.success());
+    }
+
+    /// CSI, OSC, control characters and `\r` progress segments are removed.
     #[test]
     fn sanitises_escapes_and_progress_bars() {
         assert_eq!(sanitise_output("\u{1b}[31mred\u{1b}[0m ok"), "red ok");
@@ -440,6 +520,7 @@ mod tests {
         assert_eq!(sanitise_output("a\u{0}b\tc"), "ab\tc");
     }
 
+    /// Each built-in matcher extracts location and message; bad custom patterns are rejected.
     #[test]
     fn problem_matchers() {
         let cwd = Path::new("/w");
@@ -458,6 +539,7 @@ mod tests {
         assert!(ProblemMatcher::new("nothing here").is_none());
     }
 
+    /// Output capture, exit codes, cancellation, timeouts and spawn failure.
     #[cfg(unix)]
     #[test]
     fn runs_captures_and_cancels() {

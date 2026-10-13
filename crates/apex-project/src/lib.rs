@@ -31,5 +31,6 @@ pub mod search;
 pub mod session;
 pub mod spell;
 pub mod tasks;
+pub mod token;
 pub mod tree;
 pub mod watch;

@@ -21,76 +21,135 @@ use crate::command::Command;
 use crate::palette::{PaletteItem, PaletteMode, Payload};
 use crate::view::ViewId;
 
+/// Quiet period after the last edit before `didChange` is sent to the server.
 const CHANGE_DEBOUNCE: Duration = Duration::from_millis(250);
+/// How long the pointer must rest on a position before a hover request is sent.
 const HOVER_DELAY: Duration = Duration::from_millis(600);
+/// Failures (exits or start errors) after which a server is not restarted
+/// automatically for five minutes.
 const MAX_RESTARTS: u32 = 3;
+/// Documents larger than this are never sent to a language server.
 const MAX_SYNC_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
+/// Where a completion entry came from; server entries score higher when filtering.
 pub enum CompletionSource {
+    /// Returned by the language server.
     Lsp,
+    /// Built locally: words from open documents, or a snippet.
     Word,
 }
 
 #[derive(Debug, Clone)]
+/// One row of the completion popup, with ranges already converted to char offsets.
 pub struct CompletionEntry {
+    /// Snippet body to expand on accept; when set, `insert` is ignored.
     pub snippet: Option<String>,
+    /// Text shown in the list and matched against the typed prefix.
     pub label: String,
+    /// Secondary text: the server's detail, or the source document's title for words.
     pub detail: String,
+    /// Short kind label, such as `function`, `word` or `snippet`.
     pub kind: String,
+    /// Text to insert; LSP snippet syntax is stripped on accept.
     pub insert: String,
     /// Char range to replace (defaults to the typed prefix).
     pub replace: Option<(usize, usize)>,
+    /// Extra edits as `(start, end, text)` char ranges, such as auto-imports.
     pub additional: Vec<(usize, usize, String)>,
+    /// Origin of the entry.
     pub source: CompletionSource,
+    /// Tie-break key after the fuzzy score (server `sortText`, or a prefixed word).
     pub sort: String,
 }
 
+/// The open completion popup for one view.
 pub struct CompletionState {
+    /// View the popup belongs to.
     pub view: ViewId,
     pub doc: DocId,
+    /// Char offset where the typed prefix begins; the prefix runs to the caret.
     pub prefix_start: usize,
+    /// All candidates, server entries first once the response arrives.
     pub items: Vec<CompletionEntry>,
+    /// Indices into `items` that match the prefix, best first (at most 200).
     pub filtered: Vec<usize>,
+    /// Index into `filtered` of the highlighted row.
     pub selected: usize,
+    /// Id of the outstanding completion request; responses with another id are ignored.
     pub request: Option<i64>,
+    /// Set while a server reply is awaited; cleared after three seconds so the
+    /// popup shows word completions alone.
     pub waiting_since: Option<Instant>,
 }
 
+/// A visible hover tooltip.
 pub struct HoverState {
+    /// Markdown text: diagnostics first, then the server's hover contents.
     pub text: String,
+    /// Screen position the tooltip is anchored to.
     pub at: egui::Pos2,
     pub doc: DocId,
+    /// Char offset the tooltip describes.
     pub pos: usize,
 }
 
+/// Synchronisation state of one open document with its language server.
 struct SyncedDoc {
+    /// `file://` URI the server knows the document by.
     uri: String,
+    /// Client key: workspace root and language id.
     key: (PathBuf, String),
+    /// Document revision last sent to the server.
     revision: u64,
+    /// When an unsent change was first noticed; drives the debounce.
     changed_at: Option<Instant>,
 }
 
 #[derive(Default)]
+/// Application-wide language-server state, keyed by `(workspace root, language id)`.
 pub struct LspUi {
+    /// Running clients, one per workspace root and language.
     clients: HashMap<(PathBuf, String), LspClient>,
+    /// Latest published diagnostics per file.
     pub diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
+    /// Documents opened on a server.
     synced: HashMap<DocId, SyncedDoc>,
+    /// Open completion popup, if any.
     pub completion: Option<CompletionState>,
+    /// Visible hover tooltip, if any.
     pub hover: Option<HoverState>,
+    /// Signature help: `(label, active parameter, document, caret when requested)`.
     pub signature: Option<(String, Option<usize>, DocId, usize)>,
+    /// Pending hover: `(document, position, since, request id)`; id 0 means the
+    /// pointer is still resting and no request has been sent.
     hover_pending: Option<(DocId, usize, Instant, i64)>,
+    /// Latest `$/progress` text per client, shown in the status bar.
     pub progress: HashMap<(PathBuf, String), String>,
+    /// Failure count and time of the last failure per client key.
     failures: HashMap<(PathBuf, String), (u32, Instant)>,
+    /// Server-initiated `workspace/applyEdit` awaiting the user's answer:
+    /// `(request id, client key)`.
     pending_apply: Option<(Value, (PathBuf, String))>,
+    /// Not read or written in this module.
     pub last_trigger: Option<Instant>,
+    /// Client keys never to start; checked by `ensure_client` but not populated here.
     disabled_pairs: HashSet<(PathBuf, String)>,
+    /// Languages already logged as having no server on `PATH`, so the message is logged once.
     unavailable_reported: HashSet<String>,
+    /// Workspace roots for which "not started: folder not trusted" has
+    /// already been shown, so the status bar is not rewritten every frame.
+    untrusted_reported: HashSet<PathBuf>,
+    /// Locations from the last multi-result navigation, used to place the caret
+    /// precisely when a palette entry is accepted.
     pub last_locations: Vec<lsp::Location>,
+    /// Code actions offered in the palette; palette payloads index into this.
     pub code_actions: Vec<lsp::CodeAction>,
 }
 
 impl ApexApp {
+    /// Workspace root for a file: the first open root containing it, else its
+    /// parent directory, else `.`.
     fn lsp_root_for(&self, path: &Path) -> PathBuf {
         self.roots.iter().find(|r| path.starts_with(r)).cloned().or_else(|| path.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."))
     }
@@ -113,6 +172,8 @@ impl ApexApp {
         found
     }
 
+    /// Client key for a document, or `None` for unsaved documents and the
+    /// plain, hex and diff modes.
     fn client_key_for_doc(&mut self, d: DocId) -> Option<(PathBuf, String)> {
         let path = self.docs.get(&d)?.path.clone()?;
         let lang = self.language_of(d).id.to_string();
@@ -122,6 +183,10 @@ impl ApexApp {
         Some((self.lsp_root_for(&path), lang))
     }
 
+    /// Return whether a client exists for `key`, starting the server process if
+    /// needed. Refuses when the key is disabled, has failed `MAX_RESTARTS` times in
+    /// the last five minutes, or has no configured server. A start error counts as
+    /// `MAX_RESTARTS` failures, so it is not retried for five minutes.
     fn ensure_client(&mut self, key: &(PathBuf, String)) -> bool {
         if self.lsp.clients.contains_key(key) {
             return true;
@@ -136,6 +201,18 @@ impl ApexApp {
             return false;
         }
         let Some(cfg) = self.lsp_config_for(&key.1) else { return false };
+        // Servers act on the whole folder, not just the open file:
+        // rust-analyzer runs `cargo` (build scripts, proc macros, a
+        // repository's `.cargo/config.toml`), gopls runs `go list`, and so on.
+        // Opening one file from a hostile clone must not run its code, so a
+        // server starts only in a trusted workspace, like build tasks and git.
+        // Once the folder is trusted, the next frame starts the server.
+        if !self.trust.is_trusted(&key.0) {
+            if self.lsp.untrusted_reported.insert(key.0.clone()) {
+                self.set_status(format!("{} language server not started: this folder is not trusted (Project > Trust Workspace)", cfg.command[0]), false);
+            }
+            return false;
+        }
         match LspClient::start(cfg, &key.0) {
             Ok(c) => {
                 self.set_status(format!("Starting {} for {}", c.config.command[0], key.1), false);
@@ -168,6 +245,7 @@ impl ApexApp {
         for d in doc_ids {
             let Some(key) = self.client_key_for_doc(d) else { continue };
             let too_big = self.docs.get(&d).is_some_and(|doc| doc.len_bytes() > MAX_SYNC_BYTES || doc.large_file);
+            // Large files are never synced: full-text `didChange` would be too costly.
             if too_big {
                 continue;
             }
@@ -200,6 +278,8 @@ impl ApexApp {
                         s.uri = uri;
                         s.revision = revision;
                     } else if s.revision != revision {
+                        // Debounce: send the full text only once edits pause for
+                        // `CHANGE_DEBOUNCE`; keep repainting until then so the timer fires.
                         if s.changed_at.is_none() {
                             s.changed_at = Some(Instant::now());
                         }
@@ -260,6 +340,9 @@ impl ApexApp {
         repaint
     }
 
+    /// Handle one event from the client for `key`: readiness, diagnostics, replies,
+    /// server edit requests (shown for confirmation), messages, progress and exits.
+    /// An exit drops the client and its synced documents so the next tick restarts it.
     fn lsp_handle_event(&mut self, ctx: &egui::Context, key: &(PathBuf, String), ev: LspEvent) {
         match ev {
             LspEvent::Ready => {
@@ -336,12 +419,14 @@ impl ApexApp {
 
     // ----- positions ---------------------------------------------------------------
 
+    /// Convert a char offset to an LSP position (line, UTF-16 column).
     fn lsp_position(&self, d: DocId, pos: usize) -> Option<Position> {
         let doc = self.docs.get(&d)?;
         let (line, col) = char_to_utf16_position(doc.rope(), pos);
         Some(Position { line: line as u32, character: col as u32 })
     }
 
+    /// Convert an LSP range to an ordered `(start, end)` char range in a document.
     fn char_range(&self, d: DocId, r: &Range) -> Option<(usize, usize)> {
         let doc = self.docs.get(&d)?;
         let rope = doc.rope();
@@ -350,11 +435,13 @@ impl ApexApp {
         Some((a.min(b), a.max(b)))
     }
 
+    /// Open document whose path matches a `file://` URI.
     fn doc_for_uri(&self, uri: &str) -> Option<DocId> {
         let p = lsp::path_for(uri)?;
         self.docs.iter().find(|(_, d)| d.path.as_ref() == Some(&p)).map(|(id, _)| *id)
     }
 
+    /// Key of the running client a document is synced with, if any.
     fn client_for_doc(&mut self, d: DocId) -> Option<(PathBuf, String)> {
         let s = self.lsp.synced.get(&d)?;
         let key = s.key.clone();
@@ -382,6 +469,7 @@ impl ApexApp {
         diags.iter().filter_map(|dg| self.char_range(d, &dg.range).map(|(a, b)| (a, b.max(a + 1), dg.severity.unwrap_or(3)))).collect()
     }
 
+    /// All diagnostics as `Problem` rows (1-based line and column) for the problems panel.
     pub(crate) fn lsp_problem_list(&self) -> Vec<Problem> {
         let mut out = Vec::new();
         for (path, diags) in &self.lsp.diagnostics {
@@ -410,6 +498,8 @@ impl ApexApp {
 
     // ----- hover --------------------------------------------------------------------
 
+    /// Track the pointer for hover: a new position restarts the rest timer and hides
+    /// the current tooltip; `None` cancels a pending hover.
     pub(crate) fn lsp_hover_moved(&mut self, view: ViewId, pos: Option<usize>) {
         match pos {
             Some(p) => {
@@ -429,6 +519,8 @@ impl ApexApp {
         }
     }
 
+    /// Show diagnostics at `pos` and, when the server supports it, send a hover
+    /// request whose reply is appended to the tooltip.
     fn lsp_request_hover(&mut self, d: DocId, pos: usize) {
         let mut text = self.lsp_diagnostics_at(d, pos).join("\n\n");
         let Some(key) = self.client_for_doc(d) else {
@@ -459,6 +551,7 @@ impl ApexApp {
         }
     }
 
+    /// Set the hover tooltip, anchored at the pointer or else below the caret.
     fn lsp_show_hover(&mut self, d: DocId, pos: usize, text: String) {
         let at = self.views.values().find(|v| v.doc == d).map(|v| v.last_caret_rect.map(|r| r.left_bottom()).unwrap_or_default()).unwrap_or_default();
         let at = self.last_pointer.unwrap_or(at);
@@ -554,6 +647,9 @@ impl ApexApp {
         self.lsp_refilter_completion();
     }
 
+    /// Local candidates for the prefix in `prefix_start..head`: snippets, then words
+    /// from this document and other open ones. Skips documents over 4 MiB and stops
+    /// after about 2000 entries to bound the cost per keystroke.
     fn word_completions(&self, d: DocId, prefix_start: usize, head: usize) -> Vec<CompletionEntry> {
         let doc = &self.docs[&d];
         let prefix: String = doc.rope().slice(prefix_start..head).to_string();
@@ -588,6 +684,8 @@ impl ApexApp {
             let text = dd.text();
             for m in re.find_iter(&text).take(200_000) {
                 let w = m.as_str();
+                // Skip the prefix itself and words that share neither its first char
+                // nor (case-insensitively) the whole prefix.
                 if w == prefix || !w.starts_with(prefix.chars().next().unwrap_or(' ')) && !w.to_lowercase().starts_with(&prefix.to_lowercase()) {
                     continue;
                 }
@@ -612,6 +710,9 @@ impl ApexApp {
         out
     }
 
+    /// Fuzzy-match items against the current prefix and reorder `filtered`. Closes
+    /// the popup if the caret left the prefix, there are several carets, or nothing
+    /// matches and no server reply is pending.
     pub(crate) fn lsp_refilter_completion(&mut self) {
         let Some(c) = &mut self.lsp.completion else { return };
         let Some(view) = self.views.get(&c.view) else {
@@ -641,6 +742,7 @@ impl ApexApp {
                     return Some((0, i));
                 }
                 let label = nucleo_matcher::Utf32Str::new(&it.label, &mut buf);
+                // Server entries get a fixed bonus so they outrank equally good word matches.
                 pattern.score(label, &mut matcher).map(|s| (s + if it.source == CompletionSource::Lsp { 50 } else { 0 }, i))
             })
             .collect();
@@ -706,6 +808,8 @@ impl ApexApp {
         false
     }
 
+    /// Insert the selected entry as one undoable edit, replacing its range (or the
+    /// typed prefix) and applying any additional edits. Snippets are expanded instead.
     pub(crate) fn lsp_accept_completion(&mut self) {
         let Some(c) = self.lsp.completion.take() else { return };
         let Some(&idx) = c.filtered.get(c.selected) else { return };
@@ -721,6 +825,7 @@ impl ApexApp {
         let additional = item.additional.clone();
         self.run_edit(view, |d, s| {
             let n = d.len_chars();
+            // Clamp: server ranges may refer to a slightly older text.
             let mut changes = vec![Change::replace(start.min(n), end.min(n), insert.clone())];
             for (a, b, t) in &additional {
                 changes.push(Change::replace((*a).min(n), (*b).min(n), t.clone()));
@@ -732,6 +837,7 @@ impl ApexApp {
         });
     }
 
+    /// Send a signature-help request for the primary caret, if the server supports it.
     fn lsp_request_signature(&mut self, view: ViewId) {
         let Some(d) = self.views.get(&view).map(|v| v.doc) else { return };
         let Some(key) = self.client_for_doc(d) else { return };
@@ -749,6 +855,9 @@ impl ApexApp {
 
     // ----- responses -------------------------------------------------------------------
 
+    /// Act on a reply to a request sent earlier. Errors from completion, hover and
+    /// signature help are silent; others go to the status bar. Stale replies (other
+    /// request id, closed popup, changed document) are dropped.
     fn lsp_handle_response(&mut self, ctx: &egui::Context, key: &(PathBuf, String), id: i64, kind: RequestKind, result: Result<Value, String>) {
         let result = match result {
             Ok(v) => v,
@@ -954,6 +1063,7 @@ impl ApexApp {
         let _ = key;
     }
 
+    /// Record the active view's selections and scroll so closing the palette restores them.
     pub(crate) fn remember_palette_restore_pub(&mut self) {
         self.palette_preview = None;
         if let Some(v) = self.active_view_id()
@@ -963,6 +1073,7 @@ impl ApexApp {
         }
     }
 
+    /// Open the file of `loc` (recording a jump) and put the caret at the range start.
     fn lsp_goto_location(&mut self, ctx: &egui::Context, loc: &lsp::Location) {
         let Some(path) = lsp::path_for(&loc.uri) else { return };
         self.note_jump();
@@ -1005,6 +1116,8 @@ impl ApexApp {
                 continue;
             };
             if let Some(d) = self.doc_for_uri(uri) {
+                // Refuse edits computed against a version the server no longer holds,
+                // so stale ranges cannot corrupt the buffer.
                 if let Some(v) = edit.versions.get(uri)
                     && self.lsp.synced.get(&d).and_then(|s| self.lsp.clients.get(&s.key)).and_then(|c| c.version(&s_uri(&self.lsp.synced[&d]))) != Some(*v)
                 {
@@ -1036,6 +1149,7 @@ impl ApexApp {
                         let opts = apex_project::fileio::SaveOptions {
                             encoding: l.encoding,
                             line_ending: l.line_ending,
+                            // Save fails if the file changed on disk since it was loaded.
                             expected: Some(l.identity),
                             force: false,
                             in_place: false,
@@ -1056,6 +1170,8 @@ impl ApexApp {
         (applied, failures)
     }
 
+    /// Apply (or decline) a workspace edit after the confirmation dialog, and answer
+    /// the server if the edit came from its `workspace/applyEdit` request.
     pub(crate) fn lsp_confirm_workspace_edit(&mut self, edit: &WorkspaceEdit, accepted: bool) {
         let pending = self.lsp.pending_apply.take();
         if accepted {
@@ -1079,6 +1195,9 @@ impl ApexApp {
 
     // ----- commands ------------------------------------------------------------------------
 
+    /// Run an LSP-related command (navigation, rename, format, code actions, hover,
+    /// restart, toggle, completion). `arg` is the new name for rename. Returns `false`
+    /// if `cmd` is not handled here. Requests are sent after flushing pending changes.
     pub(crate) fn lsp_command(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) -> bool {
         match cmd {
             Command::GotoDefinition | Command::GotoDeclaration | Command::GotoImplementation | Command::GotoReferences => {
@@ -1464,6 +1583,8 @@ impl ApexApp {
         }
     }
 
+    /// Status-bar text for the active document's server: its name, progress, or
+    /// `(starting)`; `None` when LSP is off or the document is not synced.
     pub(crate) fn lsp_status_label(&self) -> Option<String> {
         if !self.settings.lsp_enabled {
             return None;
@@ -1479,6 +1600,7 @@ impl ApexApp {
         }
     }
 
+    /// Shut down every server process (used when the application exits).
     pub(crate) fn lsp_shutdown_all(&mut self) {
         for (_, mut c) in self.lsp.clients.drain() {
             c.shutdown();
@@ -1546,6 +1668,7 @@ impl ApexApp {
     }
 }
 
+/// Clone of a synced document's URI.
 fn s_uri(s: &SyncedDoc) -> String {
     s.uri.clone()
 }
@@ -1599,6 +1722,7 @@ pub fn strip_snippet(s: &str) -> String {
     out
 }
 
+/// A run of hover markdown: fenced code or ordinary text.
 enum MdBlock {
     Code(String),
     Text(String),
@@ -1627,6 +1751,8 @@ fn markdown_blocks(text: &str) -> Vec<MdBlock> {
     out
 }
 
+/// Pattern for completion words: a letter or underscore followed by at least two
+/// letters, digits or underscores. Compiled once.
 fn word_regex() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"[\p{L}_][\p{L}\p{N}_]{2,}").expect("valid regex"))

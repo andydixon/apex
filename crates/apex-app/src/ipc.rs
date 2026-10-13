@@ -8,8 +8,6 @@
 //! `done` once every requested file has been closed. Nothing is reachable
 //! from other machines or, on Unix, other users.
 
-use std::collections::hash_map::RandomState;
-use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -19,26 +17,39 @@ use std::time::Duration;
 use apex_ui::OpenRequest;
 use serde::{Deserialize, Serialize};
 
+/// Contents of `instance.json`: how a later invocation reaches this one.
 #[derive(Serialize, Deserialize)]
 struct Instance {
+    /// Loopback TCP port the listener is bound to.
     port: u16,
+    /// Shared secret a client must echo in `Request::token`.
     token: String,
+    /// Process id of the running editor; recorded for diagnostics, not read here.
     pid: u32,
 }
 
 /// What a second invocation asks the running instance to do.
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct Request {
+    /// Copy of the instance token, filled in by `try_send` from `instance.json`.
     #[serde(default)]
     pub token: String,
+    /// Files to open with optional 1-based line and column; canonicalised by
+    /// `try_send` before sending.
     pub files: Vec<(PathBuf, Option<usize>, Option<usize>)>,
+    /// Folders to add as workspace roots; canonicalised by `try_send`.
     pub folders: Vec<PathBuf>,
+    /// Two files (old, new) to compare.
     pub diff: Option<(PathBuf, PathBuf)>,
+    /// Keep the connection open until every file in `files` has been closed.
     pub wait: bool,
 }
 
+/// Cap on the request line a client may send, so a misbehaving local
+/// process cannot make the listener buffer unbounded data.
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 
+/// Path of `instance.json` in the per-user runtime directory.
 fn instance_file() -> PathBuf {
     apex_project::paths::runtime_dir().join("instance.json")
 }
@@ -46,6 +57,9 @@ fn instance_file() -> PathBuf {
 /// Clients waiting for their files to close: (remaining paths, connection).
 static WAITERS: Mutex<Vec<(Vec<PathBuf>, TcpStream)>> = Mutex::new(Vec::new());
 
+/// Canonical form of `p` so client and editor compare the same path
+/// spelling; falls back to `p` unchanged if it does not exist or cannot be
+/// resolved.
 fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
@@ -53,6 +67,11 @@ fn canonical(p: &Path) -> PathBuf {
 /// Hand `req` to a running instance. `Ok(true)` when it accepted the request
 /// (and, with `wait`, when the files have since been closed); `Ok(false)` when
 /// no instance is running.
+///
+/// An unreadable `instance.json` or a refused connection is treated as a
+/// stale file and deleted. Fills in `req.token` and canonicalises the paths.
+/// Errors are I/O failures reading the file or talking to the instance (each
+/// step has a 5 s timeout, except the `--wait` read, which has none).
 pub fn try_send(mut req: Request) -> std::io::Result<bool> {
     let path = instance_file();
     let src = match std::fs::read_to_string(&path) {
@@ -102,21 +121,16 @@ pub fn try_send(mut req: Request) -> std::io::Result<bool> {
     Ok(true)
 }
 
-fn random_token() -> String {
-    let s = RandomState::new();
-    let mut out = String::new();
-    for salt in 0..4u64 {
-        let v = s.hash_one((std::process::id(), salt, std::time::SystemTime::now()));
-        out.push_str(&format!("{v:016x}"));
-    }
-    out
-}
-
 /// Start listening for other invocations. Returns the instance file path.
+///
+/// Binds an ephemeral loopback port, writes `instance.json` atomically after
+/// making the runtime directory owner-only, and spawns an `apex-ipc` thread
+/// that handles each connection on its own thread. The listener lives for
+/// the rest of the process.
 pub fn serve() -> std::io::Result<PathBuf> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let port = listener.local_addr()?.port();
-    let token = random_token();
+    let token = apex_project::token::random_token().ok_or_else(|| std::io::Error::other("no OS random source for the instance token"))?;
     let dir = apex_project::paths::runtime_dir();
     apex_project::paths::ensure_private_dir(&dir)?;
     let path = instance_file();
@@ -131,6 +145,11 @@ pub fn serve() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Serve one connection: read a single JSON request line (at most
+/// `MAX_REQUEST_BYTES`, 5 s timeout), check the token, forward the request to
+/// the editor's inbox and reply `ok`. With `wait`, the stream is parked in
+/// `WAITERS` until `view_closed` or `shutdown` writes `done`. Any failure
+/// closes the connection without a reply.
 fn handle(stream: TcpStream, token: &str) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut reader = BufReader::new(stream.take(MAX_REQUEST_BYTES));
@@ -140,9 +159,10 @@ fn handle(stream: TcpStream, token: &str) {
     }
     let Ok(req) = serde_json::from_str::<Request>(&line) else { return };
     // Constant-time comparison: a wrong token must look like a dropped connection.
-    if req.token.len() != token.len() || req.token.bytes().zip(token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) != 0 {
+    if !apex_project::token::tokens_equal(&req.token, token) {
         return;
     }
+    // Unwrap `BufReader` and `Take` to write the reply on the same socket.
     let mut stream = reader.into_inner().into_inner();
     let open = OpenRequest { files: req.files.clone(), folders: req.folders.clone(), diff: req.diff.clone() };
     crate::open_requests::push_request(open);
@@ -162,6 +182,9 @@ fn handle(stream: TcpStream, token: &str) {
 }
 
 /// Called by the editor when a file's last view closes.
+///
+/// Removes `path` (canonicalised) from every waiter and sends `done` to, then
+/// drops, each waiter with nothing left to wait for.
 pub fn view_closed(path: &Path) {
     let closed = canonical(path);
     let Ok(mut waiters) = WAITERS.lock() else { return };
@@ -177,6 +200,9 @@ pub fn view_closed(path: &Path) {
 }
 
 /// Remove the instance file and release any waiting clients.
+///
+/// Called once the window has closed. Waiters get `done` so their
+/// `--wait` invocations exit.
 pub fn shutdown() {
     let _ = std::fs::remove_file(instance_file());
     if let Ok(mut w) = WAITERS.lock() {
@@ -190,6 +216,9 @@ pub fn shutdown() {
 mod tests {
     use super::*;
 
+    /// Pins down that a wrong token gets no reply and no request, that a valid
+    /// `--wait` request reaches the inbox and returns once the file closes, and
+    /// that shutdown removes the instance file.
     #[test]
     fn round_trip_with_token_and_wait() {
         let dir = tempfile::tempdir().unwrap();

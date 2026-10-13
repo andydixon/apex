@@ -298,6 +298,7 @@ dependencies = [
  "crossbeam-channel",
  "directories",
  "encoding_rs",
+ "getrandom 0.3.4",
  "git2",
  "globset",
  "ignore",
