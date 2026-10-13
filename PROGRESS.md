@@ -171,6 +171,22 @@ rewritten; Ctrl+Enter used the frame's modifiers instead of the event's;
 exact command names now win in the palette; Finder "Open With" handler is
 installed after AppKit's own; the Dock icon is Apex's.
 
+## Milestone 14 — macOS dialogs, comments, guide and security audit (complete)
+
+* macOS Open, Open Folder and Save As no longer go through rfd. The hang was
+  rfd's main-queue dispatch deadlocking against AppKit's panel service; the
+  panel is now begun from a main run-loop block and shown as a sheet
+  (`macos_dialogs.rs`). Native dialogs are the default everywhere again.
+  Type-checked for macOS, not yet run on a Mac.
+* Every module has a header, and types and functions carry doc comments.
+* PDF user guide in LaTeX (`make guide`, `docs/user-guide/latex/`).
+* Security audit (`audits/20261013-0712-*`): language servers now need a
+  trusted folder; run-file shell injection; device and FIFO loading;
+  private temporary files; CSPRNG tokens; `--` before ref names; git2 0.21.
+  New checks: `tests/visual/lsp-trust.sh` and five unit tests. Also fixed:
+  whole-document sort moved the final newline to the top.
+* `tests/visual/git.sh`: all 16 checks pass on git2 0.21.
+
 ## Test status
 
 Last full run (`cargo test --workspace`, 12 October 2026, after the Git work):
@@ -179,10 +195,10 @@ Last full run (`cargo test --workspace`, 12 October 2026, after the Git work):
 |---|---|
 | apex-app | 2 |
 | apex-buffer | 16 |
-| apex-edit | 42 (+ 8 property tests) |
-| apex-project | 47 |
+| apex-edit | 43 (+ 8 property tests) |
+| apex-project | 51 |
 | apex-syntax | 15 (+1 ignored timing probe) |
-| apex-ui | 44 |
+| apex-ui | 46 |
 
 `cargo clippy --workspace --all-targets -- -D warnings` and
 `cargo fmt --all -- --check` clean.
