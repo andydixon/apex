@@ -2649,7 +2649,19 @@ impl ApexApp {
         let mut q = std::mem::take(&mut self.queue);
         let recent = self.recent_files.clone();
         let themes: Vec<(String, bool)> = self.themes.iter().map(|t| (t.name.clone(), t.name == self.theme.name)).collect();
-        egui::MenuBar::new().ui(ui, |ui| {
+        // Windows: drop-downs use the opposite base visuals to the window
+        // (light menus on a dark theme and vice versa) so they stand out
+        // instead of blending into the window behind them.
+        let invert = cfg!(windows);
+        let dark = self.theme.dark;
+        let menu_config = egui::containers::menu::MenuConfig::new().style(move |s: &mut egui::Style| {
+            if invert {
+                let base = if dark { egui::Visuals::light() } else { egui::Visuals::dark() };
+                s.visuals = egui::Visuals { menu_corner_radius: s.visuals.menu_corner_radius, popup_shadow: s.visuals.popup_shadow, ..base };
+            }
+            egui::containers::menu::menu_style(s);
+        });
+        egui::MenuBar::new().config(menu_config).ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 for c in [Command::NewFile, Command::OpenFile, Command::OpenFolder, Command::OpenFolderByPath] {
                     item(ui, &mut q, c);
