@@ -701,7 +701,17 @@ pub fn transpose_chars(doc: &Document, sels: &SelectionSet) -> Option<EditResult
 /// included in what `f` receives.
 fn transform_line_block(doc: &Document, sels: &SelectionSet, mut f: impl FnMut(Vec<String>) -> Vec<String>) -> Option<EditResult> {
     let rope = doc.rope();
-    let ranges = if sels.has_extent() { merged_line_ranges(rope, sels) } else { vec![(0, rope.len_lines().saturating_sub(1))] };
+    let ranges = if sels.has_extent() {
+        merged_line_ranges(rope, sels)
+    } else {
+        // Whole document. A final newline leaves an empty last "line" that is
+        // not content: leave it out so sorting cannot move it to the top.
+        let mut last = rope.len_lines().saturating_sub(1);
+        if last > 0 && rope.line(last).len_chars() == 0 {
+            last -= 1;
+        }
+        vec![(0, last)]
+    };
     let mut changes = Vec::new();
     for (a, b) in ranges {
         let start = rope.line_to_char(a);
@@ -778,7 +788,17 @@ pub fn shuffle_lines(doc: &Document, sels: &SelectionSet, seed: u64) -> Option<E
 pub fn trim_trailing_whitespace(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     let rope = doc.rope();
     let mut changes = Vec::new();
-    let ranges = if sels.has_extent() { merged_line_ranges(rope, sels) } else { vec![(0, rope.len_lines().saturating_sub(1))] };
+    let ranges = if sels.has_extent() {
+        merged_line_ranges(rope, sels)
+    } else {
+        // Whole document. A final newline leaves an empty last "line" that is
+        // not content: leave it out so sorting cannot move it to the top.
+        let mut last = rope.len_lines().saturating_sub(1);
+        if last > 0 && rope.line(last).len_chars() == 0 {
+            last -= 1;
+        }
+        vec![(0, last)]
+    };
     for (a, b) in ranges {
         for line in a..=b {
             let end = line_end_char(rope, line);
@@ -1354,6 +1374,16 @@ mod tests {
         assert_eq!(d.text(), "a\nb\nc");
         run(&mut d, |d| reverse_lines(d, &all));
         assert_eq!(d.text(), "c\nb\na");
+    }
+
+    /// A whole-document sort keeps the final newline at the end instead of
+    /// sorting the empty last line to the top.
+    #[test]
+    fn sort_keeps_trailing_newline() {
+        let mut d = doc("b\na\n");
+        let all = SelectionSet::single(Selection::point(0));
+        run(&mut d, |d| sort_lines(d, &all, true, false));
+        assert_eq!(d.text(), "a\nb\n");
     }
 
     /// Pins down line comments aligned at minimum indent (blank lines skipped)
