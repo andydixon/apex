@@ -195,7 +195,7 @@ const ENTRIES: &[Entry] = &[
         key: "native_file_dialogs",
         category: "Files",
         label: "System file dialogs",
-        help: "Off: Open and Save As ask for a path inside Apex (Tab completes).",
+        help: "On by default: use system file dialogs. Off: ask for a path inside Apex (Tab completes).",
         kind: Kind::Bool,
     },
     Entry { key: "trim_trailing_whitespace_on_save", category: "Files", label: "Trim trailing whitespace on save", help: "", kind: Kind::Bool },

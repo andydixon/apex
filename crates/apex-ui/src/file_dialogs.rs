@@ -28,6 +28,8 @@ pub(crate) enum FileDialogKind {
         replace: bool,
     },
     OpenProject,
+    /// Write the workspace's project file under the chosen path.
+    SaveProject,
     /// Save the view's document under the chosen path, then show `then`
     /// (used to resume a close-with-save sequence).
     SaveAs {
@@ -252,6 +254,11 @@ impl ApexApp {
             FileDialogKind::OpenProject => {
                 if let Some(p) = paths.first() {
                     self.open_project_file(p);
+                }
+            }
+            FileDialogKind::SaveProject => {
+                if let Some(p) = paths.first() {
+                    self.save_project_file(&normalise_path(p));
                 }
             }
             FileDialogKind::SaveAs { vid, then } => {

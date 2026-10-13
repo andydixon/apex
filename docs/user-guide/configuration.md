@@ -16,6 +16,11 @@ dialog rather than ignored or crashing.
 Layers, lowest first: built-in defaults → `settings.toml` → the
 `[settings]` table of the open project file.
 
+Open, folder selection and Save As use native system dialogs by default,
+including Open Project and Save Project As. Set `native_file_dialogs = false`
+in `settings.toml` to use the in-app path prompt instead. With native dialogs
+enabled, a reported system panel failure also opens the path prompt.
+
 Commonly changed keys:
 
 ```toml
@@ -31,6 +36,7 @@ vim_mode = true
 spell_check = true
 spell_language = "en_GB"
 exclude_patterns = ["target", "node_modules", "*.min.js"]
+native_file_dialogs = true       # false: an in-app path prompt with Tab completion
 
 [lsp_servers]
 rust = ["rust-analyzer"]

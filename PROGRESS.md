@@ -194,8 +194,15 @@ installed after AppKit's own; the Dock icon is Apex's.
   The rebuilt, signed `dist/Apex.app` selected a file through native Open
   and wrote the exact expected contents through native Save As. The macOS
   package script also produced `dist/Apex-0.0.1-macos.dmg`.
-  AppKit null-panel and abort fault injection, project-file loading, and
-  Finder/Dock integration checks remain pending.
+  Save Project As now uses the same native-first routing. With the setting
+  omitted, its native Save panel wrote a project at the exact selected path
+  (including a name without an extension); Open Project loaded its roots.
+  Cancelling the native Save panel wrote no file. With
+  `native_file_dialogs = false`, Open and Save Project As used the path
+  prompt, and saving a new project path wrote the expected TOML file.
+  Built-in defaults and configuration layering have a regression test.
+  AppKit null-panel and abort fault injection, and Finder/Dock integration
+  checks remain pending.
 * Returning focus after a path prompt opens a view now creates its
   AccessKit node before requesting focus. A headless regression test
   checks that the focused node exists in the accessibility update.
@@ -211,7 +218,7 @@ installed after AppKit's own; the Dock icon is Apex's.
 ## Test status
 
 Last full run (`cargo test --workspace`, 13 October 2026, after the dialog
-changes): 183 passed, one timing probe ignored. The successful run set
+changes): 184 passed, one timing probe ignored. The successful run set
 `TMPDIR` to its canonical physical path. With the default macOS `TMPDIR`,
 two existing apex-project Git alias tests repeat failures caused by
 `/var` versus `/private/var` path spelling; those failures are unresolved.
@@ -223,15 +230,14 @@ two existing apex-project Git alias tests repeat failures caused by
 | apex-edit | 43 (+ 8 property tests) |
 | apex-project | 51 |
 | apex-syntax | 15 (+1 ignored timing probe) |
-| apex-ui | 48 |
+| apex-ui | 49 |
 
 `cargo clippy --workspace --all-targets -- -D warnings` passed on 13 October
 2026. `cargo fmt --all -- --check` and `git diff --check` passed too.
 
 ## Next step
 
-1. macOS: test reported panel failures with fault injection, project-file
-   loading, Finder "Open With" and the Dock icon using
+1. macOS: test reported panel failures with fault injection, Finder "Open With" and the Dock icon using
    `docs/development/manual-smoke-test.md`.
 2. Try the GitHub features against a real repository after `gh auth login`.
 3. Tag the next release following `docs/development/release-process.md`.

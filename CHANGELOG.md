@@ -53,6 +53,8 @@ All notable changes to Apex are recorded here. The format follows
 - git2 0.21 (RUSTSEC-2026-0183 and RUSTSEC-2026-0184).
 
 ### Fixed
+- Save Project As now uses the native dialog by default and honours
+  `native_file_dialogs = false`, matching the other open and save commands.
 - macOS: Open, Open Folder and Save As retain the main-run-loop AppKit
   sheet backend. Null panels and explicit panel aborts now fall back to
   the in-app path prompt; ordinary cancellation stays quiet. A stalled

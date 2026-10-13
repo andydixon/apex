@@ -63,8 +63,6 @@ pub(crate) enum PromptKind {
     Sequence,
     /// Delimiters for Surround With.
     Surround,
-    /// Path of the project file to write.
-    SaveProject,
     /// New symbol name for LSP rename.
     Rename,
 }
@@ -1715,10 +1713,6 @@ impl ApexApp {
             }
             PromptKind::Sequence => self.execute(ctx, Command::InsertSequence, Some(text)),
             PromptKind::Surround => self.execute(ctx, Command::SurroundWith, Some(text)),
-            PromptKind::SaveProject => {
-                let path = PathBuf::from(text.trim());
-                self.save_project_file(&path);
-            }
             PromptKind::Rename => self.execute(ctx, Command::LspRename, Some(text)),
             PromptKind::GitArg(cmd, extra) => {
                 // Git commands take one string argument; pack the extra value in
@@ -1737,7 +1731,12 @@ impl ApexApp {
                     }
                     None => PathBuf::from(raw),
                 };
-                let saving = matches!(*kind, crate::file_dialogs::FileDialogKind::SaveAs { .. });
+                let path = if matches!(*kind, crate::file_dialogs::FileDialogKind::SaveProject) && path.extension().is_none() {
+                    path.with_extension("apex-project")
+                } else {
+                    path
+                };
+                let saving = matches!(*kind, crate::file_dialogs::FileDialogKind::SaveAs { .. } | crate::file_dialogs::FileDialogKind::SaveProject);
                 let ok = if folder {
                     path.is_dir()
                 } else if saving {
@@ -1770,21 +1769,21 @@ impl ApexApp {
 
     // ----- project files -------------------------------------------------------------
 
-    /// Write a `.apex-project` TOML file listing the roots relative to the
+    /// Write a project TOML file listing the roots relative to the
     /// file, with commented examples for settings and tasks. Becomes the
     /// current project file and a recent project.
     pub(crate) fn save_project_file(&mut self, path: &Path) {
-        let path = if path.extension().is_none() { path.with_extension("apex-project") } else { path.to_path_buf() };
+        // Preserve the native panel's exact path so its overwrite confirmation stays valid.
         let base = path.parent().unwrap_or(Path::new("."));
         let folders: Vec<String> = self.roots.iter().map(|r| pathdiff_relative(base, r)).collect();
         let body = format!(
             "# Apex project file. Safe to commit: it holds no session state.\n# Paths are relative to this file.\nfolders = {}\n\n[settings]\n# Per-project setting overrides, same keys as settings.toml.\n\n# Build tasks run only after you trust this workspace (Project ▸ Trust Workspace).\n# [[tasks]]\n# name = \"Check\"\n# command = [\"cargo\", \"check\"]\n# problem_matcher = \"rustc\"\n",
             toml_array(&folders)
         );
-        match apex_project::fileio::save_atomic(&path, body.as_bytes()) {
+        match apex_project::fileio::save_atomic(path, body.as_bytes()) {
             Ok(()) => {
-                self.project_file = Some(path.clone());
-                self.push_recent_project(&path);
+                self.project_file = Some(path.to_path_buf());
+                self.push_recent_project(path);
                 self.set_status(format!("Saved project {}", path.display()), false);
             }
             Err(e) => self.set_status(format!("Could not save project: {e}"), true),
@@ -2340,13 +2339,14 @@ impl ApexApp {
                 }
             }
             Command::SaveProject => {
-                let default = self
-                    .roots
-                    .first()
-                    .map(|r| r.join(format!("{}.apex-project", r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "workspace".into()))))
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                self.prompt("Save project file as", &default, PromptKind::SaveProject);
+                let mut spec = crate::file_dialogs::FileDialogSpec::save_file("Save Project As").filter("Apex project", &["apex-project"]);
+                if let Some(root) = self.roots.first() {
+                    let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "workspace".into());
+                    spec = spec.directory(Some(root.clone())).file_name(format!("{name}.apex-project"));
+                } else {
+                    spec = spec.directory(self.current_dir()).file_name("workspace.apex-project");
+                }
+                self.show_file_dialog(spec, crate::file_dialogs::FileDialogKind::SaveProject);
             }
             Command::OpenProject => {
                 let spec = crate::file_dialogs::FileDialogSpec::open_file("Open Project").filter("Apex project", &["apex-project", "toml"]);

@@ -147,7 +147,7 @@ pub struct Settings {
     /// Files larger than this (MB) open in reduced-feature mode.
     pub large_file_mb: usize,
     pub git_gutter: bool,
-    /// Use the system's file dialogs; off = an in-app path prompt.
+    /// Use the system's file dialogs by default; false selects an in-app path prompt.
     pub native_file_dialogs: bool,
     /// Source Control in the lower part of the sidebar.
     pub git_sidebar: bool,
@@ -247,8 +247,6 @@ impl Default for Settings {
             lsp_servers: std::collections::BTreeMap::new(),
             large_file_mb: 64,
             git_gutter: true,
-            // ponytail: the system panel hangs Apex on macOS for reasons not yet
-            // found; the in-app prompt is the default there until it is fixed.
             native_file_dialogs: true,
             git_sidebar: true,
             git_blame_inline: false,
@@ -384,6 +382,21 @@ fn first_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_dialogs_default_on_and_respect_config_override() {
+        let defaults = Settings::default();
+        assert!(defaults.native_file_dialogs);
+        let (missing, issues) = Settings::parse_layer(&defaults, "font_size = 16", "test");
+        assert!(issues.is_empty());
+        assert!(missing.native_file_dialogs);
+        let (override_settings, issues) = Settings::parse_layer(&defaults, "native_file_dialogs = false", "test");
+        assert!(issues.is_empty());
+        assert!(!override_settings.native_file_dialogs);
+        let (layered, issues) = Settings::parse_layer(&override_settings, "font_size = 18", "test");
+        assert!(issues.is_empty());
+        assert!(!layered.native_file_dialogs);
+    }
 
     /// Unknown keys, wrong types, out-of-range values and invalid TOML each
     /// produce an issue without losing the other settings.

@@ -17,7 +17,9 @@ ignored by `.gitignore` and `exclude_patterns` are shown dimmed or hidden
 
 ## Project files
 
-**Project > Save Project** writes `<name>.apex-project.toml`:
+**Project > Save Project As...** opens a native Save panel and suggests
+`<name>.apex-project`. Setting `native_file_dialogs = false` uses a path
+prompt instead. The project file contains:
 
 ```toml
 # Apex project file. Safe to commit: it holds no session state.

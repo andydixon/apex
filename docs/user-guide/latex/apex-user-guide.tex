@@ -528,7 +528,10 @@ dimmed or hidden. Git status is shown next to changed files.
 
 \section{Project files}
 
-\menu{Project > Save Project} writes \texttt{<name>.apex-project.toml}:
+\menu{Project > Save Project As} opens a native Save panel and suggests
+\texttt{<name>.apex-project}. Setting
+\setting{native\_file\_dialogs = false} uses a path prompt instead.
+The project file contains:
 
 \begin{Verbatim}
 # Apex project file. Safe to commit: it holds no session state.
@@ -586,6 +589,10 @@ types, out-of-range values) are reported in a dialog rather than ignored.
 
 Layers, lowest first: built-in defaults, \texttt{settings.toml}, the
 \texttt{[settings]} table of the open project file.
+
+Open, folder selection and Save As use native system dialogs by default,
+including Open Project and Save Project As. Set
+\setting{native\_file\_dialogs = false} to use the in-app path prompt instead.
 
 \begin{Verbatim}
 theme = "Apex Light"

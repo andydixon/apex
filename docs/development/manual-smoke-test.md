@@ -70,7 +70,8 @@ steps 1–11 is `tests/visual/smoke.sh` (Linux, Xvfb).
 
 ## Native file dialogs
 
-Use a temporary folder and disposable files. Set `native_file_dialogs = true`.
+Use a temporary folder and disposable files. Leave `native_file_dialogs`
+unset initially to verify that system panels are the default.
 Record whether each check used the system panel or the automatic path prompt;
 a passing fallback check does not verify native selection.
 
@@ -94,6 +95,12 @@ a passing fallback check does not verify native selection.
     whether the same problem affects other applications. Preserve unsaved
     work before restarting macOS, then repeat the native checks. Reported
     failure fallback does not protect against a blocked AppKit call.
-28. Set `native_file_dialogs = false`: Open, Open Folder and Save As show the
-    path prompt immediately, without creating a system panel. Restore the
-    previous setting after the check.
+28. Set `native_file_dialogs = false`: Open, Open Folder, Open Project,
+    Save As and Save Project As show the path prompt immediately, without
+    creating a system panel. Save Project As can create a new project path.
+    Restore the previous setting after the check.
+29. Save Project As uses a native Save panel when the setting is unset or
+    true. Save a project, confirm its roots, and open it with Open Project.
+    Cancel Save Project As: no project file is written. Native selection
+    writes the exact selected path, including a name without an extension;
+    the path prompt supplies `.apex-project` when no extension was typed.
