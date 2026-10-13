@@ -37,6 +37,21 @@ All notable changes to Apex are recorded here. The format follows
 - Open Folder by Path… and the `native_file_dialogs` setting: an in-app path
   prompt with Tab completion as an alternative to the system dialogs.
 
+### Security
+- Language servers start only in trusted folders: rust-analyzer runs a
+  project's build scripts, so opening one file from an untrusted clone
+  could run its code.
+- "Rust: run file" no longer interprets the file name as shell and builds
+  into the data directory instead of a fixed `/tmp` path.
+- Opening a device or FIFO (for example a symlink to `/dev/zero` in a
+  repository) is refused instead of reading forever or hanging.
+- Printing uses a fresh, private, unguessable temporary directory.
+- Single-instance and askpass tokens come from the OS random source and
+  are compared in constant time; askpass reads are capped.
+- Repository ref names can no longer be read as options by `git switch`,
+  `merge` or `branch -d`.
+- git2 0.21 (RUSTSEC-2026-0183 and RUSTSEC-2026-0184).
+
 ### Fixed
 - macOS: Open, Open Folder and Save As no longer hang the editor. The
   system panel is now shown as a sheet from the main run loop instead of

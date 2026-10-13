@@ -4197,20 +4197,12 @@ impl ApexApp {
 /// Write `text` to `<tmp>/apex-print-<pid>-<random>/<title>.txt` for the
 /// spooler and return the directory and file.
 ///
-/// A fresh directory that must not exist yet: a guessable name reused with
-/// `create_dir_all` would let another local user pre-create it and plant a
-/// symlink, turning the write into an overwrite of one of our files.
-/// `create_dir` fails if the name is taken, the random suffix makes it
-/// unguessable, the directory is owner-only on Unix, and `create_new`
-/// refuses any existing name (a symlink included).
+/// The directory comes from `paths::private_temp_dir` (fresh, unguessable,
+/// owner-only), and `create_new` refuses any existing name, a symlink
+/// included, so another local user cannot redirect the write.
 fn private_temp_file(title: &str, text: &str) -> std::io::Result<(PathBuf, PathBuf)> {
     use std::io::Write;
-    let dir = std::env::temp_dir().join(format!("apex-print-{}-{:016x}", std::process::id(), fastrand::u64(..)));
-    #[allow(unused_mut)] // only Unix sets a mode
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(&dir)?;
+    let dir = apex_project::paths::private_temp_dir("apex-print")?;
     // The file name shows up as the job name, so keep it filesystem-safe.
     let safe: String = title.chars().map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
     let path = dir.join(format!("{safe}.txt"));

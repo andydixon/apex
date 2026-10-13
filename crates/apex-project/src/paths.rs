@@ -76,3 +76,41 @@ pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// Create a fresh, owner-only directory `<tmp>/<prefix>-<pid>-<random>`.
+///
+/// The name must not exist yet: a guessable name reused with
+/// `create_dir_all` (or checked with `metadata`, which follows symlinks)
+/// lets another local user pre-create it, or plant a symlink to one of our
+/// directories, and steer where our files are written. `create` fails if
+/// the name is taken, and the random suffix makes it unguessable. The
+/// directory is `0700` on Unix; elsewhere it inherits the profile's ACLs.
+pub fn private_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
+    let suffix = crate::token::random_token().ok_or_else(|| std::io::Error::other("no OS random source"))?;
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), &suffix[..16]));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    #[cfg(not(unix))]
+    let _ = &mut builder;
+    builder.create(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Each call gets a new private directory; an existing name is refused.
+    #[test]
+    fn private_temp_dirs_are_fresh_and_owner_only() {
+        let a = super::private_temp_dir("apex-test").unwrap();
+        let b = super::private_temp_dir("apex-test").unwrap();
+        assert_ne!(a, b);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        std::fs::remove_dir(&a).unwrap();
+        std::fs::remove_dir(&b).unwrap();
+    }
+}

@@ -9,7 +9,11 @@ built in and do not depend on a server).
 
 With `lsp_enabled = true` (the default) a known server is started
 automatically the first time a file of its language is opened, if the
-program is on `PATH`:
+program is on `PATH` and the folder is **trusted** (**Project > Trust
+Workspace**). Servers work on the whole folder and some run its code
+(rust-analyzer runs a Rust project's build scripts), so in an untrusted
+folder the status bar says the server was not started; trust the folder
+and it starts straight away. Everything else works without a server.
 
 | Language | Server |
 |---|---|

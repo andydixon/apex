@@ -40,9 +40,11 @@ repository. Detected tasks (cargo, make and friends) run without a prompt;
 the first line of the Output panel is always the exact command and
 directory used.
 
-Commands are never passed through a shell unless `shell = true`, the
-editor's own environment secrets are not forwarded, and output is
-sanitised of terminal escape sequences before it is displayed.
+Commands are never passed through a shell unless `shell = true`, and
+output is sanitised of terminal escape sequences before it is displayed.
+A task inherits Apex's environment (as a command typed in a terminal
+would) plus its own `env`; `env` cannot set the dynamic loader or shell
+start-up variables (`LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`).
 
 ## Problems
 

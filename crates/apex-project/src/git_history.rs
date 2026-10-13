@@ -512,8 +512,9 @@ pub fn apply(c: &JobCtx, originals: &[CommitRecord], changes: &[CommitRecord], o
         c.git(&["update-ref", &hold, "HEAD"], None)?;
         // Private (0700 on Unix): it holds scripts that git sources, so other
         // local users must not be able to read or replace them.
-        let dir = std::env::temp_dir().join(format!("apex-rewrite-{}-{stamp}", std::process::id()));
-        crate::paths::ensure_private_dir(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        // Fresh and unguessable: these scripts are sourced by `sh`, so their
+        // directory must not be one another local user could pre-create.
+        let dir = crate::paths::private_temp_dir("apex-rewrite").map_err(|e| format!("could not create a private temporary directory: {e}"))?;
         let result = (|| -> Result<String, String> {
             // Two shell scripts sourced by filter-branch: `env` sets identity
             // and dates per `$GIT_COMMIT`; `msg` replaces only changed messages

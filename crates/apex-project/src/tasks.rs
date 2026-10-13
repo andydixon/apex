@@ -26,7 +26,9 @@ pub struct TaskDef {
     pub command: Vec<String>,
     /// Working directory, relative to the workspace root when not absolute.
     pub cwd: Option<String>,
-    /// Extra environment variables. `PATH` and secrets from the editor are not forwarded.
+    /// Extra environment variables, added to the editor's own environment
+    /// (which the task inherits in full). Keys that steer the dynamic loader
+    /// or the shell (`LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`) are ignored.
     pub env: HashMap<String, String>,
     /// Run `command[0]` through the platform shell (`sh -c` / `cmd /C`).
     pub shell: bool,

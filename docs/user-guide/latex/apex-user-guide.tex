@@ -959,7 +959,8 @@ you trust the workspace: the first attempt shows the command and asks.
 per folder in your data directory and never inside the repository. The
 first line of the Output panel is always the exact command and directory
 used. Commands never go through a shell unless \texttt{shell = true}, and
-output is stripped of terminal escape sequences before it is shown.
+output is stripped of terminal escape sequences before it is shown. A task
+inherits Apex's environment, as a command typed in a terminal would.
 \end{safenote}
 
 \section{Problems}
@@ -972,10 +973,19 @@ share the same list. The status bar shows the count.
 \chapter{Language servers}
 
 \begin{nutshell}
-Optional. If a known server is on your PATH it starts when you open a file
-of its language and gives you completion, diagnostics, hover, go to
-definition, rename and formatting. Everything else works without one.
+Optional. If a known server is on your PATH and the folder is trusted, it
+starts when you open a file of its language and gives you completion,
+diagnostics, hover, go to definition, rename and formatting. Everything
+else works without one.
 \end{nutshell}
+
+\begin{safenote}
+Servers act on the whole folder, and some run its code: rust-analyzer runs
+a Rust project's build scripts. So a server starts only in a folder you
+have trusted (\menu{Project > Trust Workspace}). In an untrusted folder the
+status bar says the server was not started; trust the folder and it
+starts at once.
+\end{safenote}
 
 \section{Starting a server}
 

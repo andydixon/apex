@@ -89,6 +89,12 @@ editor.
 * Servers are started only from `known_servers()` (fixed argv for programs
   found on `PATH`) or the user's own `lsp_servers` setting. Project files
   cannot configure servers.
+* Servers start only in a **trusted** folder. A server works on the whole
+  folder and some execute it: rust-analyzer runs `cargo`, which runs build
+  scripts, proc macros and the repository's `.cargo/config.toml`. Before
+  October 2026 opening a single `.rs` file from an untrusted clone was
+  enough to run its build script; `tests/visual/lsp-trust.sh` now checks
+  that no server starts until the folder is trusted.
 * The client parses JSON-RPC with a message size limit and ignores
   malformed frames; every position from the server is converted with
   clamped UTF-16 arithmetic; ranges are validated against the current
@@ -105,7 +111,7 @@ editor.
 **Threat**: another local process injects "open this file" requests.
 
 * The listener binds `127.0.0.1` on an ephemeral port; the port and a
-  256-bit random token are written to `instance.json` in the per-user
+  256-bit token from the operating system's CSPRNG (`apex_project::token`) are written to `instance.json` in the per-user
   runtime directory with owner-only permissions (`ensure_private_dir`,
   0700/0600). A client must present the token; comparison is constant
   time and a mismatch closes the connection without a reply.
@@ -146,7 +152,7 @@ and open files in the editor — equivalent to what it could do by running
 * **Credentials**: Apex never stores passwords or tokens. When git or ssh
   needs one, it runs Apex itself as `GIT_ASKPASS`/`SSH_ASKPASS`; the helper
   connects to a loopback listener opened for that one job (random port,
-  random token checked per connection), the prompt is shown in a dialog,
+  256-bit CSPRNG token compared in constant time, reads capped at 64 KiB), the prompt is shown in a dialog,
   and the answer is written back once. The listener closes when the job
   ends; an unanswered prompt times out after ten minutes. `gh` keeps its
   own login.
@@ -189,12 +195,23 @@ and open files in the editor — equivalent to what it could do by running
    open files, which is the platform's normal behaviour.
 6. **Windows runtime directory permissions** rely on the profile ACLs
    rather than explicit 0600 modes.
-7. **Askpass token strength.** The per-job token comes from the standard
-   library's randomly keyed hasher rather than a dedicated CSPRNG. The
-   listener is loopback-only and lives for one job, so another local
-   process would need to guess it during that window.
+7. **Tasks inherit the editor's environment.** A build task sees every
+   variable Apex was started with (as a command typed in a terminal
+   would); only loader and shell start-up variables in a task's own `env`
+   are refused.
 8. **Trusted repositories run hooks.** Trusting a folder lets its hooks
    run whenever Apex runs `git` there, exactly as on the command line.
+
+## Audit of October 2026
+
+`audits/` holds a full security audit and a functionality report. Fixed
+in that pass: language servers in untrusted folders (above); a shell
+injection through the file name in the "Rust: run file" task, which also
+built into a fixed `/tmp` path; opening a symlink to `/dev/zero` or a
+FIFO (unbounded read or a hung editor); a predictable print temp
+directory open to a symlink attack; tokens derived from a hasher rather
+than a CSPRNG; option injection through repository ref names; and two
+git2 soundness advisories (RUSTSEC-2026-0183, RUSTSEC-2026-0184).
 
 ## Verification performed
 

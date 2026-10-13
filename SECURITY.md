@@ -15,8 +15,10 @@ Apex treats the following as untrusted input:
 * output from any external process (build tasks, language servers);
 * clipboard contents and drag-and-drop payloads.
 
-Apex never executes project-provided commands, language servers or build
-tasks without explicit per-workspace trust. Configuration is data and cannot
-execute code. Apex makes no network connections.
+Apex never executes project-provided commands, language servers, `git`
+or build tasks in a folder without explicit per-workspace trust.
+Configuration is data and cannot execute code. Apex makes no network
+connections of its own; `git` and the GitHub CLI reach the network only
+when you ask (fetch, pull, push, pull requests) or turn on auto-fetch.
 
 Details of the file-handling guarantees are in `docs/security/file-handling.md`.

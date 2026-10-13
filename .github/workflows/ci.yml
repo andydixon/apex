@@ -35,6 +35,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Dependency advisories
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
       - name: Benchmarks compile
         run: cargo bench --workspace --no-run
       - name: Package (Linux)
