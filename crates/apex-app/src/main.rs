@@ -12,6 +12,7 @@ mod ipc;
 mod macos;
 mod open_requests;
 
+/// Command-line interface parsed by `clap`.
 #[derive(Parser, Debug)]
 #[command(name = "apex", version, about = "Apex — a native, high-performance text editor", long_about = None)]
 struct Cli {
@@ -36,6 +37,12 @@ struct Cli {
 }
 
 /// Parse `path[:line[:col]]`, being careful with Windows drive letters.
+///
+/// An argument naming an existing path is taken literally, so file names
+/// containing `:` still open. Otherwise up to two trailing `:`-separated
+/// numbers are read as 1-based line and column. In the third arm only the
+/// last part is numeric, so the first colon is kept as part of the path
+/// (for example `C:\x.rs:7`).
 fn parse_path_arg(arg: &str) -> (PathBuf, Option<usize>, Option<usize>) {
     if std::path::Path::new(arg).exists() {
         return (PathBuf::from(arg), None, None);
@@ -51,6 +58,9 @@ fn parse_path_arg(arg: &str) -> (PathBuf, Option<usize>, Option<usize>) {
     }
 }
 
+/// Entry point. Exit code: the askpass helper's code in helper mode; 0 when
+/// the request was handed to a running instance or the window closed
+/// normally; 2 if the GUI could not start.
 fn main() -> std::process::ExitCode {
     // Run by git or ssh as the askpass helper for a command Apex started:
     // relay the prompt to the editor and print the answer. No window.
@@ -90,6 +100,7 @@ fn main() -> std::process::ExitCode {
             Ok(false) => {}
             Err(e) => tracing::warn!("could not contact a running instance: {e}"),
         }
+        // Reuse is already the default; the flag only changes what is logged here.
         if cli.reuse_window && (cli.paths.is_empty() && cli.diff.is_none()) {
             tracing::info!("no running instance to reuse; starting one");
         }
@@ -98,6 +109,7 @@ fn main() -> std::process::ExitCode {
         Ok(p) => tracing::debug!("single-instance socket recorded in {}", p.display()),
         Err(e) => tracing::warn!("single-instance server not started: {e}"),
     }
+    // Lets the editor release `--wait` clients of this instance.
     args.on_view_closed = Some(std::sync::Arc::new(|p: &std::path::Path| ipc::view_closed(p)));
     args.inbox = Some(open_requests::init());
     #[cfg(target_os = "macos")]
@@ -131,6 +143,8 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Window icon decoded from the bundled 512 px PNG; egui's default if the
+/// PNG fails to decode.
 fn app_icon() -> egui::IconData {
     eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icons/png/apex-512.png")).unwrap_or_default()
 }
@@ -139,6 +153,7 @@ fn app_icon() -> egui::IconData {
 mod tests {
     use super::*;
 
+    /// Pins down `path:line:col`, `path:line`, a Windows drive letter and a plain path.
     #[test]
     fn path_args() {
         assert_eq!(parse_path_arg("src/main.rs:120:8"), (PathBuf::from("src/main.rs"), Some(120), Some(8)));

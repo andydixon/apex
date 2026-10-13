@@ -14,14 +14,22 @@ use crate::indent::IndentSettings;
 use crate::selection::{Selection, SelectionSet};
 use crate::transaction::{Assoc, Change, Transaction};
 
+/// Outcome of an editing operation, ready for `Document::apply`.
 #[derive(Debug, Clone)]
 pub struct EditResult {
+    /// Changes to apply, in char indices of the document before the edit. May be
+    /// empty when only the selections move (for example stepping over a closer).
     pub tx: Transaction,
+    /// Selections after the edit, in char indices of the edited document.
     pub sels: SelectionSet,
+    /// Undo grouping hint: `Typing` and the delete kinds may coalesce with the
+    /// previous undo entry.
     pub kind: EditKind,
 }
 
 impl EditResult {
+    /// Wrap the parts, returning `None` when `tx` changes nothing so callers can
+    /// treat no-op commands uniformly.
     fn new(tx: Transaction, sels: SelectionSet, kind: EditKind) -> Option<Self> {
         if tx.is_empty() { None } else { Some(Self { tx, sels, kind }) }
     }
@@ -30,8 +38,13 @@ impl EditResult {
 /// Options influencing plain text insertion.
 #[derive(Debug, Clone, Copy)]
 pub struct InsertOptions {
+    /// Insert the closing partner of a typed bracket or quote, wrap selections
+    /// in it, and step over an existing closer.
     pub auto_pair: bool,
+    /// Not read by `insert_text`; auto-indent on Enter is the `auto_indent`
+    /// argument of `newline`.
     pub auto_indent: bool,
+    /// Overtype mode: a single typed char replaces the grapheme after each caret.
     pub overwrite: bool,
 }
 
@@ -41,19 +54,26 @@ impl Default for InsertOptions {
     }
 }
 
+/// Auto-pair table: `(opener, closer)`. Quotes pair with themselves.
 const PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}'), ('"', '"'), ('\'', '\''), ('`', '`')];
 
+/// Closer for opener `c`, or `None` if `c` does not open a pair.
 fn closing_of(c: char) -> Option<char> {
     PAIRS.iter().find(|(o, _)| *o == c).map(|(_, c)| *c)
 }
 
+/// Whether `c` is the closing half of any `PAIRS` entry (quotes included).
 fn is_closer(c: char) -> bool {
     PAIRS.iter().any(|(_, x)| *x == c)
 }
 
 /// Build a result where each selection's range is replaced by the text
 /// yielded by `f` and the cursor collapses after the inserted text.
+///
+/// Selections are visited in ascending order; `delta` accumulates the length
+/// change so far so each new caret is placed in post-edit char indices.
 fn replace_each(doc: &Document, sels: &SelectionSet, kind: EditKind, mut f: impl FnMut(&Selection) -> String) -> Option<EditResult> {
+    // `doc` is unused; kept so every operation has the same shape.
     let _ = doc;
     let mut changes = Vec::with_capacity(sels.len());
     let mut new_sels = Vec::with_capacity(sels.len());
@@ -70,6 +90,12 @@ fn replace_each(doc: &Document, sels: &SelectionSet, kind: EditKind, mut f: impl
 }
 
 /// Insert typed text at every caret, with auto-pairing and overtype.
+///
+/// `text` may be several chars (IME commit, paste-like input); pairing,
+/// step-over and overwrite only apply when it is a single char. Returns
+/// `Some` with an empty transaction when the only effect is stepping over
+/// a closer. A single non-newline char is tagged `EditKind::Typing` so
+/// consecutive keystrokes share an undo entry.
 pub fn insert_text(doc: &Document, sels: &SelectionSet, text: &str, opts: InsertOptions) -> Option<EditResult> {
     let rope = doc.rope();
     let mut chars = text.chars();
@@ -109,11 +135,14 @@ pub fn insert_text(doc: &Document, sels: &SelectionSet, text: &str, opts: Insert
                     let mut new_sels = Vec::with_capacity(sels.len());
                     for (i, s) in sels.iter().enumerate() {
                         changes.push(Change::insert(s.head, format!("{c}{close}")));
+                        // Each earlier caret has gained two chars, hence `2 * i`.
                         new_sels.push(Selection::point(s.head + 1 + 2 * i));
                     }
                     return EditResult::new(Transaction::new(changes), SelectionSet::from_vec(new_sels, sels.primary_index()), EditKind::Typing);
                 }
             }
+        // Typing a closer that is not also an opener (`)`, `]`, `}`) steps over
+        // an identical char at every caret.
         } else if is_closer(c) && sels.iter().all(|s| s.is_empty() && rope.get_char(s.head) == Some(c)) {
             let mut ns = sels.clone();
             ns.transform(|s| Selection::point(s.head + 1));
@@ -127,6 +156,7 @@ pub fn insert_text(doc: &Document, sels: &SelectionSet, text: &str, opts: Insert
         let mut delta: isize = 0;
         for s in sels.iter() {
             let next = rope.get_char(s.head);
+            // Never overtype a line terminator: at end of line this is a plain insert.
             let end = if next.is_some_and(|n| n != '\n' && n != '\r') { next_grapheme_boundary(rope.slice(..), s.head) } else { s.head };
             changes.push(Change::replace(s.head, end, text));
             let pos = (s.head as isize + delta) as usize + 1;
@@ -142,6 +172,10 @@ pub fn insert_text(doc: &Document, sels: &SelectionSet, text: &str, opts: Insert
 
 /// Paste: when the clipboard holds exactly as many lines as there are carets,
 /// distribute one line per caret; otherwise insert the whole text everywhere.
+///
+/// Line endings in `text` are normalised to LF first; the document's
+/// own line ending is applied elsewhere. Distribution requires more than one
+/// caret and no trailing newline on the clipboard text.
 pub fn paste(doc: &Document, sels: &SelectionSet, text: &str) -> Option<EditResult> {
     let text = apex_buffer::line_ending::normalise(text, LineEnding::Lf);
     let lines: Vec<&str> = text.lines().collect();
@@ -153,11 +187,15 @@ pub fn paste(doc: &Document, sels: &SelectionSet, text: &str) -> Option<EditResu
             l
         });
     }
+    // Mechanically nothing here special-cases whole-line pastes (see the
+    // next comment): the text replaces each selection as-is.
     // Whole-line paste (copied with no selection) goes above the caret's line.
     replace_each(doc, sels, EditKind::Other, |_| text.clone())
 }
 
 /// Leading whitespace of the line containing `pos`.
+///
+/// `pos` is a char index, clamped to the document length.
 fn line_indent_at(rope: &Rope, pos: usize) -> String {
     let line = rope.char_to_line(pos.min(rope.len_chars()));
     let l = rope.line(line);
@@ -166,6 +204,11 @@ fn line_indent_at(rope: &Rope, pos: usize) -> String {
 }
 
 /// Insert a line break at each caret with automatic indentation.
+///
+/// With `auto_indent`, the new line copies the current line's leading
+/// whitespace, adds one `indent.unit()` after an opening bracket, and when
+/// the caret sits between a bracket pair also pushes the closer onto its own
+/// line at the base indent, leaving the caret on the middle line.
 pub fn newline(doc: &Document, sels: &SelectionSet, indent: IndentSettings, auto_indent: bool) -> Option<EditResult> {
     let rope = doc.rope();
     let mut changes = Vec::with_capacity(sels.len());
@@ -176,6 +219,8 @@ pub fn newline(doc: &Document, sels: &SelectionSet, indent: IndentSettings, auto
         let mut caret_offset_in_text = 1;
         if auto_indent {
             let base = line_indent_at(rope, s.start());
+            // Last non-whitespace char before the caret on this line; stopping at
+            // `\n` means a bracket on an earlier line does not count.
             let prev = rope.slice(..s.start()).chars_at(s.start()).reversed().find(|c| !c.is_whitespace() || *c == '\n');
             let next = rope.get_char(s.end());
             let opens = matches!(prev, Some('{' | '(' | '['));
@@ -201,6 +246,11 @@ pub fn newline(doc: &Document, sels: &SelectionSet, indent: IndentSettings, auto
 
 /// Delete the selection, or one grapheme (or one indent level of leading
 /// whitespace) before each caret.
+///
+/// With `smart` and spaces-mode indentation, a caret preceded only by spaces
+/// on its line deletes back to the previous indent stop. Otherwise, if the
+/// caret sits between an opener and its closer (for example `(|)`), both
+/// are removed. Carets at char index 0 are left as they are.
 pub fn delete_backward(doc: &Document, sels: &SelectionSet, indent: IndentSettings, smart: bool) -> Option<EditResult> {
     let rope = doc.rope();
     let text = rope.slice(..);
@@ -220,6 +270,7 @@ pub fn delete_backward(doc: &Document, sels: &SelectionSet, indent: IndentSettin
             let mut start = prev_grapheme_boundary(text, s.head);
             if smart && !before.is_empty() && before.chars().all(|c| c == ' ') && indent.style == crate::indent::IndentStyle::Spaces {
                 let w = indent.indent_width.max(1);
+                // `before` is all ASCII spaces, so its byte length is its column count.
                 let back = before.len() % w;
                 let back = if back == 0 { w } else { back };
                 start = s.head - back;
@@ -245,31 +296,42 @@ pub fn delete_backward(doc: &Document, sels: &SelectionSet, indent: IndentSettin
 }
 
 /// Delete the selection or one grapheme after each caret.
+///
+/// Tagged `EditKind::DeleteForward` so repeated presses coalesce in undo.
 pub fn delete_forward(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     let text = doc.slice();
     delete_ranges(sels, EditKind::DeleteForward, |s| if s.is_empty() { (s.head, next_grapheme_boundary(text, s.head)) } else { (s.start(), s.end()) })
 }
 
+/// Delete each selection, or from each caret back to the previous word start.
 pub fn delete_word_backward(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     let text = doc.slice();
     delete_ranges(sels, EditKind::Other, |s| if s.is_empty() { (motion::prev_word_start(text, s.head), s.head) } else { (s.start(), s.end()) })
 }
 
+/// Delete each selection, or from each caret forward to the next word end.
 pub fn delete_word_forward(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     let text = doc.slice();
     delete_ranges(sels, EditKind::Other, |s| if s.is_empty() { (s.head, motion::next_word_end(text, s.head)) } else { (s.start(), s.end()) })
 }
 
+/// Delete from the start of each caret's line up to the caret (the
+/// selection's head; its extent is ignored).
 pub fn delete_to_line_start(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     let rope = doc.rope();
     delete_ranges(sels, EditKind::Other, |s| (rope.line_to_char(rope.char_to_line(s.head)), s.head))
 }
 
+/// Delete from each caret (the selection's head) to the end of its line,
+/// leaving the terminator.
 pub fn delete_to_line_end(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     let rope = doc.rope();
     delete_ranges(sels, EditKind::Other, |s| (s.head, line_end_char(rope, rope.char_to_line(s.head))))
 }
 
+/// Delete the char range `range_of` yields for each selection (either order
+/// accepted) and collapse each selection to the start of its deleted range,
+/// in post-edit char indices. Empty ranges produce no change.
 fn delete_ranges(sels: &SelectionSet, kind: EditKind, mut range_of: impl FnMut(&Selection) -> (usize, usize)) -> Option<EditResult> {
     let mut changes = Vec::with_capacity(sels.len());
     let mut new_sels = Vec::with_capacity(sels.len());
@@ -287,7 +349,11 @@ fn delete_ranges(sels: &SelectionSet, kind: EditKind, mut range_of: impl FnMut(&
 }
 
 /// Wrap each selection in `open`…`close`, keeping the inner text selected.
+///
+/// `open` and `close` may be multi-char strings. Each selection keeps its
+/// direction.
 pub fn surround(doc: &Document, sels: &SelectionSet, open: &str, close: &str) -> Option<EditResult> {
+    // `doc` is unused; kept so every operation has the same shape.
     let _ = doc;
     let mut changes = Vec::with_capacity(sels.len() * 2);
     for s in sels.iter() {
@@ -307,6 +373,8 @@ pub fn surround(doc: &Document, sels: &SelectionSet, open: &str, close: &str) ->
 
 /// Inclusive line range spanned by a selection. A selection ending at column
 /// 0 of a later line does not include that line (Sublime behaviour).
+///
+/// Returns zero-based `(first, last)` line indices.
 pub fn lines_of(rope: &Rope, s: &Selection) -> (usize, usize) {
     let first = rope.char_to_line(s.start());
     let mut last = rope.char_to_line(s.end());
@@ -317,6 +385,9 @@ pub fn lines_of(rope: &Rope, s: &Selection) -> (usize, usize) {
 }
 
 /// Merge the line ranges of all selections into disjoint sorted ranges.
+///
+/// Ranges are inclusive line indices; overlapping or adjacent ranges are
+/// joined so each line is visited once.
 fn merged_line_ranges(rope: &Rope, sels: &SelectionSet) -> Vec<(usize, usize)> {
     let mut ranges: Vec<(usize, usize)> = sels.iter().map(|s| lines_of(rope, s)).collect();
     ranges.sort_unstable();
@@ -335,12 +406,17 @@ fn merged_line_ranges(rope: &Rope, sels: &SelectionSet) -> Vec<(usize, usize)> {
 
 /// Indent every line touched by a selection by one level; selections are
 /// preserved (mapped) so repeated presses keep working.
+///
+/// Inserts `indent.unit()` at the start of each line. Blank lines are skipped
+/// when a range spans several lines.
 pub fn indent_lines(doc: &Document, sels: &SelectionSet, indent: IndentSettings) -> Option<EditResult> {
     let rope = doc.rope();
     let unit = indent.unit();
     let mut changes = Vec::new();
     for (a, b) in merged_line_ranges(rope, sels) {
         for line in a..=b {
+            // `sels.is_empty()` is always false, so this reduces to "blank line in a
+            // multi-line range".
             if line_len_chars(rope, line) == 0 && !sels.is_empty() && (a != b) {
                 continue; // keep blank lines blank in block indents
             }
@@ -350,6 +426,8 @@ pub fn indent_lines(doc: &Document, sels: &SelectionSet, indent: IndentSettings)
     let tx = Transaction::new(changes);
     let mut ns = sels.clone();
     ns.transform(|s| {
+        // `After` keeps a selection that starts at column 0 after the inserted
+        // indent rather than before it.
         let a = tx.map_pos(s.anchor, Assoc::After);
         let h = tx.map_pos(s.head, Assoc::After);
         Selection::new(a, h)
@@ -358,6 +436,9 @@ pub fn indent_lines(doc: &Document, sels: &SelectionSet, indent: IndentSettings)
 }
 
 /// Remove one level of indentation from every touched line.
+///
+/// Per line removes either one leading tab or up to `indent_width` leading
+/// spaces, whichever comes first.
 pub fn outdent_lines(doc: &Document, sels: &SelectionSet, indent: IndentSettings) -> Option<EditResult> {
     let rope = doc.rope();
     let mut changes = Vec::new();
@@ -392,6 +473,10 @@ pub fn outdent_lines(doc: &Document, sels: &SelectionSet, indent: IndentSettings
 }
 
 /// Insert `unit` at the caret, or indent lines if the selection spans lines.
+///
+/// In spaces mode the inserted run reaches the next multiple of
+/// `indent_width` display columns (tabs expanded at `tab_width`), so it
+/// aligns rather than always inserting a full unit.
 pub fn tab(doc: &Document, sels: &SelectionSet, indent: IndentSettings) -> Option<EditResult> {
     let rope = doc.rope();
     let multiline = sels.iter().any(|s| !s.is_empty() && lines_of(rope, s).0 != lines_of(rope, s).1);
@@ -410,6 +495,11 @@ pub fn tab(doc: &Document, sels: &SelectionSet, indent: IndentSettings) -> Optio
 }
 
 /// Duplicate the selected text, or the whole line for empty selections.
+///
+/// A duplicated line is inserted above the original with that line's own
+/// terminator (or the document default for the last line), and the caret
+/// moves down with the original. A duplicated selection is inserted right
+/// after itself and the copy becomes selected.
 pub fn duplicate(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     let rope = doc.rope();
     let mut changes = Vec::new();
@@ -440,6 +530,8 @@ pub fn duplicate(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
 }
 
 /// Delete whole lines touched by the selections.
+///
+/// Each selection collapses to the mapped start of its range.
 pub fn delete_lines(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     let rope = doc.rope();
     let mut changes = Vec::new();
@@ -457,6 +549,10 @@ pub fn delete_lines(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
 }
 
 /// Move the lines touched by each selection up or down by one.
+///
+/// `down` picks the direction. Ranges already at the top (or bottom) are
+/// skipped; returns `None` if every range was. Selections move with their
+/// lines and keep their extent.
 pub fn move_lines(doc: &Document, sels: &SelectionSet, down: bool) -> Option<EditResult> {
     let rope = doc.rope();
     let ranges = merged_line_ranges(rope, sels);
@@ -468,6 +564,8 @@ pub fn move_lines(doc: &Document, sels: &SelectionSet, down: bool) -> Option<Edi
         nlines
     };
     let mut changes = Vec::new();
+    // Selections are moved by hand rather than mapped through `tx`, because
+    // mapping a replaced range cannot tell which part of it a position followed.
     let mut shift: Vec<(usize, usize, isize)> = Vec::new(); // (first_char, last_char, delta)
     for (a, b) in ranges {
         if down {
@@ -520,10 +618,13 @@ pub fn move_lines(doc: &Document, sels: &SelectionSet, down: bool) -> Option<Edi
     let tx = Transaction::new(changes);
     let mut ns = sels.clone();
     ns.transform(|s| {
+        // A selection moves with the block that contains its start; selections
+        // elsewhere stay put.
         let d = shift.iter().find(|(a, b, _)| s.start() >= *a && s.start() <= *b).map(|x| x.2).unwrap_or(0);
         let f = |p: usize| ((p as isize) + d).max(0) as usize;
         Selection::new(f(s.anchor), f(s.head))
     });
+    // Guard against the hand-computed positions running past the new end.
     ns.clamp(&{
         let mut r = rope.clone();
         tx.apply(&mut r);
@@ -533,6 +634,9 @@ pub fn move_lines(doc: &Document, sels: &SelectionSet, down: bool) -> Option<Edi
 }
 
 /// Join each selected line range (or the caret line with the next) with a single space.
+///
+/// The next line's leading whitespace is removed. No space is inserted when
+/// either side is blank.
 pub fn join_lines(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     let rope = doc.rope();
     let mut changes = Vec::new();
@@ -556,6 +660,10 @@ pub fn join_lines(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
 }
 
 /// Swap the grapheme before the caret with the one after (`ab|` → `ba|`-style).
+///
+/// At the end of a line (or the document) the two graphemes before the caret
+/// are swapped instead. Selections with an extent, and carets at index 0,
+/// are left alone.
 pub fn transpose_chars(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     let rope = doc.rope();
     let text = doc.slice();
@@ -585,6 +693,12 @@ pub fn transpose_chars(doc: &Document, sels: &SelectionSet) -> Option<EditResult
 }
 
 /// Apply `f` to the lines in each selection (whole document if no extent).
+///
+/// `f` receives the lines without terminators and returns replacement
+/// lines, which are joined with the first line's terminator. Lines are
+/// whole-line ranges from `merged_line_ranges`. Without an extent the whole
+/// document is used; when it ends with a terminator, the empty last line is
+/// included in what `f` receives.
 fn transform_line_block(doc: &Document, sels: &SelectionSet, mut f: impl FnMut(Vec<String>) -> Vec<String>) -> Option<EditResult> {
     let rope = doc.rope();
     let ranges = if sels.has_extent() { merged_line_ranges(rope, sels) } else { vec![(0, rope.len_lines().saturating_sub(1))] };
@@ -606,6 +720,9 @@ fn transform_line_block(doc: &Document, sels: &SelectionSet, mut f: impl FnMut(V
     EditResult::new(tx, ns, EditKind::Other)
 }
 
+/// Sort the line block (see `transform_line_block`) by `Ord` on strings, or
+/// by lower-cased text when not `case_sensitive`; `reverse` reverses the
+/// result. The sort is stable.
 pub fn sort_lines(doc: &Document, sels: &SelectionSet, case_sensitive: bool, reverse: bool) -> Option<EditResult> {
     transform_line_block(doc, sels, |mut v| {
         if case_sensitive {
@@ -620,6 +737,8 @@ pub fn sort_lines(doc: &Document, sels: &SelectionSet, case_sensitive: bool, rev
     })
 }
 
+/// Remove repeated lines from the line block, keeping the first occurrence of
+/// each.
 pub fn unique_lines(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     transform_line_block(doc, sels, |v| {
         let mut seen = std::collections::HashSet::new();
@@ -627,6 +746,7 @@ pub fn unique_lines(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     })
 }
 
+/// Reverse the order of the lines in the line block.
 pub fn reverse_lines(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     transform_line_block(doc, sels, |mut v| {
         v.reverse();
@@ -634,9 +754,13 @@ pub fn reverse_lines(doc: &Document, sels: &SelectionSet) -> Option<EditResult> 
     })
 }
 
+/// Shuffle the line block with a Fisher–Yates pass driven by `seed`; the same
+/// seed and input give the same order.
 pub fn shuffle_lines(doc: &Document, sels: &SelectionSet, seed: u64) -> Option<EditResult> {
     transform_line_block(doc, sels, |mut v| {
         // Small xorshift so we need no RNG dependency.
+        // xorshift64 must not start at zero, hence `| 1`. Modulo bias is
+        // irrelevant here.
         let mut x = seed | 1;
         for i in (1..v.len()).rev() {
             x ^= x << 13;
@@ -649,6 +773,8 @@ pub fn shuffle_lines(doc: &Document, sels: &SelectionSet, seed: u64) -> Option<E
 }
 
 /// Remove trailing whitespace on every line (or the selected lines).
+///
+/// Only spaces and tabs are trimmed; line terminators are left alone.
 pub fn trim_trailing_whitespace(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     let rope = doc.rope();
     let mut changes = Vec::new();
@@ -678,6 +804,10 @@ pub fn trim_trailing_whitespace(doc: &Document, sels: &SelectionSet) -> Option<E
 }
 
 /// Make sure the document ends with exactly one line terminator.
+///
+/// Mechanically: appends the document's line ending when the last char is
+/// not `\n` or `\r`. Extra trailing blank lines are not removed. Returns
+/// `None` for an empty document or one that already ends with a terminator.
 pub fn ensure_final_newline(doc: &Document, sels: &SelectionSet) -> Option<EditResult> {
     let rope = doc.rope();
     let n = rope.len_chars();
@@ -691,6 +821,10 @@ pub fn ensure_final_newline(doc: &Document, sels: &SelectionSet) -> Option<EditR
 }
 
 /// Convert leading indentation between tabs and spaces across the document.
+///
+/// Each line's leading whitespace is measured with `to.tab_width` and
+/// rewritten with `to`'s style. The whole document is processed whatever
+/// `sels` covers; `sels` is only mapped through the edit.
 pub fn convert_indentation(doc: &Document, sels: &SelectionSet, to: IndentSettings) -> Option<EditResult> {
     let rope = doc.rope();
     let mut changes = Vec::new();
@@ -714,17 +848,26 @@ pub fn convert_indentation(doc: &Document, sels: &SelectionSet, to: IndentSettin
     EditResult::new(tx, ns, EditKind::Other)
 }
 
+/// Case conversion applied by `change_case`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseOp {
+    /// `UPPER CASE`.
     Upper,
+    /// `lower case`.
     Lower,
+    /// First alphanumeric of each run upper-cased, the rest lower-cased.
     Title,
+    /// Upper-case letters lowered and everything else upper-cased.
     Swap,
+    /// `snake_case`, splitting on separators and lower-to-upper transitions.
     Snake,
+    /// `camelCase`, using the same word split as `Snake`.
     Camel,
+    /// `kebab-case`, using the same word split as `Snake`.
     Kebab,
 }
 
+/// Return `s` converted by `op`.
 fn apply_case(s: &str, op: CaseOp) -> String {
     match op {
         CaseOp::Upper => s.to_uppercase(),
@@ -766,6 +909,9 @@ fn apply_case(s: &str, op: CaseOp) -> String {
     }
 }
 
+/// Split an identifier into words at `_`, `-`, whitespace, and where an
+/// upper-case char follows a lower-case char or digit. Runs of capitals are
+/// not split (`HTTPServer` stays one word).
 fn split_words(s: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut cur = String::new();
@@ -791,6 +937,9 @@ fn split_words(s: &str) -> Vec<String> {
 }
 
 /// Change the case of each selection (or the word at each caret).
+///
+/// Selections keep their direction; a caret stays in place, clamped to the
+/// end of the converted word. Carets not on a word are left alone.
 pub fn change_case(doc: &Document, sels: &SelectionSet, op: CaseOp) -> Option<EditResult> {
     let rope = doc.rope();
     let text = doc.slice();
@@ -808,6 +957,8 @@ pub fn change_case(doc: &Document, sels: &SelectionSet, op: CaseOp) -> Option<Ed
     }
     let tx = Transaction::new(changes);
     let mut ns = sels.clone();
+    // `transform` visits selections in the same order as the loop above, so
+    // `ranges[i]` lines up as long as the same carets are skipped.
     let mut i = 0;
     ns.transform(|s| {
         let r = if s.is_empty() { motion::word_at(text, s.head) } else { (s.start(), s.end()) };
@@ -830,6 +981,11 @@ pub fn change_case(doc: &Document, sels: &SelectionSet, op: CaseOp) -> Option<Ed
 
 /// Toggle a line comment prefix on the lines touched by every selection.
 /// If every non-blank line is commented, uncomment; otherwise comment all.
+///
+/// `prefix` is the comment marker including any trailing space (for example
+/// `// `). Matching ignores that trailing space so `//x` counts as
+/// commented. Blank lines are not commented unless the block is entirely
+/// blank.
 pub fn toggle_line_comment(doc: &Document, sels: &SelectionSet, prefix: &str) -> Option<EditResult> {
     let rope = doc.rope();
     let prefix_trim = prefix.trim_end();
@@ -872,6 +1028,12 @@ pub fn toggle_line_comment(doc: &Document, sels: &SelectionSet, prefix: &str) ->
 }
 
 /// Toggle block comments around each selection.
+///
+/// The range is the selection, or the caret line from its first non-blank
+/// char. If the trimmed range is itself wrapped in `open`/`close`, the markers
+/// (and one inner space each side) are removed; if `open`/`close` sit just
+/// outside the range they are removed; otherwise `open ` and ` close` are
+/// added.
 pub fn toggle_block_comment(doc: &Document, sels: &SelectionSet, open: &str, close: &str) -> Option<EditResult> {
     let rope = doc.rope();
     let mut changes = Vec::new();
@@ -894,6 +1056,7 @@ pub fn toggle_block_comment(doc: &Document, sels: &SelectionSet, open: &str, clo
             let s0 = a + a_chars;
             let e0 = b - t_chars;
             let mut open_end = s0 + open_c;
+            // Only eat the padding space if it does not overlap the close marker.
             if rope.get_char(open_end) == Some(' ') && e0 - close_c > open_end {
                 open_end += 1;
             }
@@ -920,6 +1083,10 @@ pub fn toggle_block_comment(doc: &Document, sels: &SelectionSet, open: &str, clo
 
 /// If `a..b` is directly wrapped by `open`/`close` (with optional single
 /// spaces), return the char ranges of both markers.
+///
+/// Returns `(open_start, open_end, close_start, close_end)` as char indices;
+/// the open range ends at `a` and the close range starts at `b`, so the
+/// optional spaces are included in the removed ranges.
 fn surrounding_markers(rope: &Rope, a: usize, b: usize, open: &str, close: &str) -> Option<(usize, usize, usize, usize)> {
     let oc = open.chars().count();
     let cc = close.chars().count();
@@ -947,6 +1114,8 @@ fn surrounding_markers(rope: &Rope, a: usize, b: usize, open: &str, close: &str)
 
 /// Replace each selection with `start + i*step` (number cursors like Sublime's
 /// "Arithmetic" or TextPastry).
+///
+/// `i` is the selection's position in document order, starting at 0.
 pub fn insert_sequence(doc: &Document, sels: &SelectionSet, start: i64, step: i64) -> Option<EditResult> {
     let mut i = 0i64;
     replace_each(doc, sels, EditKind::Other, |_| {
@@ -957,6 +1126,11 @@ pub fn insert_sequence(doc: &Document, sels: &SelectionSet, start: i64, step: i6
 }
 
 /// Split every multi-line selection into one selection per line.
+///
+/// Each part covers the selection's text on that line, excluding the
+/// terminator. A part that would start exactly at the selection's end on a
+/// later line is dropped. Carets are kept. This changes only selections, not
+/// the document.
 pub fn split_into_lines(doc: &Document, sels: &SelectionSet) -> SelectionSet {
     let rope = doc.rope();
     let mut ns = sels.clone();
@@ -979,6 +1153,12 @@ pub fn split_into_lines(doc: &Document, sels: &SelectionSet) -> SelectionSet {
 }
 
 /// Hard-wrap selected paragraphs (or the caret paragraph) at `width` columns.
+///
+/// Mechanically: works on the line block from `transform_line_block`, so
+/// with no extent the whole document is wrapped. Paragraphs are runs of
+/// non-blank lines; each is refilled using the first line's indentation.
+/// `width` is in display columns with a floor of 10, and tabs count as 4.
+/// Words longer than the width are kept whole.
 pub fn hard_wrap(doc: &Document, sels: &SelectionSet, width: usize) -> Option<EditResult> {
     transform_line_block(doc, sels, |lines| {
         let mut out = Vec::new();
@@ -1026,10 +1206,13 @@ pub fn hard_wrap(doc: &Document, sels: &SelectionSet, width: usize) -> Option<Ed
 mod tests {
     use super::*;
 
+    /// Build a test document from `s`.
     fn doc(s: &str) -> Document {
         Document::from_text(s)
     }
 
+    /// Run `f` on `d`, apply its result and return the new selections. Panics if
+    /// `f` produced no edit.
     fn run(d: &mut Document, f: impl FnOnce(&Document) -> Option<EditResult>) -> SelectionSet {
         let r = f(d).expect("edit produced nothing");
         let before = SelectionSet::default();
@@ -1037,6 +1220,7 @@ mod tests {
         r.sels
     }
 
+    /// Pins down post-edit caret positions and primary index for multi-caret insert.
     #[test]
     fn multi_cursor_insert_keeps_offsets_straight() {
         let mut d = doc("a\nb\nc");
@@ -1047,6 +1231,8 @@ mod tests {
         assert_eq!(s.primary_index(), 2);
     }
 
+    /// Pins down bracket auto-pairing, stepping over the closer, and pair-aware
+    /// backspace.
     #[test]
     fn auto_pair_and_step_over() {
         let mut d = doc("");
@@ -1063,6 +1249,8 @@ mod tests {
         assert_eq!(d.text(), "");
     }
 
+    /// Pins down that typing a quote over a selection wraps it and keeps the
+    /// inner text selected.
     #[test]
     fn wrap_selection_with_quotes() {
         let mut d = doc("abc");
@@ -1072,6 +1260,7 @@ mod tests {
         assert_eq!(s.primary(), Selection::new(1, 4));
     }
 
+    /// Pins down base indent, extra level after `{`, and closer on its own line.
     #[test]
     fn newline_auto_indents_and_expands_braces() {
         let mut d = doc("  foo {}");
@@ -1081,6 +1270,7 @@ mod tests {
         assert_eq!(s.primary(), Selection::point(14));
     }
 
+    /// Pins down backspace to the previous indent stop, including partial levels.
     #[test]
     fn smart_backspace_removes_indent_level() {
         let mut d = doc("      x");
@@ -1092,6 +1282,7 @@ mod tests {
         assert_eq!(d.text(), "x");
     }
 
+    /// Pins down that backspace removes a whole grapheme (base plus combining mark).
     #[test]
     fn delete_backward_grapheme() {
         let mut d = doc("ae\u{301}");
@@ -1100,6 +1291,8 @@ mod tests {
         assert_eq!(d.text(), "a");
     }
 
+    /// Pins down block indent skipping blank lines, selection mapping, and that
+    /// outdent reverses it.
     #[test]
     fn indent_outdent_round_trip() {
         let mut d = doc("a\nb\n\nc");
@@ -1112,6 +1305,8 @@ mod tests {
         assert_eq!(s.primary(), Selection::new(0, 6));
     }
 
+    /// Pins down line duplication, caret placement, and deleting the last line
+    /// with its preceding terminator.
     #[test]
     fn duplicate_and_delete_lines() {
         let mut d = doc("one\ntwo\nthree");
@@ -1126,6 +1321,8 @@ mod tests {
         assert_eq!(d.text(), "one\ntwo");
     }
 
+    /// Pins down moving a line past the end without a trailing newline, the
+    /// bottom limit, and moving back up.
     #[test]
     fn move_lines_up_and_down() {
         let mut d = doc("a\nb\nc");
@@ -1142,6 +1339,7 @@ mod tests {
         assert_eq!(s.primary(), Selection::point(2));
     }
 
+    /// Pins down join (indent stripped), sort, de-duplication and reversal.
     #[test]
     fn join_sort_unique_reverse() {
         let mut d = doc("b\n  a\nb");
@@ -1158,6 +1356,8 @@ mod tests {
         assert_eq!(d.text(), "c\nb\na");
     }
 
+    /// Pins down line comments aligned at minimum indent (blank lines skipped)
+    /// and block comment add/remove round trips.
     #[test]
     fn comments_toggle() {
         let mut d = doc("  a\n\n  b");
@@ -1174,6 +1374,7 @@ mod tests {
         assert_eq!(d.text(), "x = 1");
     }
 
+    /// Pins down title, swap, snake, camel and kebab conversions.
     #[test]
     fn case_changes() {
         let mut d = doc("hello world");
@@ -1187,6 +1388,7 @@ mod tests {
         assert_eq!(apply_case("SomeVar", CaseOp::Kebab), "some-var");
     }
 
+    /// Pins down grapheme transposition and numbered multi-caret insertion.
     #[test]
     fn transpose_and_sequence() {
         let mut d = doc("ab");
@@ -1200,6 +1402,7 @@ mod tests {
         assert_eq!(d.text(), "1\n2\n3");
     }
 
+    /// Pins down one clipboard line per caret when the counts match.
     #[test]
     fn paste_distributes_lines_across_cursors() {
         let mut d = doc("\n\n");
@@ -1208,6 +1411,7 @@ mod tests {
         assert_eq!(d.text(), "a\nb\nc");
     }
 
+    /// Pins down trailing-whitespace removal and that a final newline is added once.
     #[test]
     fn trim_and_final_newline() {
         let mut d = doc("a  \nb\t");
@@ -1219,6 +1423,7 @@ mod tests {
         assert!(ensure_final_newline(&d, &s).is_none());
     }
 
+    /// Pins down per-line selection splitting and paragraph refill at a width.
     #[test]
     fn split_lines_and_hard_wrap() {
         let d = doc("ab\ncd\nef");
@@ -1229,6 +1434,7 @@ mod tests {
         assert_eq!(d.text(), "one two\nthree four\nfive six");
     }
 
+    /// Measures (and bounds at 200 ms) a 1,000-caret insert, checking offsets.
     #[test]
     fn thousand_cursors_insert() {
         let text = "x\n".repeat(1000);

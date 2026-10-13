@@ -17,11 +17,15 @@ use apex_edit::{Assoc, Change, Document, EditKind, Selection, SelectionSet, Tran
 
 use crate::command::Command;
 
+/// Current editing mode of the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
+    /// Keys pass through to the ordinary editor until Esc.
     Insert,
+    /// Characterwise visual selection (`v`).
     Visual,
+    /// Linewise visual selection (`V`).
     VisualLine,
     /// `:` or `/` command line is being typed.
     CmdLine,
@@ -51,6 +55,7 @@ pub enum Key {
 /// Per-key environment the host supplies.
 #[derive(Debug, Clone, Copy)]
 pub struct Env {
+    /// Tab width in columns, for display-column (goal column) calculations.
     pub tab_width: usize,
     /// Rows visible in the editor; used by Ctrl+F/B/D/U.
     pub page_lines: usize,
@@ -58,14 +63,22 @@ pub struct Env {
 
 /// What the engine needs from the application.
 pub trait VimHost {
+    /// The document being edited.
     fn doc(&self) -> &Document;
+    /// Current selections (char indices).
     fn sels(&self) -> SelectionSet;
+    /// Replace the selections without editing text.
     fn set_sels(&mut self, sels: SelectionSet);
     /// Apply an edit produced from the current document and selections.
+    /// Returns whether an edit was applied (`f` returning `None` means no edit).
     fn edit(&mut self, f: &mut dyn FnMut(&Document, &SelectionSet) -> Option<EditResult>) -> bool;
+    /// Run an application command, with an optional string argument (e.g. a path or `"force"`).
     fn command(&mut self, cmd: Command, arg: Option<String>);
+    /// Show a status-bar message; `error` styles it as an error.
     fn status(&mut self, text: String, error: bool);
+    /// Read the system clipboard.
     fn clipboard_get(&mut self) -> Option<String>;
+    /// Write the system clipboard.
     fn clipboard_set(&mut self, text: String);
     /// Start a new undo group so an insert session undoes as one step.
     fn undo_boundary(&mut self);
@@ -73,36 +86,56 @@ pub trait VimHost {
     fn system_paste(&mut self) {}
 }
 
+/// Contents of one named register.
 #[derive(Debug, Clone, Default)]
 struct Register {
     text: String,
+    /// Yanked as whole lines: pastes go above/below the line rather than at the caret.
     linewise: bool,
 }
 
+/// The `:`, `/` or `?` command line being typed.
 #[derive(Debug, Clone)]
 pub struct CmdLine {
+    /// Prompt character: `:`, `/` or `?`.
     pub prompt: char,
+    /// Text typed after the prompt.
     pub text: String,
 }
 
+/// Operator that acts on a motion, text object or visual range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
+    /// `d`
     Delete,
+    /// `c`: delete then enter insert mode.
     Change,
+    /// `y`
     Yank,
+    /// `>`
     Indent,
+    /// `<`
     Outdent,
+    /// `gU`
     Upper,
+    /// `gu`
     Lower,
+    /// `g~`
     ToggleCase,
+    /// `=`: re-indent.
     Format,
 }
 
+/// Single-character find on the current line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FindKind {
+    /// `f`: forward, onto the char.
     F,
+    /// `F`: backward, onto the char.
     BackF,
+    /// `t`: forward, stop before the char.
     T,
+    /// `T`: backward, stop after the char.
     BackT,
 }
 
@@ -119,23 +152,34 @@ enum Span {
     Range(usize, usize, bool),
 }
 
+/// The Vim engine: mode, pending keys, registers and repeat state. One per
+/// editor; it reads and edits the document only through a [`VimHost`].
 pub struct Vim {
+    /// Current mode.
     pub mode: Mode,
+    /// Command line being typed; `Some` only in [`Mode::CmdLine`].
     pub cmdline: Option<CmdLine>,
     /// Keys of the command being typed (counts, register, operator, pending motion key).
     pending: Vec<Key>,
+    /// Registers by name (`"`, `0`-`9`, `-`, `a`-`z`).
     registers: HashMap<char, Register>,
     /// Keys of the last change, for `.`.
     last_change: Vec<Key>,
+    /// Keys since the last completed command; becomes `last_change` if the command edited text.
     recording: Vec<Key>,
+    /// True while `.` replays `last_change`, so the replay is not itself recorded.
     replaying: bool,
+    /// Last search pattern and whether it searched forward, for `n`/`N`.
     last_search: Option<(String, bool)>,
+    /// Last `f`/`F`/`t`/`T` target, for `;` and `,`.
     last_find: Option<(char, FindKind)>,
     /// Anchor of the visual selection as a char offset.
     visual_anchor: usize,
+    /// Display column that `j`/`k` try to keep; cleared by horizontal motions.
     goal_col: Option<usize>,
     /// Pending `i`/`a` count: the inserted text is repeated when leaving insert mode.
     insert_repeat: usize,
+    /// Char index where the current insert session began (for `insert_repeat`).
     insert_start: usize,
     /// Operator waiting for a `/pattern<CR>` target.
     pending_op: Option<(Op, Option<char>)>,
@@ -144,12 +188,14 @@ pub struct Vim {
 }
 
 impl Default for Vim {
+    /// Same as [`Vim::new`].
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl Vim {
+    /// A new engine in normal mode with empty registers.
     pub fn new() -> Self {
         Vim {
             mode: Mode::Normal,
@@ -207,6 +253,7 @@ impl Vim {
             // A mouse or quick-add selection becomes a visual selection.
             self.start_visual(Mode::Visual, host);
         }
+        // Command-line keys are not recorded: `.` repeats edits, not ex commands.
         if !self.replaying && self.mode != Mode::CmdLine {
             self.recording.push(k);
         }
@@ -217,11 +264,15 @@ impl Vim {
                 true
             }
             Mode::Normal | Mode::Visual | Mode::VisualLine => {
+                // Re-parse the whole pending sequence on every key; an
+                // incomplete parse just stashes it again.
                 self.pending.push(k);
                 let keys = std::mem::take(&mut self.pending);
                 match self.run(&keys, env, host) {
                     Parse::Incomplete => self.pending = keys,
                     Parse::Done { change } => {
+                        // A change that entered insert mode (e.g. `cw`) keeps
+                        // recording until Esc, so `.` replays the typed text too.
                         if change && !self.replaying && self.mode != Mode::Insert {
                             self.last_change = std::mem::take(&mut self.recording);
                         } else if self.mode != Mode::Insert {
@@ -239,6 +290,9 @@ impl Vim {
 
     // ----- insert mode ---------------------------------------------------------------
 
+    /// Handle a key in insert mode. Esc returns to normal mode (applying any
+    /// count repeat and closing the undo group); other keys return false so the
+    /// editor handles them, except during `.` replay where they are applied here.
     fn insert_key(&mut self, k: Key, _env: &Env, host: &mut dyn VimHost) -> bool {
         match k {
             Key::Esc => {
@@ -260,6 +314,7 @@ impl Vim {
                     host.command(Command::ToggleOverwrite, None);
                 }
                 host.undo_boundary();
+                // Vim steps the caret back one char when leaving insert mode.
                 self.move_all(host, |_, p| p.saturating_sub(1), false, _env);
                 self.clamp_normal(host);
                 if !self.replaying {
@@ -294,6 +349,9 @@ impl Vim {
 
     // ----- command line --------------------------------------------------------------
 
+    /// Edit the command line, or run it on Enter: `:` runs an ex command, `/`
+    /// and `?` search (or complete a pending `d/pattern` style operator).
+    /// Backspace on an empty line cancels.
     fn cmdline_key(&mut self, k: Key, env: &Env, host: &mut dyn VimHost) {
         let Some(cl) = &mut self.cmdline else {
             self.mode = Mode::Normal;
@@ -318,6 +376,7 @@ impl Vim {
                     ':' => self.ex_command(&cl.text, env, host),
                     '/' | '?' => {
                         let forward = cl.prompt == '/';
+                        // An empty pattern reuses the previous search.
                         if !cl.text.is_empty() {
                             self.last_search = Some((cl.text.clone(), forward));
                         }
@@ -326,6 +385,7 @@ impl Vim {
                             let rope = host.doc().rope();
                             let cur = self.cursor(host).min(rope.len_chars());
                             match search_from(rope, &pat, cur, fwd, 1) {
+                                // Search motions are exclusive, in either direction.
                                 Some(p) => self.apply_operator(op, cur.min(p), cur.max(p), false, register, host, env),
                                 None => host.status(format!("Pattern not found: {pat}"), true),
                             }
@@ -340,6 +400,8 @@ impl Vim {
         }
     }
 
+    /// Run a `:` command (without the colon). Most map to an application
+    /// [`Command`]; unknown commands report an error on the status bar.
     fn ex_command(&mut self, text: &str, env: &Env, host: &mut dyn VimHost) {
         let text = text.trim();
         if text.is_empty() {
@@ -357,6 +419,8 @@ impl Vim {
         } else {
             (ExRange::Line, text)
         };
+        // Split command name from argument; a `!` stays on the name (`q!`), a
+        // `/` starts the argument (`s/a/b/`).
         let (cmd, arg) = match rest.find(|c: char| c.is_whitespace() || c == '/' || c == '!') {
             Some(i) if rest[i..].starts_with('!') => (&rest[..=i], rest[i + 1..].trim()),
             Some(i) => (&rest[..i], rest[i..].trim()),
@@ -400,6 +464,10 @@ impl Vim {
         let _ = env;
     }
 
+    /// `:s/pattern/replacement/flags` over `range`. The pattern is a regex;
+    /// flags `g` (all matches per line) and `i` (ignore case) are honoured. Applies
+    /// one transaction, leaves the caret at the start of the last changed line
+    /// and returns to normal mode.
     fn ex_substitute(&mut self, range: ExRange, arg: &str, host: &mut dyn VimHost) {
         // s/pat/rep/flags with `/` as the only delimiter; `\/` escapes it.
         let Some(body) = arg.strip_prefix('/') else {
@@ -447,12 +515,14 @@ impl Vim {
             }
             ExRange::Visual => {
                 let p = sels.primary();
+                // Visual mode may have been left already; include the stored anchor.
                 let (a, b) = (p.start(), p.end().max(self.visual_anchor.min(rope.len_chars())));
                 let la = rope.char_to_line(a);
                 let lb = rope.char_to_line(b.saturating_sub(1).max(a));
                 (rope.line_to_char(la), line_end_char(rope, lb))
             }
         };
+        // At most 100,000 matches are considered; later ones are left unchanged.
         let mut matches = query.find_all(rope, 100_000);
         matches.retain(|m| m.range.start >= start && m.range.end <= end);
         if !global {
@@ -493,6 +563,9 @@ impl Vim {
 
     // ----- normal / visual parsing ----------------------------------------------------
 
+    /// Parse and, if complete, execute a normal/visual-mode key sequence:
+    /// `["x][count]operator[count]target` or a simple command. Returns
+    /// `Incomplete` to wait for more keys.
     fn run(&mut self, keys: &[Key], env: &Env, host: &mut dyn VimHost) -> Parse {
         let mut i = 0;
         // Register prefix.
@@ -545,6 +618,7 @@ impl Vim {
                 }
                 _ => keys.get(i) == Some(&k),
             };
+            // A count may also sit between the operator and its target (`d3w`, `d3d`).
             let (count2, ni) = parse_count(keys, i);
             let count2 = count2.unwrap_or(1);
             if doubled || (keys.get(ni) == Some(&k) && count2 != 1) {
@@ -583,6 +657,7 @@ impl Vim {
                     let cur = self.cursor(host);
                     let rope = host.doc().rope();
                     let (a, b, linewise) = span_range(rope, cur, span);
+                    // Empty range: nothing to operate on, and nothing to repeat.
                     if a == b && !linewise {
                         return Parse::Done { change: false };
                     }
@@ -595,7 +670,9 @@ impl Vim {
         }
     }
 
-    /// Commands that are not operator + target.
+    /// Commands that are not operator + target: mode switches, single-key
+    /// edits, put, undo, `.` and so on. `keys` starts after any register and
+    /// count; anything unrecognised is parsed as a plain motion.
     fn simple_command(&mut self, keys: &[Key], count: Option<usize>, register: Option<char>, env: &Env, host: &mut dyn VimHost) -> Parse {
         let n = count.unwrap_or(1);
         let Some(&k) = keys.first() else { return Parse::Incomplete };
@@ -709,6 +786,8 @@ impl Vim {
                 let (ws, we) = motion::word_at(host.doc().slice(), p);
                 if ws < we {
                     let w: String = host.doc().rope().slice(ws..we).to_string();
+                    // The direction is stored with the pattern (`#` searches
+                    // backward), so step "in the same direction" below.
                     self.last_search = Some((format!("\\b{}\\b", regex_escape(&w)), c == '*'));
                     self.search_step(n as i64, true, host);
                 }
@@ -719,6 +798,7 @@ impl Vim {
                     let (a, b, lw) = self.visual_range(host);
                     self.apply_operator(Op::Delete, a, b, lw, register, host, env);
                 } else {
+                    // `x` never deletes past the end of the line.
                     let cur = self.cursor(host);
                     let rope = host.doc().rope();
                     let end = (cur + n).min(line_end_of(rope, cur));
@@ -812,6 +892,7 @@ impl Vim {
                     (rope.char_to_line(a), rope.char_to_line(b.saturating_sub(1).max(a)))
                 } else {
                     let l = rope.char_to_line(cur.min(rope.len_chars()));
+                    // `J` and `2J` both join two lines; `nJ` joins n lines.
                     (l, (l + n.max(2) - 1).min(rope.len_lines().saturating_sub(1)))
                 };
                 let joins = lb.saturating_sub(la).max(1);
@@ -831,6 +912,7 @@ impl Vim {
                     if visual {
                         let (a, b, _) = self.visual_range(host);
                         host.edit(&mut |d, s| {
+                            // Keep newlines so the line structure is unchanged.
                             let text: String = d.rope().slice(a..b).chars().map(|ch| if ch == '\n' { '\n' } else { c }).collect();
                             let tx = Transaction::single(Change::replace(a, b, text));
                             let mut ns = s.clone();
@@ -841,6 +923,7 @@ impl Vim {
                     } else {
                         let cur = self.cursor(host);
                         let end = (cur + n).min(line_end_of(host.doc().rope(), cur));
+                        // As in Vim, `3rx` does nothing if fewer than 3 chars remain on the line.
                         if end - cur == n {
                             let text: String = std::iter::repeat_n(c, n).collect();
                             host.edit(&mut |_, s| {
@@ -916,6 +999,8 @@ impl Vim {
                     prefixed.append(&mut keys);
                     keys = prefixed;
                 }
+                // The replay feeds keys back through `key`, which owns `pending`;
+                // stash it so the `.` sequence itself is not mixed in.
                 self.replaying = true;
                 let saved_pending = std::mem::take(&mut self.pending);
                 for key in keys {
@@ -934,6 +1019,8 @@ impl Vim {
                 Some(Key::Char(c)) if c.is_ascii_alphabetic() => {
                     let p = self.cursor(host);
                     let _ = p;
+                    // Marks live in the document (prefixed `vim:`); the host sets
+                    // the mark at the current caret.
                     host.command(Command::SetMark, Some(format!("vim:{c}")));
                     change(false)
                 }
@@ -1022,6 +1109,10 @@ impl Vim {
     // ----- motions and text objects --------------------------------------------------
 
     /// Parse a motion or (after an operator / in visual mode) a text object.
+    /// `n` is the effective count; `after_op` is true when an operator is waiting,
+    /// which changes some motions (`l`, `w`) and enables `i`/`a` objects and `n`/`N`.
+    /// `g` commands that act directly on the host return `Target::Invalid`
+    /// after running, so no motion follows.
     fn parse_target(&mut self, keys: &[Key], n: usize, env: &Env, host: &mut dyn VimHost, after_op: bool) -> Target {
         let Some(&k) = keys.first() else { return Target::Incomplete };
         // Keys that act on the host rather than yield a span.
@@ -1089,6 +1180,7 @@ impl Vim {
                 }
                 Span::Exclusive(p)
             }
+            // Vertical motions yield the target line; `apply_motion` applies the goal column.
             Key::Char('j') | Key::Down | Key::Ctrl('n') | Key::Ctrl('j') => Span::Linewise((line + n).min(last_line)),
             Key::Char('k') | Key::Up | Key::Ctrl('p') => Span::Linewise(line.saturating_sub(n)),
             Key::Char('0') | Key::Home => Span::Exclusive(rope.line_to_char(line)),
@@ -1129,6 +1221,7 @@ impl Vim {
                     // Vim's `e` moves at least one char before looking for an end.
                     let from = (p + 1).min(rope.len_chars());
                     let e = if big { next_big_word_end(rope, from) } else { motion::next_word_end(doc.slice(), from) };
+                    // `next_word_end` returns an exclusive end; the caret sits on the last char.
                     p = e.saturating_sub(1).max(p);
                     if e == from {
                         break;
@@ -1138,6 +1231,7 @@ impl Vim {
             }
             Key::Char('g') => match keys.get(1) {
                 None => return Target::Incomplete,
+                // `gg`/`G` with a count go to that (1-based) line.
                 Some(Key::Char('g')) => Span::Linewise(if n > 1 { (n - 1).min(last_line) } else { 0 }),
                 Some(Key::Char('e')) => {
                     let mut p = cur;
@@ -1150,6 +1244,7 @@ impl Vim {
                     let l = (line + n - 1).min(last_line);
                     let e = line_end_char(rope, l);
                     let mut p = e;
+                    // `g_`: last non-blank char of the line.
                     while p > rope.line_to_char(l) && rope.char(p - 1).is_whitespace() {
                         p -= 1;
                     }
@@ -1177,6 +1272,7 @@ impl Vim {
                 let le = line_end_char(rope, line);
                 (cur..le).find(|&p| "([{}])".contains(rope.char(p))).and_then(|p| apex_edit::brackets::matching_bracket(rope, p))
             }) {
+                // From the opener (or before the pair) go to the closer, otherwise to the opener.
                 Some((a, b)) => Span::Inclusive(if cur == a || (cur != b && cur < a) { b } else { a }),
                 None => return Target::Invalid,
             },
@@ -1191,6 +1287,7 @@ impl Vim {
                     };
                     self.last_find = Some((*target, kind));
                     match find_char(rope, cur, *target, kind, n) {
+                        // Backward finds exclude the char under the caret, as in Vim.
                         Some(p) => {
                             if matches!(kind, FindKind::F | FindKind::T) {
                                 Span::Inclusive(p)
@@ -1236,6 +1333,7 @@ impl Vim {
                 let p = mark_pos.unwrap_or(cur).min(rope.len_chars());
                 if k == Key::Char('\'') { Span::Linewise(rope.char_to_line(p)) } else { Span::Exclusive(p) }
             }
+            // `H`/`M`/`L` are relative to `top_line_hint`, an approximation (see there).
             Key::Char('H') => Span::Linewise(self.top_line_hint(host).min(last_line)),
             Key::Char('L') => Span::Linewise((self.top_line_hint(host) + env.page_lines.saturating_sub(1)).min(last_line)),
             Key::Char('M') => Span::Linewise((self.top_line_hint(host) + env.page_lines / 2).min(last_line)),
@@ -1246,6 +1344,7 @@ impl Vim {
             Key::Enter | Key::Char('+') => Span::Linewise((line + n).min(last_line)),
             Key::Char('-') => Span::Linewise(line.saturating_sub(n)),
             Key::Char('_') => Span::Linewise((line + n - 1).min(last_line)),
+            // `n|`: display column n (1-based) of the current line, clamped to its end.
             Key::Char('|') => {
                 let l = rope.line(line);
                 Span::Exclusive(
@@ -1262,6 +1361,7 @@ impl Vim {
             },
             Key::Char('n') | Key::Char('N') if after_op => {
                 let Some((pat, fwd)) = self.last_search.clone() else { return Target::Invalid };
+                // `N` reverses the stored direction.
                 let forward = (k == Key::Char('n')) == fwd;
                 match search_from(rope, &pat, cur, forward, n) {
                     Some(p) => Span::Exclusive(p),
@@ -1273,12 +1373,17 @@ impl Vim {
         Target::Span(span)
     }
 
+    /// Line used as the top of the screen for `H`/`M`/`L`. The engine has no
+    /// view, so this is the caret line.
     fn top_line_hint(&self, host: &mut dyn VimHost) -> usize {
         // Without the view we approximate H/M/L from the cursor line (the host scrolls to it).
         let rope = host.doc().rope();
         rope.char_to_line(self.cursor(host).min(rope.len_chars()))
     }
 
+    /// Move the caret (or the visual cursor) to a motion's target. Linewise
+    /// targets keep `goal_col`; other motions clear it. In visual mode a text
+    /// object replaces the selection.
     fn apply_motion(&mut self, span: Span, host: &mut dyn VimHost, env: &Env) {
         let rope = host.doc().rope();
         let cur = self.cursor(host).min(rope.len_chars());
@@ -1294,6 +1399,7 @@ impl Vim {
                 let le = line_end_char(rope, l);
                 let col = display_col_to_char_col(rope.line(l), goal, env.tab_width);
                 let p = (ls + col).min(le);
+                // Normal mode never rests on the newline (except on an empty line).
                 if !matches!(self.mode, Mode::Visual | Mode::VisualLine) && p == le && le > ls { le - 1 } else { p }
             }
             Span::Range(a, b, _) => {
@@ -1334,6 +1440,8 @@ impl Vim {
 
     // ----- visual helpers ------------------------------------------------------------
 
+    /// Enter `mode` (`Visual` or `VisualLine`) from the current primary selection;
+    /// collapses to a single selection.
     fn start_visual(&mut self, mode: Mode, host: &mut dyn VimHost) {
         let s = host.sels().primary();
         self.mode = mode;
@@ -1354,6 +1462,7 @@ impl Vim {
         let cursor = cursor.min(n);
         let anchor = self.visual_anchor.min(n);
         let sel = match self.mode {
+            // Keep the editor selection's direction matching anchor -> cursor.
             Mode::VisualLine => {
                 let (la, lb) = (rope.char_to_line(anchor), rope.char_to_line(cursor));
                 let (a, b) = line_range(rope, la.min(lb), la.max(lb));
@@ -1370,7 +1479,7 @@ impl Vim {
         host.set_sels(SelectionSet::single(sel));
     }
 
-    /// Char range covered by the visual selection.
+    /// Char range `[start, end)` covered by the visual selection, plus whether it is linewise.
     fn visual_range(&self, host: &mut dyn VimHost) -> (usize, usize, bool) {
         let s = host.sels().primary();
         (s.start(), s.end(), self.mode == Mode::VisualLine)
@@ -1378,6 +1487,9 @@ impl Vim {
 
     // ----- operators -----------------------------------------------------------------
 
+    /// Apply `op` to the char range `[a, b)`. Deleted or yanked text goes to
+    /// `register` (and the unnamed/numbered registers); `Change` then enters
+    /// insert mode, everything else returns to normal mode with the caret near `a`.
     #[allow(clippy::too_many_arguments)]
     fn apply_operator(&mut self, op: Op, a: usize, b: usize, linewise: bool, register: Option<char>, host: &mut dyn VimHost, env: &Env) {
         let rope = host.doc().rope();
@@ -1392,6 +1504,7 @@ impl Vim {
                 self.clamp_normal(host);
             }
             Op::Delete | Op::Change => {
+                // An empty `c` (e.g. `cl` at line end) must not clobber the registers.
                 if op == Op::Delete || !text.is_empty() {
                     self.store_register(register, text.clone(), linewise, host, false);
                 }
@@ -1426,6 +1539,8 @@ impl Vim {
             Op::Indent | Op::Outdent => {
                 let (la, lb) = (rope.char_to_line(a), rope.char_to_line(b.saturating_sub(1).max(a)));
                 let (ra, rb) = line_range(rope, la, lb);
+                // Select the lines (without the final newline) so the editor's
+                // indent/outdent ops act on exactly those lines.
                 host.set_sels(SelectionSet::single(Selection::new(ra, rb.saturating_sub(1).max(ra))));
                 host.edit(&mut |d, s| if op == Op::Indent { ops::indent_lines(d, s, d.indent) } else { ops::outdent_lines(d, s, d.indent) });
                 self.mode = Mode::Normal;
@@ -1434,6 +1549,7 @@ impl Vim {
                 host.set_sels(SelectionSet::single(Selection::point(p)));
             }
             Op::Format => {
+                // `Reindent` works on the current selection, so select the range first.
                 host.set_sels(SelectionSet::single(Selection::new(a, b)));
                 host.command(Command::Reindent, None);
                 self.mode = Mode::Normal;
@@ -1461,6 +1577,10 @@ impl Vim {
         }
     }
 
+    /// Store yanked (`yank`) or deleted text, following Vim's register rules:
+    /// `_` discards, `+`/`*` also set the system clipboard, `A`-`Z` append to
+    /// `a`-`z`. The unnamed register always updates; yanks also set `0`,
+    /// multi-line deletes shift `1`-`9`, small deletes set `-`.
     fn store_register(&mut self, register: Option<char>, text: String, linewise: bool, host: &mut dyn VimHost, yank: bool) {
         let reg = Register { text: text.clone(), linewise };
         match register {
@@ -1496,6 +1616,10 @@ impl Vim {
         }
     }
 
+    /// `p` (`after`) or `P`: paste register contents `n` times. Linewise text
+    /// goes below/above the current line; otherwise after/at the caret. With no
+    /// register and an empty unnamed register, falls back to the system clipboard.
+    /// In visual mode replaces the selection.
     fn put(&mut self, after: bool, n: usize, register: Option<char>, visual: bool, host: &mut dyn VimHost, env: &Env) {
         let reg = match register {
             Some('+' | '*') => {
@@ -1519,6 +1643,7 @@ impl Vim {
             let (a, b, lw) = self.visual_range(host);
             let old: String = host.doc().rope().slice(a..b).to_string();
             let mut ins = text.clone();
+            // Bridge linewise/characterwise mismatches with an extra newline.
             if reg.linewise && !lw {
                 ins = format!("\n{ins}");
             } else if !reg.linewise && lw {
@@ -1541,6 +1666,7 @@ impl Vim {
             let line = rope.char_to_line(cur);
             let at = if after { if line + 1 < rope.len_lines() { rope.line_to_char(line + 1) } else { rope.len_chars() } } else { rope.line_to_char(line) };
             let mut ins = text;
+            // Pasting below a last line that has no newline: add one first.
             let needs_nl_before = after && line + 1 >= rope.len_lines() && !rope.to_string().ends_with('\n') && rope.len_chars() > 0;
             if needs_nl_before {
                 ins = format!("\n{ins}");
@@ -1572,6 +1698,9 @@ impl Vim {
 
     // ----- search --------------------------------------------------------------------
 
+    /// `n`/`N`: jump to the `count`th match of the last search, in its stored
+    /// direction (`same_direction`) or the reverse. Also hands the pattern to
+    /// the editor's find so matches are highlighted.
     fn search_step(&mut self, count: i64, same_direction: bool, host: &mut dyn VimHost) {
         let Some((pat, fwd)) = self.last_search.clone() else {
             host.status("No previous search".into(), true);
@@ -1594,6 +1723,8 @@ impl Vim {
 
     // ----- misc helpers --------------------------------------------------------------
 
+    /// Switch to insert mode: open an undo group, remember where insertion
+    /// started and collapse selections to their heads.
     fn enter_insert(&mut self, host: &mut dyn VimHost) {
         host.undo_boundary();
         self.mode = Mode::Insert;
@@ -1603,6 +1734,7 @@ impl Vim {
         host.set_sels(sels);
     }
 
+    /// `:n`: put the caret on the first non-blank of 1-based line `n` (clamped).
     fn goto_line(&mut self, n: usize, host: &mut dyn VimHost) {
         let rope = host.doc().rope();
         let line = n.saturating_sub(1).min(rope.len_lines().saturating_sub(1));
@@ -1610,7 +1742,7 @@ impl Vim {
         host.set_sels(SelectionSet::single(Selection::point(p)));
     }
 
-    /// Move every caret with `f`.
+    /// Move every caret to `f(doc, head)` (char index, clamped to the document).
     fn move_all(&mut self, host: &mut dyn VimHost, f: impl Fn(&Document, usize) -> usize, extend: bool, _env: &Env) {
         let mut sels = host.sels();
         let doc = host.doc();
@@ -1650,25 +1782,39 @@ impl Vim {
     }
 }
 
+/// Line range prefix of an ex command.
 #[derive(Debug, Clone, Copy)]
 enum ExRange {
+    /// No prefix: the caret line.
     Line,
+    /// `%`: the whole document.
     All,
+    /// `'<,'>`: the lines of the visual selection.
     Visual,
 }
 
+/// Outcome of parsing a normal/visual key sequence.
 enum Parse {
+    /// Need more keys; keep them pending.
     Incomplete,
+    /// Not a valid command; discard the keys.
     Invalid,
+    /// Executed. `change` is true if it edited text and should be repeatable with `.`.
     Done { change: bool },
 }
 
+/// Outcome of parsing a motion or text object.
 enum Target {
+    /// Need more keys.
     Incomplete,
+    /// Not a motion (or a `g` command already run); no span.
     Invalid,
     Span(Span),
 }
 
+/// Parse a decimal count starting at `keys[i]`. A leading `0` is not a count
+/// (it is the `0` motion). Returns the count (capped at 1,000,000) and the
+/// index after it.
 fn parse_count(keys: &[Key], mut i: usize) -> (Option<usize>, usize) {
     let mut n: Option<usize> = None;
     while let Some(Key::Char(c)) = keys.get(i) {
@@ -1684,25 +1830,32 @@ fn parse_count(keys: &[Key], mut i: usize) -> (Option<usize>, usize) {
     (n, i)
 }
 
+/// Char index of the start of `line`.
 fn ls_of(rope: &Rope, line: usize) -> usize {
     rope.line_to_char(line)
 }
 
+/// Whether char index `p` is at (or past) the end of its line's content.
 fn at_line_end(rope: &Rope, p: usize) -> bool {
     let p = p.min(rope.len_chars());
     p >= line_end_char(rope, rope.char_to_line(p))
 }
 
+/// Char index of the end of the line containing `p` (before the newline).
 fn line_end_of(rope: &Rope, p: usize) -> usize {
     line_end_char(rope, rope.char_to_line(p.min(rope.len_chars())))
 }
 
+/// Char index of the first non-blank on the line containing `p`, or the line
+/// end if the line is blank.
 fn first_non_blank_of_line(rope: &Rope, p: usize) -> usize {
     let line = rope.char_to_line(p.min(rope.len_chars()));
     let ls = rope.line_to_char(line);
     (ls + motion::first_non_blank(rope.line(line))).min(line_end_char(rope, line))
 }
 
+/// Char index of the first non-blank of the first line of `inserted`, given
+/// that it will be placed at char index `start`.
 fn first_non_blank_of_line_text(inserted: &str, start: usize) -> usize {
     let first = inserted.lines().next().unwrap_or("");
     start + first.chars().take_while(|c| c.is_whitespace()).count()
@@ -1723,6 +1876,7 @@ fn span_range(rope: &Rope, cur: usize, span: Span) -> (usize, usize, bool) {
         Span::Exclusive(p) => (cur.min(p), cur.max(p), false),
         Span::Inclusive(p) => {
             let (a, b) = (cur.min(p), cur.max(p));
+            // Extend past the last grapheme so the end is exclusive.
             (a, motion::next_grapheme_boundary(rope.slice(..), b).max(b).min(n), false)
         }
         Span::Linewise(l) => {
@@ -1734,10 +1888,12 @@ fn span_range(rope: &Rope, cur: usize, span: Span) -> (usize, usize, bool) {
     }
 }
 
+/// Whether `c` belongs to a WORD (`W`/`B`/`E`): any non-whitespace.
 fn is_big_word_char(c: char) -> bool {
     !c.is_whitespace()
 }
 
+/// `W`: char index of the next WORD start after `p` (or the document end).
 fn next_big_word_start(rope: &Rope, p: usize) -> usize {
     let n = rope.len_chars();
     let mut i = p.min(n);
@@ -1750,6 +1906,7 @@ fn next_big_word_start(rope: &Rope, p: usize) -> usize {
     i
 }
 
+/// Exclusive end (char index) of the next WORD at or after `p`, skipping leading whitespace.
 fn next_big_word_end(rope: &Rope, p: usize) -> usize {
     let n = rope.len_chars();
     let mut i = p.min(n);
@@ -1762,6 +1919,7 @@ fn next_big_word_end(rope: &Rope, p: usize) -> usize {
     i
 }
 
+/// `B`: char index of the start of the WORD before `p`.
 fn prev_big_word_start(rope: &Rope, p: usize) -> usize {
     let mut i = p.min(rope.len_chars());
     while i > 0 && rope.char(i - 1).is_whitespace() {
@@ -1773,10 +1931,13 @@ fn prev_big_word_start(rope: &Rope, p: usize) -> usize {
     i
 }
 
+/// Whether line `l` is empty or whitespace only.
 fn line_is_blank(rope: &Rope, l: usize) -> bool {
     rope.line(l).chars().all(char::is_whitespace)
 }
 
+/// `}`: the next blank line after the paragraph at `line` (skipping blank
+/// lines first), or the last line.
 fn next_paragraph(rope: &Rope, line: usize) -> usize {
     let last = rope.len_lines().saturating_sub(1);
     let mut l = line;
@@ -1789,6 +1950,7 @@ fn next_paragraph(rope: &Rope, line: usize) -> usize {
     l
 }
 
+/// `{`: the previous blank line before the paragraph at `line`, or line 0.
 fn prev_paragraph(rope: &Rope, line: usize) -> usize {
     let mut l = line;
     while l > 0 && line_is_blank(rope, l) {
@@ -1800,6 +1962,8 @@ fn prev_paragraph(rope: &Rope, line: usize) -> usize {
     l
 }
 
+/// `f`/`F`/`t`/`T`: char index of the `n`th `target` on the caret's line in
+/// the given direction (adjusted by one for `t`/`T`), or `None` if absent.
 fn find_char(rope: &Rope, cur: usize, target: char, kind: FindKind, n: usize) -> Option<usize> {
     let line = rope.char_to_line(cur.min(rope.len_chars()));
     let ls = rope.line_to_char(line);
@@ -1818,6 +1982,7 @@ fn find_char(rope: &Rope, cur: usize, target: char, kind: FindKind, n: usize) ->
     })
 }
 
+/// Backslash-escape regex metacharacters so `s` matches literally.
 fn regex_escape(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -1830,6 +1995,8 @@ fn regex_escape(s: &str) -> String {
 }
 
 /// Position of the `n`th match of `pat` after/before `cur`, wrapping around.
+/// `pat` is a regex, case-sensitive only if it contains an upper-case letter
+/// (smart case). Returns the match start as a char index.
 fn search_from(rope: &Rope, pat: &str, cur: usize, forward: bool, n: usize) -> Option<usize> {
     let q = Query::new(pat, SearchOptions { case_sensitive: pat.chars().any(char::is_uppercase), whole_word: false, regex: true, in_range: None }).ok()?;
     let matches = q.find_all(rope, 200_000);
@@ -1845,12 +2012,17 @@ fn search_from(rope: &Rope, pat: &str, cur: usize, forward: bool, n: usize) -> O
     if forward {
         idx = (idx + step) % matches.len();
     } else {
+        // `idx - step` modulo len, without underflow.
         idx = (idx + matches.len() * step - step) % matches.len();
     }
     Some(matches[idx].range.start)
 }
 
 /// Text objects: `(a, b, linewise)` or None.
+///
+/// `obj` is the object key (`w`, `W`, `p`, quotes, brackets, `t`, `s`),
+/// `around` selects the `a` form rather than `i`, `n` is the count. The range
+/// is `[a, b)` in char indices.
 fn text_object(rope: &Rope, cur: usize, obj: char, around: bool, n: usize) -> Option<(usize, usize, bool)> {
     let len = rope.len_chars();
     let cur = cur.min(len);
@@ -1861,6 +2033,7 @@ fn text_object(rope: &Rope, cur: usize, obj: char, around: bool, n: usize) -> Op
             if cur >= len {
                 return None;
             }
+            // Grow over the run of the caret char's class, stopping at line breaks.
             let c0 = class(rope.char(cur));
             let mut a = cur;
             while a > 0 && class(rope.char(a - 1)) == c0 && rope.char(a - 1) != '\n' {
@@ -1902,6 +2075,8 @@ fn text_object(rope: &Rope, cur: usize, obj: char, around: bool, n: usize) -> Op
             Some((a, b, false))
         }
         'p' => {
+            // A paragraph is a run of non-blank lines, or a run of blank lines
+            // if the caret is on one; `ap` adds the following run.
             let line = rope.char_to_line(cur);
             let last = rope.len_lines().saturating_sub(1);
             let blank = line_is_blank(rope, line);
@@ -1936,6 +2111,7 @@ fn text_object(rope: &Rope, cur: usize, obj: char, around: bool, n: usize) -> Op
             let line = rope.char_to_line(cur);
             let ls = rope.line_to_char(line);
             let le = line_end_char(rope, line);
+            // Quotes are paired left to right on the caret's line; escaped ones are skipped.
             let quotes: Vec<usize> = (ls..le).filter(|&i| rope.char(i) == obj && (i == ls || rope.char(i - 1) != '\\')).collect();
             // Pair containing the cursor, else the first pair after it.
             let mut pair = None;
@@ -1963,6 +2139,7 @@ fn text_object(rope: &Rope, cur: usize, obj: char, around: bool, n: usize) -> Op
                 '[' | ']' => ('[', ']'),
                 _ => ('<', '>'),
             };
+            // A count selects the nth enclosing pair outward.
             let mut level = n;
             let mut from = cur;
             let mut found = None;
@@ -1995,6 +2172,10 @@ fn text_object(rope: &Rope, cur: usize, obj: char, around: bool, n: usize) -> Op
         }
         't' => {
             // Inner/around tag: nearest enclosing <x ...>...</x>.
+            // Scans every opening tag in the document and matches its closing
+            // tag by depth; works in byte offsets, converted to chars at the end.
+            // `best` is (open start, open end, close start, close end); the
+            // latest-starting tag containing the caret wins.
             let text = rope.to_string();
             let mut best: Option<(usize, usize, usize, usize)> = None;
             let bytes = text.as_bytes();
@@ -2003,6 +2184,7 @@ fn text_object(rope: &Rope, cur: usize, obj: char, around: bool, n: usize) -> Op
             while let Some(off) = text[i..].find('<') {
                 let s = i + off;
                 i = s + 1;
+                // Skip closing tags, comments and doctypes.
                 if bytes.get(s + 1) == Some(&b'/') || bytes.get(s + 1) == Some(&b'!') {
                     continue;
                 }
@@ -2021,6 +2203,7 @@ fn text_object(rope: &Rope, cur: usize, obj: char, around: bool, n: usize) -> Op
                 let open_tag = format!("<{name}");
                 while depth > 0 {
                     let next_close = text[j..].find(&close_tag).map(|x| j + x);
+                    // Only count `<name>` / `<name ...>`, not `<name-other>`.
                     let next_open =
                         text[j..].find(&open_tag).map(|x| j + x).filter(|&p| text[p + open_tag.len()..].starts_with(|c: char| c == '>' || c.is_whitespace()));
                     match (next_open, next_close) {
@@ -2078,6 +2261,7 @@ fn text_object(rope: &Rope, cur: usize, obj: char, around: bool, n: usize) -> Op
 }
 
 /// Innermost `open`…`close` pair enclosing `cur` (positions of the brackets).
+/// A caret on either bracket selects that bracket's pair.
 fn enclosing_pair(rope: &Rope, cur: usize, open: char, close: char) -> Option<(usize, usize)> {
     let n = rope.len_chars();
     let cur = cur.min(n);
@@ -2087,6 +2271,7 @@ fn enclosing_pair(rope: &Rope, cur: usize, open: char, close: char) -> Option<(u
     if cur < n && rope.char(cur) == close {
         return apex_edit::brackets::matching_bracket(rope, cur);
     }
+    // Walk backwards, skipping closed pairs, to the first unmatched opener.
     let mut depth = 0usize;
     let mut i = cur;
     while i > 0 {
@@ -2108,15 +2293,20 @@ fn enclosing_pair(rope: &Rope, cur: usize, open: char, close: char) -> Option<(u
 mod tests {
     use super::*;
 
+    /// In-memory [`VimHost`] that records commands and status messages.
     struct Host {
         doc: Document,
         sels: SelectionSet,
+        /// Fake system clipboard.
         clipboard: Option<String>,
+        /// Every command sent, in order.
         commands: Vec<(Command, Option<String>)>,
+        /// Every status message shown, in order.
         messages: Vec<String>,
     }
 
     impl Host {
+        /// A host over `text` with the caret at 0.
         fn new(text: &str) -> Self {
             Host {
                 doc: Document::from_text(text),
@@ -2126,24 +2316,30 @@ mod tests {
                 messages: Vec::new(),
             }
         }
+        /// Full document text.
         fn text(&self) -> String {
             self.doc.text()
         }
+        /// Primary caret head (char index).
         fn cursor(&self) -> usize {
             self.sels.primary().head
         }
     }
 
     impl VimHost for Host {
+        /// The test document.
         fn doc(&self) -> &Document {
             &self.doc
         }
+        /// Current selections.
         fn sels(&self) -> SelectionSet {
             self.sels.clone()
         }
+        /// Replace selections.
         fn set_sels(&mut self, sels: SelectionSet) {
             self.sels = sels;
         }
+        /// Apply the edit to the document; an empty transaction only updates selections.
         fn edit(&mut self, f: &mut dyn FnMut(&Document, &SelectionSet) -> Option<EditResult>) -> bool {
             let Some(r) = f(&self.doc, &self.sels) else { return false };
             let before = self.sels.clone();
@@ -2158,6 +2354,7 @@ mod tests {
                 false
             }
         }
+        /// Undo/redo are applied to the document; every command is recorded.
         fn command(&mut self, cmd: Command, arg: Option<String>) {
             match cmd {
                 Command::Undo => {
@@ -2174,23 +2371,28 @@ mod tests {
             }
             self.commands.push((cmd, arg));
         }
+        /// Record the message.
         fn status(&mut self, text: String, _error: bool) {
             self.messages.push(text);
         }
+        /// Read the fake clipboard.
         fn clipboard_get(&mut self) -> Option<String> {
             self.clipboard.clone()
         }
+        /// Write the fake clipboard.
         fn clipboard_set(&mut self, text: String) {
             self.clipboard = Some(text);
         }
+        /// Close the current undo group in the document history.
         fn undo_boundary(&mut self) {
             self.doc.history_mut().mark_boundary();
         }
     }
 
+    /// Environment used by every test.
     const ENV: Env = Env { tab_width: 4, page_lines: 10 };
 
-    /// Feed a key string; `<Esc>`, `<CR>`, `<C-x>` are recognised.
+    /// Feed a key string; `<Esc>`, `<CR>`, `<BS>`, `<lt>`, `<C-x>` are recognised.
     fn feed(vim: &mut Vim, host: &mut Host, keys: &str) {
         let mut chars = keys.chars().peekable();
         while let Some(c) = chars.next() {
@@ -2221,6 +2423,7 @@ mod tests {
         }
     }
 
+    /// Send one printable char, inserting it directly when the engine passes it through.
     fn vim_char(vim: &mut Vim, host: &mut Host, c: char) {
         if vim.mode == Mode::Insert {
             // Insert mode: text goes straight to the document, as the editor would do.
@@ -2233,6 +2436,7 @@ mod tests {
         }
     }
 
+    /// Run `keys` on a fresh engine over `text`; returns (final text, caret, engine, host).
     fn run(text: &str, keys: &str) -> (String, usize, Vim, Host) {
         let mut host = Host::new(text);
         let mut vim = Vim::new();
@@ -2242,6 +2446,7 @@ mod tests {
         (t, c, vim, host)
     }
 
+    /// Character, word, line, document, find and bracket motions.
     #[test]
     fn basic_motions() {
         let (_, c, ..) = run("hello world\nsecond line\n", "ll");
@@ -2280,6 +2485,7 @@ mod tests {
         assert_eq!(c, 3);
     }
 
+    /// Normal mode keeps the caret off the newline.
     #[test]
     fn cursor_cannot_rest_on_newline_in_normal_mode() {
         let (_, c, ..) = run("ab\ncd\n", "lll");
@@ -2291,6 +2497,7 @@ mod tests {
         assert_eq!(c, 2);
     }
 
+    /// Operators with motions and text objects, and pasting the result.
     #[test]
     fn delete_change_yank_put() {
         let (t, c, ..) = run("hello world\n", "dw");
@@ -2348,6 +2555,7 @@ mod tests {
         assert_eq!(t, "if x {\n}\n");
     }
 
+    /// Counted operators, appending registers and the black-hole register.
     #[test]
     fn counts_and_registers() {
         let (t, ..) = run("a b c d e\n", "3dw");
@@ -2363,6 +2571,7 @@ mod tests {
         assert_eq!(t, "");
     }
 
+    /// Characterwise and linewise visual selection and operators on them.
     #[test]
     fn visual_modes() {
         let (t, ..) = run("hello world\n", "vlld");
@@ -2395,6 +2604,7 @@ mod tests {
         assert_eq!(t, "xxxxxef\n");
     }
 
+    /// Insert-entry commands plus `r`, `~`, `gu` and `s`.
     #[test]
     fn insert_variants_and_repeat() {
         let (t, c, ..) = run("abc\n", "ix<Esc>");
@@ -2430,6 +2640,7 @@ mod tests {
         assert_eq!(t, "  X\n");
     }
 
+    /// `.` repeats the last change, including an insert session.
     #[test]
     fn dot_repeat() {
         let (t, ..) = run("a b c d\n", "dw..");
@@ -2446,6 +2657,7 @@ mod tests {
         assert_eq!(t, "bc bc bc\n");
     }
 
+    /// `u` goes through the host; an insert session undoes as one step.
     #[test]
     fn undo_redo_through_host() {
         let (t, _, _, host) = run("abc\n", "xu");
@@ -2458,6 +2670,7 @@ mod tests {
         assert_eq!(t, "abc\n");
     }
 
+    /// `/`, `?`, `n` and a search as an operator target.
     #[test]
     fn search() {
         let (_, c, ..) = run("foo bar foo baz\n", "/foo<CR>");
@@ -2476,6 +2689,7 @@ mod tests {
         assert!(host.messages.iter().any(|m| m.contains("not found")));
     }
 
+    /// `:` commands map to host commands; `:s` substitutes; unknown ones report an error.
     #[test]
     fn ex_commands() {
         let (_, _, _, host) = run("abc\n", ":w<CR>");
@@ -2500,6 +2714,7 @@ mod tests {
         assert_eq!(vim.mode, Mode::Normal);
     }
 
+    /// Marks, paragraph motion, `|` and cancelling a pending operator.
     #[test]
     fn marks_and_misc() {
         let (_, _, _, host) = run("abc\ndef\n", "jmaggk'a");
@@ -2519,6 +2734,7 @@ mod tests {
         assert_eq!(vim.pending_text(), "");
     }
 
+    /// Secondary carets follow the primary caret's motion.
     #[test]
     fn multiple_cursors_follow_motions() {
         let mut host = Host::new("ab\ncd\n");

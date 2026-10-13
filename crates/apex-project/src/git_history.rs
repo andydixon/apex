@@ -14,22 +14,32 @@ use regex::Regex;
 
 use crate::git_cli::JobCtx;
 
+/// One commit's editable metadata, as loaded from `git log` (and, as a draft,
+/// as edited in the history window).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CommitRecord {
+    /// Full commit hash; identifies the commit to rewrite.
     pub hash: String,
+    /// Abbreviated hash for display and error messages.
     pub short_hash: String,
     pub author_name: String,
     pub author_email: String,
+    /// Strict ISO 8601 as loaded; free text while being edited.
     pub author_date: String,
     pub committer_name: String,
     pub committer_email: String,
+    /// Strict ISO 8601 as loaded; free text while being edited.
     pub committer_date: String,
+    /// Ref decorations (`%D`), for example `HEAD -> main` or `tag: v1`.
     pub refs: Vec<String>,
+    /// Full hashes of the parents; two or more for a merge.
     pub parents: Vec<String>,
+    /// Full message, normalised by [`normalise_message`].
     pub message: String,
 }
 
 impl CommitRecord {
+    /// The first line of the message, trimmed.
     pub fn subject(&self) -> &str {
         self.message.lines().next().unwrap_or("").trim()
     }
@@ -40,9 +50,13 @@ pub fn normalise_message(m: &str) -> String {
     m.replace("\r\n", "\n").trim_end_matches('\n').to_string()
 }
 
+/// `git log` format: one record per commit, fields separated by U+001F and
+/// records terminated by U+001E, which cannot occur in the fields themselves
+/// (the message, `%B`, is last so it is split off whole).
 const LOG_FORMAT: &str = "--pretty=format:%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI%x1f%D%x1f%P%x1f%B%x1e";
 
 /// Parse `git log --all --reverse` output in [`LOG_FORMAT`] (oldest first).
+/// Errors if a record does not have all eleven fields.
 pub fn parse_log(out: &str) -> Result<Vec<CommitRecord>, String> {
     let mut commits = Vec::new();
     for raw in out.split('\x1e') {
@@ -75,14 +89,19 @@ pub fn parse_log(out: &str) -> Result<Vec<CommitRecord>, String> {
 /// Repository facts shown above the editor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoFacts {
+    /// No uncommitted changes (`git status --porcelain` is empty).
     pub clean: bool,
+    /// Current branch, or `None` when `HEAD` is detached.
     pub branch: Option<String>,
+    /// URL of the `origin` remote, if there is one.
     pub origin: Option<String>,
     /// Local UTC offset in minutes (from `git var`), for "now".
     pub local_offset: i32,
 }
 
-/// Load facts and every commit reachable from any ref (oldest first).
+/// Load facts and every commit reachable from any ref (oldest first, parents
+/// before children). Runs read-only git commands; errors if `status` or `log`
+/// fails (an empty repository gives no commits rather than an error).
 pub fn load(c: &JobCtx) -> Result<(RepoFacts, Vec<CommitRecord>), String> {
     let clean = c.git_quiet(&["status", "--porcelain"], None)?.trim().is_empty();
     let branch = c.git_quiet(&["symbolic-ref", "--quiet", "--short", "HEAD"], None).ok().map(|s| s.trim().to_string());
@@ -105,14 +124,18 @@ pub fn load(c: &JobCtx) -> Result<(RepoFacts, Vec<CommitRecord>), String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GitDate {
     pub year: i64,
+    /// 1 to 12.
     pub month: u32,
+    /// 1 to the length of the month.
     pub day: u32,
     pub hour: u32,
     pub minute: u32,
     pub second: u32,
+    /// UTC offset in minutes (east positive); `None` = local time.
     pub offset: Option<i32>,
 }
 
+/// Parse a UTC offset (`Z`, `+01:00`, `-0500`) into minutes east of UTC.
 fn parse_offset(s: &str) -> Option<i32> {
     if s == "Z" {
         return Some(0);
@@ -131,6 +154,7 @@ fn parse_offset(s: &str) -> Option<i32> {
     (h <= 23 && m <= 59).then_some(sign * (h * 60 + m))
 }
 
+/// Number of days in `month` (1 to 12) of `year`, with Gregorian leap years.
 pub fn days_in_month(year: i64, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -141,6 +165,8 @@ pub fn days_in_month(year: i64, month: u32) -> u32 {
 }
 
 /// Days since 1970-01-01 for a civil date (proleptic Gregorian).
+/// Howard Hinnant's `days_from_civil`, which counts from 1 March so the leap
+/// day falls at the end of the year.
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -151,7 +177,8 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// Civil date for days since 1970-01-01.
+/// Civil date `(year, month, day)` for days since 1970-01-01; the inverse of
+/// [`days_from_civil`].
 pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
@@ -166,7 +193,8 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 impl GitDate {
     /// ISO 8601 (`2024-05-01T09:30:00+01:00`, `Z`, `+0100`), with `T` or a
-    /// space, seconds optional, offset optional (= local time).
+    /// space, seconds optional, offset optional (= local time). The year must
+    /// be four digits and the date must exist; `None` otherwise.
     pub fn parse(input: &str) -> Option<GitDate> {
         let s = input.trim();
         let (date, rest) = s.split_at_checked(10)?;
@@ -197,6 +225,7 @@ impl GitDate {
         Some(GitDate { year, month, day, hour, minute, second, offset })
     }
 
+    /// Strict ISO 8601 (`2024-05-01T09:30:00+01:00`), without an offset if none is set.
     pub fn format(&self) -> String {
         let base = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", self.year, self.month, self.day, self.hour, self.minute, self.second);
         match self.offset {
@@ -205,6 +234,7 @@ impl GitDate {
         }
     }
 
+    /// The wall-clock date at `t` seconds since the epoch in a zone `offset` minutes east of UTC.
     pub fn from_unix(t: i64, offset: i32) -> GitDate {
         let local = t + offset as i64 * 60;
         let (year, month, day) = civil_from_days(local.div_euclid(86_400));
@@ -224,6 +254,7 @@ pub fn normalise_date(s: &str) -> String {
     GitDate::parse(s).map(|d| d.format()).unwrap_or_else(|| s.trim().to_string())
 }
 
+/// The current time in the zone `local_offset` minutes east of UTC.
 pub fn now(local_offset: i32) -> GitDate {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     GitDate::from_unix(t, local_offset)
@@ -242,7 +273,8 @@ pub fn changed(orig: &CommitRecord, draft: &CommitRecord) -> bool {
         || normalise_message(&orig.message) != normalise_message(&draft.message)
 }
 
-/// Check a draft before applying.
+/// Check a draft before applying: names and emails must be non-empty and
+/// both dates must parse. The error names the commit by its short hash.
 pub fn validate(d: &CommitRecord) -> Result<(), String> {
     if d.author_name.trim().is_empty() || d.author_email.trim().is_empty() {
         return Err(format!("{}: author name and email are required", d.short_hash));
@@ -259,7 +291,8 @@ pub fn validate(d: &CommitRecord) -> Result<(), String> {
 }
 
 /// Replace the author of every draft whose name or email matches `query`
-/// (case-insensitive; substring unless `exact`). Returns the count.
+/// (case-insensitive; substring unless `exact`). Returns the count. Errors if
+/// the query or the replacement name or email is empty.
 pub fn replace_author(drafts: &mut [CommitRecord], query: &str, name: &str, email: &str, exact: bool) -> Result<usize, String> {
     let (query, name, email) = (query.trim(), name.trim(), email.trim());
     if query.is_empty() {
@@ -281,11 +314,13 @@ pub fn replace_author(drafts: &mut [CommitRecord], query: &str, name: &str, emai
     Ok(n)
 }
 
+/// Parse `YYYY-MM-DD` into `(year, month, day)`.
 fn parse_day(s: &str) -> Option<(i64, u32, u32)> {
     let d = GitDate::parse(&format!("{}T00:00", s.trim()))?;
     Some((d.year, d.month, d.day))
 }
 
+/// Parse `HH:MM` into seconds after midnight; `24:00` is accepted as the end of the day.
 fn parse_hm(s: &str) -> Option<u32> {
     let (h, m) = s.trim().split_once(':')?;
     let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
@@ -296,6 +331,7 @@ fn parse_hm(s: &str) -> Option<u32> {
 /// time: a random day in `[start, end]` at a random time in the daily window
 /// `[from, to)`, in local time. The random instants are sorted, so times
 /// never go backwards. `rand(n)` returns a value in `0..n`.
+/// Returns the number of drafts changed; errors on unparsable or reversed inputs.
 pub fn spread_dates(drafts: &mut [CommitRecord], start: &str, end: &str, from: &str, to: &str, mut rand: impl FnMut(u64) -> u64) -> Result<usize, String> {
     let s = parse_day(start).ok_or("start date must be YYYY-MM-DD")?;
     let e = parse_day(end).ok_or("end date must be YYYY-MM-DD")?;
@@ -320,11 +356,13 @@ pub fn spread_dates(drafts: &mut [CommitRecord], start: &str, end: &str, from: &
     Ok(drafts.len())
 }
 
+/// Matches a `Co-authored-by:` trailer (any case, hyphen or space).
 fn co_author_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r"(?i)^\s*co-authored(?:-|\s+)by\s*:").expect("valid regex"))
 }
 
+/// Matches a `Co-authored-by:` trailer naming Claude or Codex.
 fn ai_attribution_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r"(?i)^\s*co-authored(?:-|\s+)by\s*:.*\b(claude|codex)\b").expect("valid regex"))
@@ -342,6 +380,7 @@ pub fn remove_co_authors(message: &str) -> (String, usize) {
         if ai_attribution_re().is_match(line) {
             in_block = true;
         } else if in_block && !line.trim().is_empty() {
+            // Continuation of an AI attribution block: removed.
         } else if co_author_re().is_match(line) || line.to_lowercase().contains("claude-session:") {
             in_block = false;
         } else {
@@ -380,6 +419,7 @@ pub fn ai_commits(commits: &[CommitRecord]) -> HashSet<String> {
         .filter(|c| [&c.author_name, &c.author_email, &c.committer_name, &c.committer_email, &c.message].iter().any(|s| re.is_match(s)))
         .map(|c| c.hash.clone())
         .collect();
+    // Commits reachable from `start`, not walking past anything in `skip`.
     let ancestors = |start: &[String], skip: &HashSet<String>| -> HashSet<String> {
         let mut seen = HashSet::new();
         let mut stack: Vec<String> = start.to_vec();
@@ -399,6 +439,8 @@ pub fn ai_commits(commits: &[CommitRecord]) -> HashSet<String> {
         if c.parents.len() < 2 || ai.contains(&c.hash) {
             continue;
         }
+        // The merged-in side is whatever the other parents reach that the
+        // first parent does not.
         let base = ancestors(&c.parents[..1], &HashSet::new());
         if ancestors(&c.parents[1..], &base).iter().any(|h| ai.contains(h)) {
             ai.insert(c.hash.clone());
@@ -409,18 +451,27 @@ pub fn ai_commits(commits: &[CommitRecord]) -> HashSet<String> {
 
 // ----- apply ---------------------------------------------------------------
 
+/// Options from the history window for [`apply`].
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOptions {
+    /// Not read by [`apply`]; co-author removal is applied to the drafts
+    /// beforehand by [`planned`].
     pub remove_co_authors: bool,
+    /// After rewriting, push all branches to `origin` with `--force-with-lease`.
     pub force_push: bool,
+    /// With `force_push`, also push tags the same way.
     pub push_tags: bool,
 }
 
+/// Single-quote `v` for a POSIX shell, so commit metadata cannot inject
+/// commands into the filter scripts.
 fn sh_quote(v: &str) -> String {
     format!("'{}'", v.replace('\'', "'\"'\"'"))
 }
 
-/// The commits that will actually change (after co-author removal).
+/// The commits that will actually change (after co-author removal when
+/// `strip_co_authors`), as drafts in `originals` order. Commits without a
+/// draft use the original.
 pub fn planned(originals: &[CommitRecord], drafts: &HashMap<String, CommitRecord>, strip_co_authors: bool) -> Vec<CommitRecord> {
     originals
         .iter()
@@ -436,6 +487,12 @@ pub fn planned(originals: &[CommitRecord], drafts: &HashMap<String, CommitRecord
 
 /// Rewrite history so each commit in `changes` gets its edited metadata.
 /// Returns a summary for the status bar.
+///
+/// Refuses a dirty working tree and invalid drafts. Rewrites local branches and
+/// tags with `git filter-branch`, tags the old `HEAD` as `apex-backup-<time>`
+/// (even if the rewrite fails), deletes `refs/original/`, expires the reflog
+/// and runs `gc --prune=now`, then force-pushes if asked. Filter scripts and
+/// changed messages are written to a private temporary directory, removed after.
 pub fn apply(c: &JobCtx, originals: &[CommitRecord], changes: &[CommitRecord], opts: &ApplyOptions) -> Result<String, String> {
     if !c.git_quiet(&["status", "--porcelain"], None)?.trim().is_empty() {
         return Err("the repository has uncommitted changes; commit or stash them first".into());
@@ -453,9 +510,14 @@ pub fn apply(c: &JobCtx, originals: &[CommitRecord], changes: &[CommitRecord], o
         let backup = format!("apex-backup-{stamp}");
         let hold = format!("refs/apex-backup/{stamp}");
         c.git(&["update-ref", &hold, "HEAD"], None)?;
+        // Private (0700 on Unix): it holds scripts that git sources, so other
+        // local users must not be able to read or replace them.
         let dir = std::env::temp_dir().join(format!("apex-rewrite-{}-{stamp}", std::process::id()));
         crate::paths::ensure_private_dir(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
         let result = (|| -> Result<String, String> {
+            // Two shell scripts sourced by filter-branch: `env` sets identity
+            // and dates per `$GIT_COMMIT`; `msg` replaces only changed messages
+            // (reading them from files) and passes the rest through `cat`.
             let mut env = String::from("case \"$GIT_COMMIT\" in\n");
             let mut msg = String::from("case \"$GIT_COMMIT\" in\n");
             for d in changes {
@@ -503,6 +565,8 @@ pub fn apply(c: &JobCtx, originals: &[CommitRecord], changes: &[CommitRecord], o
             }
             Ok(out)
         })();
+        // Always turn the held ref into the backup tag, whether or not the
+        // rewrite succeeded.
         let _ = std::fs::remove_dir_all(&dir);
         c.git(&["tag", &backup, &hold], None)?;
         c.git(&["update-ref", "-d", &hold], None)?;
@@ -512,6 +576,7 @@ pub fn apply(c: &JobCtx, originals: &[CommitRecord], changes: &[CommitRecord], o
         for r in originals.lines().filter(|l| !l.trim().is_empty()) {
             c.git(&["update-ref", "-d", r.trim()], None)?;
         }
+        // Non-fatal: the rewrite has already succeeded.
         if let Err(e) = c.git(&["reflog", "expire", "--expire=now", "--all"], None).and_then(|_| c.git(&["gc", "--prune=now", "--quiet"], None)) {
             c.log(format!("[cleanup warning: {e}]"));
         }
@@ -535,6 +600,7 @@ pub fn apply(c: &JobCtx, originals: &[CommitRecord], changes: &[CommitRecord], o
 mod tests {
     use super::*;
 
+    /// A record with fixed dates and an email derived from `author`.
     fn rec(hash: &str, parents: &[&str], author: &str, msg: &str) -> CommitRecord {
         CommitRecord {
             hash: hash.into(),
@@ -551,6 +617,7 @@ mod tests {
         }
     }
 
+    /// Date parsing, formatting, Unix conversion and calendar helpers.
     #[test]
     fn dates_parse_format_and_round_trip() {
         let d = GitDate::parse("2024-05-01T09:30:00+01:00").unwrap();
@@ -569,6 +636,7 @@ mod tests {
         assert_eq!(days_in_month(1900, 2), 28);
     }
 
+    /// Records in [`LOG_FORMAT`] parse into refs, parents and messages.
     #[test]
     fn parses_log_records() {
         let out = "aaa\x1fa\x1fAda\x1fada@x\x1f2024-01-01T10:00:00+00:00\x1fAda\x1fada@x\x1f2024-01-01T10:00:00+00:00\x1fHEAD -> main, tag: v1\x1f\x1ffirst\n\nbody\n\x1e\nbbb\x1fb\x1fBo\x1fbo@x\x1f2024-01-02T10:00:00+00:00\x1fBo\x1fbo@x\x1f2024-01-02T10:00:00+00:00\x1f\x1faaa\x1fsecond\n\x1e";
@@ -582,6 +650,7 @@ mod tests {
         assert!(parse_log("garbage\x1e").is_err());
     }
 
+    /// Bulk author replacement and ordered random date spreading.
     #[test]
     fn bulk_author_and_date_spread() {
         let mut d = vec![rec("1", &[], "Alice", "a"), rec("2", &["1"], "Bob", "b"), rec("3", &["2"], "alicia", "c")];
@@ -607,6 +676,7 @@ mod tests {
         assert!(spread_dates(&mut d, "2024-03-01", "2024-03-01", "12:00", "08:00", |_| 0).is_err());
     }
 
+    /// Co-author trailers and AI attribution blocks are removed.
     #[test]
     fn co_author_removal() {
         let m = "Fix it\n\nBody.\n\nCo-authored-by: Bob <b@x>\nCo-Authored-By: Claude <noreply@anthropic.com>\n🤖 Generated with Claude Code\nhttps://claude.ai/code\n\nClaude-Session: abc\n";
@@ -616,6 +686,7 @@ mod tests {
         assert_eq!(remove_co_authors("plain\n"), ("plain".to_string(), 0));
     }
 
+    /// A merge that brings in an AI commit is flagged; a later re-merge is not.
     #[test]
     fn ai_commit_detection_includes_merges() {
         let commits = vec![
@@ -632,6 +703,7 @@ mod tests {
         assert_eq!(v, vec!["c", "d"]);
     }
 
+    /// End-to-end rewrite with the system `git`, including the backup tag.
     #[test]
     fn applies_edits_with_real_git() {
         use crate::git_cli::{JobEvent, available, start_job};

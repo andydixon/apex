@@ -5,6 +5,8 @@ use apex_edit::ops::{self, InsertOptions};
 use apex_edit::{Assoc, Change, Document, EditKind, IndentSettings, Selection, SelectionSet, Transaction};
 use proptest::prelude::*;
 
+/// Random document text of up to 20 fragments, weighted towards ASCII words
+/// but including every awkward case the editor must not split.
 fn text_strategy() -> impl Strategy<Value = String> {
     // Mix of ASCII, CRLF, tabs, combining marks, emoji ZWJ sequences and CJK.
     prop::collection::vec(
@@ -23,13 +25,20 @@ fn text_strategy() -> impl Strategy<Value = String> {
     .prop_map(|v| v.concat())
 }
 
+/// One random edit, positions in char indices; `change_of` clamps them to the
+/// document.
 #[derive(Debug, Clone)]
 enum Op {
+    /// Insert the text at the position.
     Insert(usize, String),
+    /// Delete the range `start..end` (start never after end).
     Delete(usize, usize),
+    /// Replace the range `start..end` with the text.
     Replace(usize, usize, String),
 }
 
+/// Random `Op` with positions in `0..200`, so many land past the end and
+/// exercise clamping.
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         (0..200usize, text_strategy()).prop_map(|(a, t)| Op::Insert(a, t)),
@@ -38,6 +47,8 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     ]
 }
 
+/// Turn `op` into a `Change` for a document of `len` chars, clamping both
+/// ends. Positions are not snapped to grapheme boundaries.
 fn change_of(op: &Op, len: usize) -> Change {
     match op {
         Op::Insert(a, t) => Change::insert((*a).min(len), t.clone()),

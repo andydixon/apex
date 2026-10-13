@@ -20,6 +20,7 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// How to launch one language server and which Apex languages it serves.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -27,13 +28,17 @@ pub struct ServerConfig {
     pub command: Vec<String>,
     /// Language ids this server handles (Apex ids: "rust", "python", …).
     pub languages: Vec<String>,
+    /// Sent as `initializationOptions` in the `initialize` request.
     pub initialization_options: Option<Value>,
+    /// Sent via `workspace/didChangeConfiguration` once initialised, and returned for `workspace/configuration` requests.
     pub settings: Option<Value>,
+    /// Extra environment variables for the server; `LD_*` and `DYLD_*` keys are ignored by `LspClient::start`.
     pub env: HashMap<String, String>,
 }
 
 /// Well-known servers offered when found on PATH (never downloaded).
 pub fn known_servers() -> Vec<ServerConfig> {
+    // `PATH` is not checked here; callers filter with `program_available`.
     let mk = |cmd: &[&str], langs: &[&str]| ServerConfig {
         command: cmd.iter().map(|s| s.to_string()).collect(),
         languages: langs.iter().map(|s| s.to_string()).collect(),
@@ -66,49 +71,60 @@ pub fn known_servers() -> Vec<ServerConfig> {
 /// True if the program can be found on PATH (or is an absolute path that exists).
 pub fn program_available(program: &str) -> bool {
     let p = Path::new(program);
+    // Absolute paths bypass the `PATH` search.
     if p.is_absolute() {
         return p.exists();
     }
     let Some(paths) = std::env::var_os("PATH") else { return false };
     std::env::split_paths(&paths).any(|dir| {
         let candidate = dir.join(program);
+        // On Windows the bare name may lack an executable extension.
         candidate.is_file() || (cfg!(windows) && ["exe", "cmd", "bat"].iter().any(|e| candidate.with_extension(e).is_file()))
     })
 }
 
 // ----- protocol types ---------------------------------------------------------
 
+/// LSP position: zero-based line and UTF-16 code-unit offset within the line.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Position {
     pub line: u32,
     pub character: u32,
 }
 
+/// LSP half-open range from `start` to `end`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Range {
     pub start: Position,
     pub end: Position,
 }
 
+/// A range within a document identified by URI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Location {
+    /// `file://` URI as sent by the server (see `path_for`).
     pub uri: String,
     pub range: Range,
 }
 
+/// One diagnostic from `textDocument/publishDiagnostics`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnostic {
     pub range: Range,
+    /// LSP severity: 1 error, 2 warning, 3 information, 4 hint; `None` if omitted.
     #[serde(default)]
     pub severity: Option<u8>,
+    /// Server-specific diagnostic code (number or string).
     #[serde(default)]
     pub code: Option<Value>,
+    /// Name of the tool that produced the diagnostic, e.g. `rustc`.
     #[serde(default)]
     pub source: Option<String>,
     pub message: String,
 }
 
+/// Replace `range` with `new_text`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TextEdit {
@@ -116,22 +132,28 @@ pub struct TextEdit {
     pub new_text: String,
 }
 
+/// One completion candidate; only the fields Apex uses are decoded.
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionItem {
     pub label: String,
+    /// LSP `CompletionItemKind` number; see `kind_label`.
     #[serde(default)]
     pub kind: Option<u8>,
     #[serde(default)]
     pub detail: Option<String>,
+    /// Markdown/plain string or `MarkupContent`, kept raw.
     #[serde(default)]
     pub documentation: Option<Value>,
     #[serde(default)]
     pub insert_text: Option<String>,
+    /// 2 means `insert_text` is a snippet; 1 or `None` means plain text.
     #[serde(default)]
     pub insert_text_format: Option<u8>,
+    /// Raw `TextEdit` or `InsertReplaceEdit`; decoded by `insertion`.
     #[serde(default)]
     pub text_edit: Option<Value>,
+    /// Edits elsewhere in the document (for example auto-imports).
     #[serde(default)]
     pub additional_text_edits: Vec<TextEdit>,
     #[serde(default)]
@@ -145,12 +167,14 @@ impl CompletionItem {
     pub fn insertion(&self) -> (String, Option<Range>) {
         if let Some(te) = &self.text_edit {
             let new_text = te.get("newText").and_then(|v| v.as_str()).unwrap_or(&self.label).to_string();
+            // `InsertReplaceEdit` has no `range`; use its `replace` range.
             let range = te.get("range").or_else(|| te.get("replace")).and_then(|r| serde_json::from_value::<Range>(r.clone()).ok());
             return (new_text, range);
         }
         (self.insert_text.clone().unwrap_or_else(|| self.label.clone()), None)
     }
 
+    /// Short human-readable name for the LSP `CompletionItemKind`, or `""` if unknown.
     pub fn kind_label(&self) -> &'static str {
         match self.kind.unwrap_or(0) {
             1 => "text",
@@ -186,14 +210,20 @@ impl CompletionItem {
 /// Flattened document or workspace symbol.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SymbolInfo {
+    /// Symbol name.
     pub name: String,
+    /// LSP `SymbolKind` number; see `symbol_kind_label`.
     pub kind: u8,
     pub uri: String,
+    /// Selection range for document symbols; full location range for workspace symbols.
     pub range: Range,
+    /// Enclosing container name (workspace symbols only).
     pub container: Option<String>,
+    /// Nesting level in a hierarchical document-symbol tree; 0 at top level.
     pub depth: u16,
 }
 
+/// Short human-readable name for an LSP `SymbolKind` number; `"symbol"` if unknown.
 pub fn symbol_kind_label(kind: u8) -> &'static str {
     match kind {
         1 => "file",
@@ -226,6 +256,7 @@ pub fn symbol_kind_label(kind: u8) -> &'static str {
     }
 }
 
+/// A server-proposed multi-file edit, normalised from either `changes` or `documentChanges`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkspaceEdit {
     /// uri → edits (document changes flattened in; version checks are up to the caller).
@@ -237,6 +268,7 @@ pub struct WorkspaceEdit {
 }
 
 impl WorkspaceEdit {
+    /// Decode an LSP `WorkspaceEdit`; malformed entries are skipped rather than failing the whole edit.
     pub fn parse(v: &Value) -> Self {
         let mut out = WorkspaceEdit::default();
         if let Some(changes) = v.get("changes").and_then(|c| c.as_object()) {
@@ -248,6 +280,7 @@ impl WorkspaceEdit {
         }
         if let Some(dc) = v.get("documentChanges").and_then(|c| c.as_array()) {
             for change in dc {
+                // Only resource operations (create/rename/delete) carry `kind`.
                 if let Some(kind) = change.get("kind").and_then(|k| k.as_str()) {
                     out.unsupported_operations.push(kind.to_string());
                     continue;
@@ -269,30 +302,52 @@ impl WorkspaceEdit {
         out
     }
 
+    /// True when there are no text edits and no unsupported resource operations to report.
     pub fn is_empty(&self) -> bool {
         self.changes.is_empty() && self.unsupported_operations.is_empty()
     }
 }
 
+/// A code action or bare command offered by the server.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeAction {
     pub title: String,
+    /// LSP `CodeActionKind`, e.g. `quickfix`.
     pub kind: Option<String>,
     pub edit: Option<WorkspaceEdit>,
+    /// Raw `Command` to run via `workspace/executeCommand` (for a bare command, the whole item).
     pub command: Option<Value>,
+    /// Server's hint that this is the preferred fix.
     pub is_preferred: bool,
 }
 
 // ----- transport -------------------------------------------------------------------
 
+/// A decoded message from the server, produced by the reader thread.
 #[derive(Debug)]
 pub enum Incoming {
-    Response { id: i64, result: Option<Value>, error: Option<Value> },
-    Notification { method: String, params: Value },
-    Request { id: Value, method: String, params: Value },
+    /// Reply to one of our requests; `id` matches `LspClient::request`.
+    Response {
+        id: i64,
+        result: Option<Value>,
+        error: Option<Value>,
+    },
+    Notification {
+        method: String,
+        params: Value,
+    },
+    /// Server-to-client request that needs a reply with the same `id`.
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+    /// The server's stdout closed, failed, or sent an oversized message.
     Exited,
 }
 
+/// Reader thread body: parses `Content-Length`-framed JSON-RPC messages from `stdout` and sends them on `tx`.
+/// Sends `Incoming::Exited` and returns on EOF, a read error, or a frame above 64 MiB; returns quietly if `tx` is closed.
 fn reader_thread(stdout: impl Read + Send + 'static, tx: Sender<Incoming>) {
     let mut reader = BufReader::new(stdout);
     loop {
@@ -320,7 +375,9 @@ fn reader_thread(stdout: impl Read + Send + 'static, tx: Sender<Incoming>) {
                 content_length = v.trim().parse().ok();
             }
         }
+        // A header block without `Content-Length` cannot be framed; skip it.
         let Some(len) = content_length else { continue };
+        // Cap the allocation so a misbehaving server cannot make Apex reserve unbounded memory.
         if len > 64 * 1024 * 1024 {
             tracing::error!("LSP message of {len} bytes exceeds the limit; disconnecting");
             let _ = tx.send(Incoming::Exited);
@@ -338,10 +395,12 @@ fn reader_thread(stdout: impl Read + Send + 'static, tx: Sender<Incoming>) {
         let msg = if let Some(method) = v.get("method").and_then(|m| m.as_str()).map(str::to_string) {
             let params = v.get("params").cloned().unwrap_or(Value::Null);
             match v.get("id") {
+                // A non-null `id` alongside `method` makes it a request needing a reply.
                 Some(id) if !id.is_null() => Incoming::Request { id: id.clone(), method, params },
                 _ => Incoming::Notification { method, params },
             }
         } else if let Some(id) = v.get("id").and_then(|i| i.as_i64()) {
+            // Apex only sends integer ids, so other ids cannot match a pending request.
             Incoming::Response { id, result: v.get("result").cloned(), error: v.get("error").cloned() }
         } else {
             continue;
@@ -352,6 +411,8 @@ fn reader_thread(stdout: impl Read + Send + 'static, tx: Sender<Incoming>) {
     }
 }
 
+/// Writer thread body: frames each JSON body from `rx` with a `Content-Length` header and writes it to `stdin`.
+/// Returns when the channel closes or a write fails (the server has gone).
 fn writer_thread(mut stdin: impl Write + Send + 'static, rx: Receiver<String>) {
     for body in rx {
         if stdin.write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes()).is_err()
@@ -365,11 +426,16 @@ fn writer_thread(mut stdin: impl Write + Send + 'static, rx: Receiver<String>) {
 
 // ----- client ----------------------------------------------------------------------
 
+/// Lifecycle of an `LspClient`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientState {
+    /// `initialize` sent; document opens are queued until the reply.
     Starting,
+    /// Initialised; requests and notifications flow normally.
     Running,
+    /// `shutdown` sent; the process is killed if it does not answer within five seconds.
     ShuttingDown,
+    /// Process has exited or been killed.
     Exited,
 }
 
@@ -378,72 +444,103 @@ pub enum ClientState {
 pub enum RequestKind {
     Initialize,
     Shutdown,
-    Completion { uri: String, version: i64 },
-    Hover { uri: String },
-    Definition { uri: String },
-    Declaration { uri: String },
-    Implementation { uri: String },
-    References { uri: String },
-    DocumentSymbols { uri: String },
+    Completion {
+        uri: String,
+        version: i64,
+    },
+    Hover {
+        uri: String,
+    },
+    Definition {
+        uri: String,
+    },
+    Declaration {
+        uri: String,
+    },
+    Implementation {
+        uri: String,
+    },
+    References {
+        uri: String,
+    },
+    DocumentSymbols {
+        uri: String,
+    },
     WorkspaceSymbols,
-    SignatureHelp { uri: String },
-    Rename { uri: String },
-    Formatting { uri: String, version: i64 },
-    CodeAction { uri: String },
+    SignatureHelp {
+        uri: String,
+    },
+    Rename {
+        uri: String,
+    },
+    Formatting {
+        uri: String,
+        version: i64,
+    },
+    CodeAction {
+        uri: String,
+    },
     ExecuteCommand,
+    /// Any other method; not produced within this module.
     Other(String),
 }
 
 /// Events for the application.
 #[derive(Debug)]
 pub enum LspEvent {
+    /// The `initialize` handshake completed and queued documents were opened.
     Ready,
-    Diagnostics {
-        uri: String,
-        version: Option<i64>,
-        diagnostics: Vec<Diagnostic>,
-    },
-    Response {
-        id: i64,
-        kind: RequestKind,
-        result: Result<Value, String>,
-    },
+    /// Diagnostics replace any previous set for `uri`.
+    Diagnostics { uri: String, version: Option<i64>, diagnostics: Vec<Diagnostic> },
+    /// Reply to a request other than `initialize`/`shutdown`; `result` is `Err` with the server's message on failure.
+    Response { id: i64, kind: RequestKind, result: Result<Value, String> },
     /// Server asked to apply an edit; the application must answer with `respond_apply_edit`.
-    ApplyEdit {
-        id: Value,
-        label: Option<String>,
-        edit: WorkspaceEdit,
-    },
-    Message {
-        level: u8,
-        text: String,
-    },
+    ApplyEdit { id: Value, label: Option<String>, edit: WorkspaceEdit },
+    /// `window/showMessage` (or `showMessageRequest`); `level` is the LSP `MessageType`, 1 error to 4 log.
+    Message { level: u8, text: String },
+    /// `window/logMessage` text, truncated to 500 characters.
     Log(String),
+    /// `$/progress` title or message; empty when a progress sequence ends.
     Progress(String),
-    Exited {
-        code: Option<i32>,
-    },
+    /// The server stopped; `code` is its exit code when known.
+    Exited { code: Option<i32> },
 }
 
+/// One running language-server process and its JSON-RPC session.
 pub struct LspClient {
+    /// Configuration the server was started with.
     pub config: ServerConfig,
+    /// Workspace root; the server's working directory and `rootUri`.
     pub root: PathBuf,
     child: Child,
+    /// Outgoing JSON bodies for the writer thread (bounded; see `send`).
     out: Sender<String>,
+    /// Decoded messages from the reader thread.
     incoming: Receiver<Incoming>,
+    /// Next JSON-RPC request id; ids start at 1 and are never reused within a session.
     next_id: i64,
+    /// Outstanding requests by id, so responses can be routed by purpose.
     pending: HashMap<i64, RequestKind>,
     pub state: ClientState,
+    /// `capabilities` from the `initialize` result; `Value::Null` until then.
     pub capabilities: Value,
+    /// `serverInfo.name` from the `initialize` result, or empty.
     pub server_name: String,
+    /// Open document URIs and their last sent version.
     open: HashMap<String, i64>,
+    /// `(uri, language_id, text)` opened before initialisation finished; replayed on `Running`.
     queued_opens: Vec<(String, String, String)>,
+    /// When `shutdown` was sent, for the kill timeout in `poll`.
     shutdown_sent: Option<Instant>,
+    /// When the process was spawned.
     pub started: Instant,
+    /// Restart counter; set to 0 here and not updated within this module.
     pub restarts: u32,
+    /// Last 20 stderr lines (each up to 300 characters), filled by a background thread.
     stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
+/// Convert a filesystem path to a `file://` URI, percent-encoding every byte outside the unreserved set plus `/` and `:`.
 pub fn uri_for(path: &Path) -> String {
     let p = path.to_string_lossy().replace('\\', "/");
     let mut out = String::from("file://");
@@ -459,6 +556,8 @@ pub fn uri_for(path: &Path) -> String {
     out
 }
 
+/// Inverse of `uri_for`: decode a `file://` URI to a path.
+/// Returns `None` for other schemes, truncated or invalid percent escapes, or non-UTF-8 results.
 pub fn path_for(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let mut bytes = Vec::with_capacity(rest.len());
@@ -480,6 +579,8 @@ pub fn path_for(uri: &str) -> Option<PathBuf> {
 }
 
 impl LspClient {
+    /// Spawn the server in `root`, start its reader, writer and stderr threads, and send `initialize`.
+    /// Errors if the command is empty, the process cannot be spawned, or a thread cannot be created.
     pub fn start(config: ServerConfig, root: &Path) -> Result<Self, String> {
         if config.command.is_empty() {
             return Err("no command".into());
@@ -487,6 +588,7 @@ impl LspClient {
         let mut cmd = Command::new(&config.command[0]);
         cmd.args(&config.command[1..]).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         for (k, v) in &config.env {
+            // Skip loader variables so a project configuration cannot inject libraries into the server.
             if k.starts_with("LD_") || k.starts_with("DYLD_") {
                 continue;
             }
@@ -495,6 +597,7 @@ impl LspClient {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
+            // Own process group so terminal signals aimed at Apex do not reach the server.
             cmd.process_group(0);
         }
         let mut child = cmd.spawn().map_err(|e| format!("could not start {:?}: {e}", config.command[0]))?;
@@ -509,6 +612,7 @@ impl LspClient {
                     let reader = BufReader::new(stderr);
                     for line in reader.lines().map_while(Result::ok) {
                         let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
+                        // Keep only a bounded tail so a chatty server cannot grow memory without limit.
                         if t.len() >= 20 {
                             t.pop_front();
                         }
@@ -543,6 +647,7 @@ impl LspClient {
         Ok(c)
     }
 
+    /// Send the `initialize` request advertising the client capabilities Apex implements.
     fn send_initialize(&mut self) {
         let root_uri = uri_for(&self.root);
         let params = json!({
@@ -571,16 +676,20 @@ impl LspClient {
         self.request(RequestKind::Initialize, "initialize", params);
     }
 
+    /// Serialise and queue a message for the writer thread.
     fn send(&self, body: Value) {
         if let Ok(s) = serde_json::to_string(&body) {
+            // Non-blocking: if the queue is full or the writer has gone, the message is dropped rather than stalling the UI.
             let _ = self.out.try_send(s);
         }
     }
 
+    /// Send a JSON-RPC notification (no reply expected).
     pub fn notify(&self, method: &str, params: Value) {
         self.send(json!({"jsonrpc": "2.0", "method": method, "params": params}));
     }
 
+    /// Send a request, remembering `kind` so `poll` can route the reply; returns the request id.
     pub fn request(&mut self, kind: RequestKind, method: &str, params: Value) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -590,22 +699,27 @@ impl LspClient {
         id
     }
 
+    /// Ask the server to cancel request `id` (`$/cancelRequest`); its reply may still arrive.
     pub fn cancel(&self, id: i64) {
         self.notify("$/cancelRequest", json!({"id": id}));
     }
 
+    /// Reply successfully to a server-to-client request.
     pub fn respond(&self, id: Value, result: Value) {
         self.send(json!({"jsonrpc": "2.0", "id": id, "result": result}));
     }
 
+    /// Reply with a JSON-RPC error to a server-to-client request.
     pub fn respond_error(&self, id: Value, code: i64, message: &str) {
         self.send(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}));
     }
 
+    /// Answer a `workspace/applyEdit` request (see `LspEvent::ApplyEdit`).
     pub fn respond_apply_edit(&self, id: Value, applied: bool, reason: Option<&str>) {
         self.respond(id, json!({"applied": applied, "failureReason": reason}));
     }
 
+    /// True once initialisation has finished and before shutdown.
     pub fn is_running(&self) -> bool {
         self.state == ClientState::Running
     }
@@ -615,12 +729,14 @@ impl LspClient {
         self.stderr_tail.lock().map(|t| t.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default()
     }
 
+    /// True if the server advertised `capability` (present and not `null` or `false`).
     pub fn supports(&self, capability: &str) -> bool {
         !matches!(self.capabilities.get(capability), None | Some(Value::Null) | Some(Value::Bool(false)))
     }
 
     // ----- document sync (full) --------------------------------------------------
 
+    /// Send `textDocument/didOpen` at version 1, or queue it until the server is running.
     pub fn did_open(&mut self, uri: &str, language_id: &str, text: &str) {
         if self.state != ClientState::Running {
             self.queued_opens.push((uri.to_string(), language_id.to_string(), text.to_string()));
@@ -630,6 +746,8 @@ impl LspClient {
         self.notify("textDocument/didOpen", json!({"textDocument": {"uri": uri, "languageId": language_id, "version": 1, "text": text}}));
     }
 
+    /// Send the full new text with an incremented version; returns that version.
+    /// Returns `None` if the server is not running or `uri` is not open.
     pub fn did_change(&mut self, uri: &str, text: &str) -> Option<i64> {
         if self.state != ClientState::Running {
             return None;
@@ -641,32 +759,39 @@ impl LspClient {
         Some(version)
     }
 
+    /// Send `textDocument/didSave` if `uri` is open.
     pub fn did_save(&self, uri: &str) {
         if self.open.contains_key(uri) {
             self.notify("textDocument/didSave", json!({"textDocument": {"uri": uri}}));
         }
     }
 
+    /// Send `textDocument/didClose` if `uri` is open, and forget its version.
     pub fn did_close(&mut self, uri: &str) {
         if self.open.remove(uri).is_some() {
             self.notify("textDocument/didClose", json!({"textDocument": {"uri": uri}}));
         }
     }
 
+    /// True if `uri` has been opened with this server.
     pub fn is_open(&self, uri: &str) -> bool {
         self.open.contains_key(uri)
     }
 
+    /// Last version sent for `uri`, if open.
     pub fn version(&self, uri: &str) -> Option<i64> {
         self.open.get(uri).copied()
     }
 
     // ----- requests ------------------------------------------------------------------
 
+    /// `TextDocumentPositionParams` for `uri` at `pos`.
     fn td_pos(uri: &str, pos: Position) -> Value {
         json!({"textDocument": {"uri": uri}, "position": pos})
     }
 
+    /// Request completions at `pos`; `trigger` is the typed trigger character, if any. Returns the request id.
+    /// The document version is recorded so stale replies can be discarded.
     pub fn completion(&mut self, uri: &str, pos: Position, trigger: Option<char>) -> i64 {
         let version = self.version(uri).unwrap_or(0);
         let mut params = Self::td_pos(uri, pos);
@@ -678,46 +803,57 @@ impl LspClient {
         self.request(RequestKind::Completion { uri: uri.to_string(), version }, "textDocument/completion", params)
     }
 
+    /// Request hover information at `pos`; returns the request id.
     pub fn hover(&mut self, uri: &str, pos: Position) -> i64 {
         self.request(RequestKind::Hover { uri: uri.to_string() }, "textDocument/hover", Self::td_pos(uri, pos))
     }
 
+    /// Request go-to-definition at `pos`; returns the request id.
     pub fn definition(&mut self, uri: &str, pos: Position) -> i64 {
         self.request(RequestKind::Definition { uri: uri.to_string() }, "textDocument/definition", Self::td_pos(uri, pos))
     }
 
+    /// Request go-to-declaration at `pos`; returns the request id.
     pub fn declaration(&mut self, uri: &str, pos: Position) -> i64 {
         self.request(RequestKind::Declaration { uri: uri.to_string() }, "textDocument/declaration", Self::td_pos(uri, pos))
     }
 
+    /// Request go-to-implementation at `pos`; returns the request id.
     pub fn implementation(&mut self, uri: &str, pos: Position) -> i64 {
         self.request(RequestKind::Implementation { uri: uri.to_string() }, "textDocument/implementation", Self::td_pos(uri, pos))
     }
 
+    /// Request all references at `pos`, including the declaration; returns the request id.
     pub fn references(&mut self, uri: &str, pos: Position) -> i64 {
         let mut p = Self::td_pos(uri, pos);
         p["context"] = json!({"includeDeclaration": true});
         self.request(RequestKind::References { uri: uri.to_string() }, "textDocument/references", p)
     }
 
+    /// Request the document's symbols; returns the request id.
     pub fn document_symbols(&mut self, uri: &str) -> i64 {
         self.request(RequestKind::DocumentSymbols { uri: uri.to_string() }, "textDocument/documentSymbol", json!({"textDocument": {"uri": uri}}))
     }
 
+    /// Request workspace symbols matching `query`; returns the request id.
     pub fn workspace_symbols(&mut self, query: &str) -> i64 {
         self.request(RequestKind::WorkspaceSymbols, "workspace/symbol", json!({"query": query}))
     }
 
+    /// Request signature help at `pos`; returns the request id.
     pub fn signature_help(&mut self, uri: &str, pos: Position) -> i64 {
         self.request(RequestKind::SignatureHelp { uri: uri.to_string() }, "textDocument/signatureHelp", Self::td_pos(uri, pos))
     }
 
+    /// Request a rename of the symbol at `pos` to `new_name`; returns the request id.
     pub fn rename(&mut self, uri: &str, pos: Position, new_name: &str) -> i64 {
         let mut p = Self::td_pos(uri, pos);
         p["newName"] = json!(new_name);
         self.request(RequestKind::Rename { uri: uri.to_string() }, "textDocument/rename", p)
     }
 
+    /// Request whole-document formatting; returns the request id.
+    /// The document version is recorded so edits for a changed document can be discarded.
     pub fn formatting(&mut self, uri: &str, tab_size: u32, insert_spaces: bool) -> i64 {
         let version = self.version(uri).unwrap_or(0);
         self.request(
@@ -727,6 +863,7 @@ impl LspClient {
         )
     }
 
+    /// Request code actions for `range` with the diagnostics that overlap it; returns the request id.
     pub fn code_actions(&mut self, uri: &str, range: Range, diagnostics: &[Diagnostic]) -> i64 {
         self.request(
             RequestKind::CodeAction { uri: uri.to_string() },
@@ -735,12 +872,15 @@ impl LspClient {
         )
     }
 
+    /// Ask the server to run `command` (`workspace/executeCommand`); returns the request id.
     pub fn execute_command(&mut self, command: &str, arguments: Value) -> i64 {
         self.request(RequestKind::ExecuteCommand, "workspace/executeCommand", json!({"command": command, "arguments": arguments}))
     }
 
     // ----- lifecycle --------------------------------------------------------------------
 
+    /// Begin a graceful shutdown by sending `shutdown`; idempotent.
+    /// `poll` sends `exit` on the reply, or kills the process after five seconds.
     pub fn shutdown(&mut self) {
         if matches!(self.state, ClientState::ShuttingDown | ClientState::Exited) {
             return;
@@ -758,6 +898,7 @@ impl LspClient {
     }
 
     /// Drain incoming messages into application events.
+    /// Non-blocking. Also answers some server requests directly and may kill the process on shutdown timeout.
     pub fn poll(&mut self) -> Vec<LspEvent> {
         let mut events = Vec::new();
         if self.state == ClientState::ShuttingDown && self.shutdown_sent.is_some_and(|t| t.elapsed() > Duration::from_secs(5)) {
@@ -777,6 +918,7 @@ impl LspClient {
                 }
                 Incoming::Response { id, result, error } => {
                     tracing::debug!("LSP <- response #{id} ok={} err={}", result.is_some(), error.is_some());
+                    // Replies to unknown ids (e.g. after cancellation) are dropped.
                     let Some(kind) = self.pending.remove(&id) else { continue };
                     match kind {
                         RequestKind::Initialize => {
@@ -794,6 +936,7 @@ impl LspClient {
                             let r = result.unwrap_or(Value::Null);
                             self.capabilities = r.get("capabilities").cloned().unwrap_or(Value::Null);
                             self.server_name = r.pointer("/serverInfo/name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                            // Handshake order matters: `initialized`, then configuration, then queued opens.
                             self.notify("initialized", json!({}));
                             if let Some(settings) = &self.config.settings {
                                 self.notify("workspace/didChangeConfiguration", json!({"settings": settings}));
@@ -806,6 +949,7 @@ impl LspClient {
                         }
                         RequestKind::Shutdown => {
                             self.notify("exit", Value::Null);
+                            // Brief pause so the server can act on `exit` before it is killed.
                             std::thread::sleep(Duration::from_millis(50));
                             self.kill();
                             events.push(LspEvent::Exited { code: None });
@@ -852,8 +996,10 @@ impl LspClient {
                         let edit = params.get("edit").map(WorkspaceEdit::parse).unwrap_or_default();
                         events.push(LspEvent::ApplyEdit { id, label, edit });
                     }
+                    // Accepted but ignored: Apex does not use dynamic registration.
                     "window/workDoneProgress/create" | "client/registerCapability" | "client/unregisterCapability" => self.respond(id, Value::Null),
                     "workspace/configuration" => {
+                        // Same settings object for every requested section.
                         let n = params.get("items").and_then(|i| i.as_array()).map(|a| a.len()).unwrap_or(1);
                         let settings = self.config.settings.clone().unwrap_or(Value::Null);
                         self.respond(id, Value::Array(vec![settings; n]));
@@ -863,10 +1009,12 @@ impl LspClient {
                         self.respond(id, json!([{"uri": uri, "name": self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()}]));
                     }
                     "window/showMessageRequest" => {
+                        // Shown as information only; Apex offers no choice, so the reply is `null`.
                         let text = params.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
                         events.push(LspEvent::Message { level: 3, text });
                         self.respond(id, Value::Null);
                     }
+                    // JSON-RPC "method not found".
                     _ => self.respond_error(id, -32601, "method not supported by Apex"),
                 },
             }
@@ -876,6 +1024,7 @@ impl LspClient {
 }
 
 impl Drop for LspClient {
+    /// Best-effort cleanup: send `exit` and kill the process so no server outlives its client.
     fn drop(&mut self) {
         if self.state != ClientState::Exited {
             self.notify("exit", Value::Null);
@@ -949,6 +1098,7 @@ pub fn parse_locations(v: &Value) -> Vec<Location> {
     }
 }
 
+/// Decode a `textDocument/codeAction` result into `CodeAction`s; items without a title are skipped.
 pub fn parse_code_actions(v: &Value) -> Vec<CodeAction> {
     let Some(items) = v.as_array() else { return Vec::new() };
     items

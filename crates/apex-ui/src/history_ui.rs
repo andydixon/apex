@@ -13,69 +13,82 @@ use egui::{Color32, RichText, Sense, Ui, pos2, vec2};
 use crate::app::ApexApp;
 use crate::command::Command;
 
+/// Which of a commit's two dates the calendar edits.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DateField {
     Author,
     Committer,
 }
 
+/// The modal shown over the editor window, with its form state.
 #[derive(Default)]
 enum Mode {
+    /// No modal open.
     #[default]
     None,
-    BulkAuthor {
-        query: String,
-        name: String,
-        email: String,
-        exact: bool,
-    },
-    Dates {
-        start: String,
-        end: String,
-        from: String,
-        to: String,
-    },
-    Calendar {
-        field: DateField,
-        date: GitDate,
-        view_year: i64,
-        view_month: u32,
-    },
-    Confirm {
-        typed: String,
-    },
+    /// Replace author: `query` matches name or email; `exact` turns off
+    /// case-insensitive substring matching.
+    BulkAuthor { query: String, name: String, email: String, exact: bool },
+    /// Rewrite dates: day range `start`..=`end` (YYYY-MM-DD) and daily time
+    /// window `from`..`to` (HH:MM), all as typed.
+    Dates { start: String, end: String, from: String, to: String },
+    /// Date picker for the selected commit's `field`; `view_year` and
+    /// `view_month` are the month on show, which may differ from `date`'s.
+    Calendar { field: DateField, date: GitDate, view_year: i64, view_month: u32 },
+    /// Final confirmation before Apply; `typed` holds the "FORCE" text
+    /// required when force-pushing.
+    Confirm { typed: String },
 }
 
+/// Result of the background load job: repository facts and commits, oldest first.
 type Loaded = Result<(RepoFacts, Vec<CommitRecord>), String>;
 
+/// State of the Edit Commit History window.
 #[derive(Default)]
 pub struct HistoryEditor {
+    /// Whether the window is shown.
     pub open: bool,
+    /// Work tree of the repository being edited.
     repo: PathBuf,
+    /// Branch, cleanliness, origin and local UTC offset, from the last load.
     facts: RepoFacts,
     /// Oldest first, as loaded.
     originals: Vec<CommitRecord>,
+    /// Edited records keyed by full hash; a commit without an entry is unedited.
     drafts: HashMap<String, CommitRecord>,
+    /// Receiver for an in-flight load job; `Some` while loading.
     loading: Option<Receiver<Loaded>>,
     /// Reload once the apply job has finished.
     awaiting_apply: bool,
+    /// Full hash of the selected commit.
     selected: Option<String>,
+    /// Filter text matched against hash, author, email and message.
     search: String,
+    /// Show only commits in `ai`.
     ai_only: bool,
+    /// Hashes of commits that mention Claude, Codex or Anthropic (see `gh::ai_commits`).
     ai: HashSet<String>,
+    /// Apply option: strip co-author and session trailers from every message.
     remove_co_authors: bool,
+    /// Apply option: force-push all branches after rewriting.
     force_push: bool,
+    /// Apply option: also force-push tags (only with `force_push`).
     push_tags: bool,
+    /// The open modal, if any.
     mode: Mode,
+    /// Error from the last load, shown under the repository line.
     error: Option<String>,
+    /// Scroll the list to the selection on the next frame (after keyboard navigation).
     scroll_to_selected: bool,
 }
 
 impl HistoryEditor {
+    /// The record for `hash` as currently edited: the draft if any, else the original.
     fn draft(&self, hash: &str) -> Option<&CommitRecord> {
         self.drafts.get(hash).or_else(|| self.originals.iter().find(|c| c.hash == hash))
     }
 
+    /// Whether `c` has a draft that differs from it in an editable field.
     fn is_dirty(&self, c: &CommitRecord) -> bool {
         self.drafts.get(&c.hash).is_some_and(|d| gh::changed(c, d))
     }
@@ -102,6 +115,7 @@ impl HistoryEditor {
         self.originals.iter().map(|c| self.drafts.get(&c.hash).cloned().unwrap_or_else(|| c.clone())).collect()
     }
 
+    /// Store every record in `all` as a draft (used after a bulk edit).
     fn store_all(&mut self, all: Vec<CommitRecord>) {
         for d in all {
             self.drafts.insert(d.hash.clone(), d);
@@ -109,6 +123,7 @@ impl HistoryEditor {
     }
 }
 
+/// A git date string shortened to `YYYY-MM-DD HH:MM` for the list; unparseable input is returned unchanged.
 fn short_date(s: &str) -> String {
     match GitDate::parse(s) {
         Some(d) => format!("{:04}-{:02}-{:02} {:02}:{:02}", d.year, d.month, d.day, d.hour, d.minute),
@@ -117,6 +132,9 @@ fn short_date(s: &str) -> String {
 }
 
 impl ApexApp {
+    /// Handle `Command::GitHistoryEditor`: open the window on the workspace's
+    /// repository and start loading it. Returns `false` for any other command.
+    /// An untrusted repository opens the Trust dialog instead, which re-runs the command.
     pub(crate) fn history_command(&mut self, cmd: Command, arg: Option<String>) -> bool {
         if cmd != Command::GitHistoryEditor {
             return false;
@@ -132,6 +150,7 @@ impl ApexApp {
             return true;
         }
         let h = &mut self.git.history;
+        // Switching repository resets all state; reopening the same one keeps the options.
         if h.repo != repo {
             *h = Default::default();
             h.repo = repo;
@@ -141,6 +160,8 @@ impl ApexApp {
         true
     }
 
+    /// Queue a background job that loads repository facts and commits, and
+    /// clear the error. The result is picked up by `show_history_editor`.
     fn history_reload(&mut self) {
         let (tx, rx) = channel();
         self.git.history.loading = Some(rx);
@@ -158,6 +179,9 @@ impl ApexApp {
         });
     }
 
+    /// Draw the Edit Commit History window and its modals, if open. Also
+    /// consumes a finished load (replacing commits and clearing drafts) and
+    /// reloads once an apply job has finished.
     pub(crate) fn show_history_editor(&mut self, ctx: &egui::Context) {
         if !self.git.history.open {
             return;
@@ -174,6 +198,7 @@ impl ApexApp {
                     h.facts = facts;
                     h.originals = commits;
                     h.drafts.clear();
+                    // Keep the selection across reloads if the commit still exists; else select the newest.
                     if h.selected.as_ref().is_none_or(|s| !h.originals.iter().any(|c| &c.hash == s)) {
                         h.selected = h.originals.last().map(|c| c.hash.clone());
                     }
@@ -181,6 +206,8 @@ impl ApexApp {
                 Err(e) => h.error = Some(e),
             }
         }
+        // Git jobs run one at a time, so nothing running means the apply job has ended
+        // (successfully or not); reload to show the rewritten hashes.
         if self.git.history.awaiting_apply && self.git.ops.running.is_none() {
             self.git.history.awaiting_apply = false;
             self.history_reload();
@@ -201,6 +228,7 @@ impl ApexApp {
         self.history_modals(ctx);
     }
 
+    /// Window body: repository line, toolbar, then the commit list beside the edit form.
     fn history_contents(&mut self, ui: &mut Ui, theme: &crate::theme::Theme) {
         let muted = theme.ui.text_muted;
         let h = &mut self.git.history;
@@ -251,6 +279,7 @@ impl ApexApp {
                 reload = true;
             }
             let label = if dirty > 0 { format!("Apply {planned} change{}…", if planned == 1 { "" } else { "s" }) } else { format!("Apply ({planned})…") };
+            // With force push on, Apply is allowed with no edits, to push an earlier rewrite.
             if ui.add_enabled((planned > 0 || h.force_push) && h.loading.is_none(), egui::Button::new(label)).clicked() {
                 apply = true;
             }
@@ -288,6 +317,8 @@ impl ApexApp {
         });
     }
 
+    /// The commit list (`visible` hashes, newest first), drawn virtualised with fixed-height rows.
+    /// Clicking a row selects it; edited commits get a dot, AI-related ones a warning colour.
     fn history_list(&mut self, ui: &mut Ui, theme: &crate::theme::Theme, visible: &[String]) {
         let h = &mut self.git.history;
         let row_h = 38.0;
@@ -296,6 +327,8 @@ impl ApexApp {
         let scroll_to = std::mem::take(&mut h.scroll_to_selected).then(|| h.selected.as_ref().and_then(|s| visible.iter().position(|v| v == s))).flatten();
         let mut area = egui::ScrollArea::vertical().id_salt("history-list").auto_shrink([false, false]);
         if let Some(i) = scroll_to {
+            // Last frame's scroll offset (stored below) tells whether the row is already in view;
+            // only scroll, centring it, when it is not.
             let top = ui.ctx().data(|d| d.get_temp::<f32>(egui::Id::new("history-list-offset"))).unwrap_or(0.0);
             let y = i as f32 * row_h;
             let viewport = ui.available_height();
@@ -337,6 +370,8 @@ impl ApexApp {
         }
     }
 
+    /// The edit form for the selected commit: author, committer, dates and message.
+    /// Edits are stored as a draft only when something changed this frame.
     fn history_form(&mut self, ui: &mut Ui, theme: &crate::theme::Theme) {
         let h = &mut self.git.history;
         let Some(hash) = h.selected.clone() else {
@@ -408,18 +443,24 @@ impl ApexApp {
             h.drafts.insert(hash.clone(), d.clone());
         }
         if let Some(field) = calendar {
+            // Start the picker at the field's current value, or now if it does not parse.
             let current = if field == DateField::Author { &d.author_date } else { &d.committer_date };
             let date = GitDate::parse(current).unwrap_or_else(|| gh::now(local_offset));
             h.mode = Mode::Calendar { field, date, view_year: date.year, view_month: date.month };
         }
     }
 
+    /// Show the modal for the current `Mode` and act on its result: stage bulk
+    /// author or date edits, set a calendar date, or queue the rewrite job
+    /// (`gh::apply`, which runs `git filter-branch` and optionally force-pushes)
+    /// and switch the bottom panel to the Git tab.
     fn history_modals(&mut self, ctx: &egui::Context) {
         let theme = self.theme.clone();
         let h = &mut self.git.history;
         let mut close = false;
         let mut status: Option<(String, bool)> = None;
         let mut start_apply = false;
+        // Take the mode out so the modal closures can borrow `h` too; it is put back unless closed.
         let mut mode = std::mem::take(&mut h.mode);
         match &mut mode {
             Mode::None => return,
@@ -547,6 +588,7 @@ impl ApexApp {
                             ui.text_edit_singleline(typed);
                         });
                     }
+                    // Force-pushing rewritten history affects others, so it needs a typed confirmation.
                     let can = !force || typed.trim() == "FORCE";
                     // Enter confirms too (it is also how FORCE is submitted).
                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -582,6 +624,8 @@ impl ApexApp {
 }
 
 /// Month grid and time fields. Some(true) = OK, Some(false) = cancel.
+/// Edits `date` in place; `year` and `month` are the month on show.
+/// `None` while the user has not pressed either button.
 fn calendar_ui(ui: &mut Ui, date: &mut GitDate, year: &mut i64, month: &mut u32, theme: &crate::theme::Theme) -> Option<bool> {
     const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
     ui.set_width(320.0);

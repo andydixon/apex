@@ -14,23 +14,31 @@ use crate::command::Command;
 use crate::git_ops::{first_remote, rel_path};
 use crate::palette::{PaletteItem, PaletteMode, Payload};
 
+/// Results sent from background `gh` jobs back to the UI thread.
 enum Incoming {
     /// The PR for (workdir, branch), or None when the branch has none.
     Status(PathBuf, String, Option<Box<PrSummary>>),
+    /// Open pull requests, shown in the palette.
     List(Vec<PrSummary>),
+    /// Check runs of the current branch's PR, shown in the palette.
     Checks(Vec<forge::CheckRun>),
+    /// PR number and its unified diff text, opened as a scratch document.
     Diff(u64, String),
 }
 
+/// Pull request state and the channel that background `gh` jobs report on.
 #[derive(Default)]
 pub struct ForgeUi {
     /// The current branch's pull request: (workdir, branch, PR).
     pub(crate) pr: Option<(PathBuf, String, PrSummary)>,
+    /// Receiving end, drained each frame by `forge_poll`; created lazily.
     rx: Option<Receiver<Incoming>>,
+    /// Sending end, cloned into each job closure.
     tx: Option<std::sync::mpsc::Sender<Incoming>>,
 }
 
 impl ForgeUi {
+    /// A sender for job results, creating the channel on first use.
     fn sender(&mut self) -> std::sync::mpsc::Sender<Incoming> {
         if self.tx.is_none() {
             let (tx, rx) = channel();
@@ -50,12 +58,15 @@ fn web_repo_for(workdir: &Path) -> Option<WebRepo> {
     forge::web_repo(&url)
 }
 
+/// The full hex id of HEAD's commit, or `None` if the repository cannot be
+/// opened or HEAD is unborn.
 fn head_id(workdir: &Path) -> Option<String> {
     let repo = git2::Repository::open(workdir).ok()?;
     repo.head().ok()?.target().map(|o| o.to_string())
 }
 
 /// `origin/HEAD`'s branch name, else `main`/`master` if present.
+/// Uses the first remote (preferring `origin`); falls back to `main`.
 fn default_branch(workdir: &Path) -> String {
     let Ok(repo) = git2::Repository::open(workdir) else { return "main".into() };
     let remote = first_remote(workdir).unwrap_or_else(|| "origin".into());
@@ -74,6 +85,7 @@ fn default_branch(workdir: &Path) -> String {
 }
 
 /// (subject, body) of commits on HEAD not on `base`, oldest first.
+/// Capped at 200 commits; empty if the repository or HEAD cannot be read.
 fn commits_since(workdir: &Path, base: &str) -> Vec<(String, String)> {
     let Ok(repo) = git2::Repository::open(workdir) else { return Vec::new() };
     let remote = first_remote(workdir).unwrap_or_else(|| "origin".into());
@@ -81,6 +93,8 @@ fn commits_since(workdir: &Path, base: &str) -> Vec<(String, String)> {
     if walk.push_head().is_err() {
         return Vec::new();
     }
+    // Prefer the remote-tracking base, as that is what the PR merges into.
+    // If neither ref exists nothing is hidden and all of HEAD's history counts.
     for r in [format!("refs/remotes/{remote}/{base}"), format!("refs/heads/{base}")] {
         if let Ok(oid) = repo.refname_to_id(&r) {
             let _ = walk.hide(oid);
@@ -96,8 +110,13 @@ fn commits_since(workdir: &Path, base: &str) -> Vec<(String, String)> {
 }
 
 impl ApexApp {
+    /// Drain results from background `gh` jobs and act on them: update the
+    /// branch's PR, show PR or check lists in the palette, or open a diff.
+    /// Called once per frame.
     pub(crate) fn forge_poll(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.git.forge.rx else { return };
+        // Collect first: handling a message needs `&mut self`, which the
+        // borrow of `rx` would otherwise block.
         let mut got = Vec::new();
         while let Ok(m) = rx.try_recv() {
             got.push(m);
@@ -122,6 +141,7 @@ impl ApexApp {
                                 p.author.as_ref().map(|a| a.login.as_str()).unwrap_or("")
                             ),
                             shortcut: String::new(),
+                            // Number and URL joined by U+001F (unit separator), split again in `GhPrActions`.
                             payload: Payload::Command(Command::GhPrActions, Some(format!("{}\u{1f}{}", p.number, p.url))),
                             boost: 0,
                         })
@@ -161,12 +181,17 @@ impl ApexApp {
     }
 
     /// Status-bar label of the current branch's PR.
+    /// `None` once the repository has moved to a different branch, so a stale PR is not shown.
     pub(crate) fn forge_status_label(&mut self) -> Option<String> {
         let (w, b, pr) = self.git.forge.pr.as_ref()?;
         let st = self.git.repos.get(w)?;
         (st.status.branch == *b).then(|| pr.status_label())
     }
 
+    /// Whether a `gh` command may run in `workdir`. Reports a missing `gh` in
+    /// the status bar; for an untrusted folder, opens the Trust dialog, which
+    /// re-runs `cmd` with `arg` once trust is granted. Gated because `gh` runs
+    /// `git`, which honours the repository's own config.
     fn gh_ready(&mut self, workdir: &Path, cmd: Command, arg: &Option<String>) -> bool {
         if !git_cli::gh_available() {
             self.set_status("This needs the GitHub CLI: install gh and run `gh auth login` (or set APEX_GH)".into(), true);
@@ -180,7 +205,9 @@ impl ApexApp {
     }
 
     /// Ask gh for the current branch's PR (after push, create, or on request).
+    /// Queues a `gh pr view` job; the result arrives as `Incoming::Status`.
     pub(crate) fn forge_refresh_pr(&mut self, workdir: PathBuf) {
+        // Silent no-op (no Trust dialog) as this also runs automatically after pushes.
         if !git_cli::gh_available() || !self.trust.is_trusted(&workdir) || web_repo_for(&workdir).is_none() {
             return;
         }
@@ -193,6 +220,7 @@ impl ApexApp {
                 let _ = tx.send(Incoming::Status(workdir, branch, Some(Box::new(pr))));
                 Ok(label)
             }
+            // gh reports "no PR" as an error; treat it as an empty result, not a failure.
             Err(e) if e.contains("no pull requests found") => {
                 let _ = tx.send(Incoming::Status(workdir, branch, None));
                 Ok(String::new())
@@ -201,6 +229,10 @@ impl ApexApp {
         });
     }
 
+    /// Run a code-host command (remote links and `gh` pull request commands).
+    /// `arg` is a file path, commit id, PR number or URL depending on `cmd`.
+    /// Returns `false` if `cmd` is not a forge command, so the caller can try others.
+    /// `gh` and `git push` run as queued background jobs; links open in the browser.
     pub(crate) fn forge_command(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) -> bool {
         match cmd {
             Command::GitOpenOnRemote
@@ -228,6 +260,8 @@ impl ApexApp {
             }
             return true;
         }
+        // Only path-like arguments name the target file; PR numbers and commit ids
+        // fall back to the active document. ':' admits Windows drive paths.
         let Some((workdir, file)) = self.git_target(arg.as_deref().filter(|a| a.starts_with('/') || a.contains(':'))) else { return true };
         let status = self.git.repos.get(&workdir).map(|e| e.status.clone()).unwrap_or_default();
         let web = web_repo_for(&workdir);
@@ -254,6 +288,7 @@ impl ApexApp {
                     let s = self.views[&v].sels.primary().range();
                     let a = rope.char_to_line(s.start.min(rope.len_chars()));
                     let mut b = rope.char_to_line(s.end.min(rope.len_chars()));
+                    // A selection ending at the start of a line does not include that line.
                     if b > a && rope.line_to_char(b) == s.end {
                         b -= 1;
                     }
@@ -279,6 +314,7 @@ impl ApexApp {
             }
             Command::GitOpenCommitOnRemote => {
                 let Some(web) = need_web(self) else { return true };
+                // Accept only something shaped like a commit id, so arbitrary text never reaches the URL.
                 let id = arg.filter(|a| a.len() >= 7 && a.chars().all(|c| c.is_ascii_hexdigit())).or_else(|| head_id(&workdir));
                 if let Some(id) = id {
                     open_url(&web.commit_url(&id));
@@ -352,6 +388,7 @@ impl ApexApp {
                 self.palette.show_with(PaletteMode::Prompt("pr_actions".into()), items, &format!("Pull request #{n}"), "");
             }
             Command::GhCheckoutPr => {
+                // Digits only, so the argument cannot be read by gh as an option or branch name.
                 let Some(n) = arg.filter(|a| a.chars().all(|c| c.is_ascii_digit()) && !a.is_empty()) else { return true };
                 if !self.gh_ready(&workdir, cmd, &Some(n.clone())) {
                     return true;
@@ -395,16 +432,19 @@ impl ApexApp {
                 let tx = self.git.forge.sender();
                 let wd = workdir.clone();
                 self.git_run("Create pull request", workdir, move |c| {
+                    // gh needs the head branch on the remote before it can open a PR.
                     if publish {
                         c.git(&["push", "--set-upstream", "--progress", &remote, &branch], None)?;
                     } else if push {
                         c.git(&["push", "--progress"], None)?;
                     }
+                    // The body goes over stdin (`--body-file -`) so it is not limited or mangled as an argument.
                     let mut args = vec!["pr", "create", "--title", title.trim(), "--body-file", "-", "--base", &base, "--head", &branch];
                     if draft {
                         args.push("--draft");
                     }
                     let out = c.gh(&args, Some(body.as_bytes()))?;
+                    // gh prints the new PR's URL as its last https line.
                     let url = out.lines().rev().find(|l| l.starts_with("https://")).unwrap_or("").trim().to_string();
                     if let Ok(v) = c.gh(&["pr", "view", "--json", forge::PR_FIELDS], None)
                         && let Ok(pr) = forge::parse_pr(&v)
@@ -420,6 +460,9 @@ impl ApexApp {
     }
 
     /// The Create Pull Request form.
+    /// Takes the dialog by value and puts it back in `self.dialog` unless
+    /// cancelled. On submit, stores it in `forge_pending_submit` and runs
+    /// `Command::GhSubmitPr`. Escape cancels.
     pub(crate) fn show_create_pr_dialog(&mut self, ctx: &egui::Context, d: Dialog) {
         let Dialog::CreatePr { workdir, branch, mut base, mut title, mut body, mut draft } = d else { return };
         let mut submit = false;
@@ -458,6 +501,7 @@ impl ApexApp {
     }
 }
 
+/// The part of `gh pr view --json statusCheckRollup` output that Apex reads.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PrStatusOnly {
