@@ -1126,9 +1126,12 @@ mod tests {
 
     #[test]
     fn uri_round_trip() {
-        let p = Path::new("/home/me/my project/ü.rs");
+        #[cfg(not(windows))]
+        let (p, want) = (Path::new("/home/me/my project/ü.rs"), "file:///home/me/my%20project/%C3%BC.rs");
+        #[cfg(windows)]
+        let (p, want) = (Path::new(r"C:\Users\me\my project\ü.rs"), "file:///C:/Users/me/my%20project/%C3%BC.rs");
         let u = uri_for(p);
-        assert_eq!(u, "file:///home/me/my%20project/%C3%BC.rs");
+        assert_eq!(u, want);
         assert_eq!(path_for(&u).unwrap(), p);
         assert!(path_for("http://x").is_none());
     }
