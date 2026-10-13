@@ -71,7 +71,7 @@ fn default_branch(workdir: &Path) -> String {
     let Ok(repo) = git2::Repository::open(workdir) else { return "main".into() };
     let remote = first_remote(workdir).unwrap_or_else(|| "origin".into());
     if let Ok(r) = repo.find_reference(&format!("refs/remotes/{remote}/HEAD"))
-        && let Some(t) = r.symbolic_target()
+        && let Ok(Some(t)) = r.symbolic_target()
         && let Some(b) = t.rsplit('/').next()
     {
         return b.to_string();
@@ -105,7 +105,7 @@ fn commits_since(workdir: &Path, base: &str) -> Vec<(String, String)> {
     walk.take(200)
         .flatten()
         .filter_map(|oid| repo.find_commit(oid).ok())
-        .map(|c| (c.summary().unwrap_or("").to_string(), c.body().unwrap_or("").to_string()))
+        .map(|c| (c.summary().ok().flatten().unwrap_or("").to_string(), c.body().ok().flatten().unwrap_or("").to_string()))
         .collect()
 }
 

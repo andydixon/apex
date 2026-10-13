@@ -49,7 +49,7 @@ criterion = { version = "0.5", default-features = false }
 notify = "8"
 ignore = "0.4"
 nucleo-matcher = "0.3"
-git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 tree-sitter = "0.27"
 clap = { version = "4.5", features = ["derive"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster"] }

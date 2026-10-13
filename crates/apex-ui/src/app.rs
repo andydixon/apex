@@ -4206,6 +4206,7 @@ impl ApexApp {
 fn private_temp_file(title: &str, text: &str) -> std::io::Result<(PathBuf, PathBuf)> {
     use std::io::Write;
     let dir = std::env::temp_dir().join(format!("apex-print-{}-{:016x}", std::process::id(), fastrand::u64(..)));
+    #[allow(unused_mut)] // only Unix sets a mode
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);

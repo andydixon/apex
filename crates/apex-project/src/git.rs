@@ -125,7 +125,7 @@ fn branch_info(repo: &git2::Repository) -> (String, bool, bool) {
             let name = repo
                 .find_reference("HEAD")
                 .ok()
-                .and_then(|r| r.symbolic_target().map(|s| s.trim_start_matches("refs/heads/").to_string()))
+                .and_then(|r| r.symbolic_target().ok().flatten().map(|s| s.trim_start_matches("refs/heads/").to_string()))
                 .unwrap_or_else(|| "main".into());
             (name, false, true)
         }
@@ -151,7 +151,8 @@ pub fn status(workdir: &Path, include_ignored: bool) -> Result<RepoStatus, git2:
     let mut dirs: HashMap<PathBuf, FileStatus> = HashMap::new();
     let mut entries = Vec::new();
     for e in statuses.iter() {
-        let Some(rel) = e.path() else { continue };
+        // Non-UTF-8 paths are skipped (git2 reports them as errors).
+        let Ok(rel) = e.path() else { continue };
         let s = e.status();
         // Ignored files only matter for colouring, never for the changes list.
         if !s.is_ignored() {
@@ -303,7 +304,7 @@ pub fn file_at(workdir: &Path, path: &Path, head: bool) -> Result<Option<String>
 pub fn head_message(workdir: &Path) -> Option<String> {
     let repo = git2::Repository::open(workdir).ok()?;
     let c = repo.head().ok()?.peel_to_commit().ok()?;
-    c.message().map(str::to_string)
+    c.message().ok().map(str::to_string)
 }
 
 /// A changed region of the working text relative to the base text.
@@ -533,7 +534,7 @@ pub fn file_history(workdir: &Path, path: &Path, limit: usize) -> Result<Vec<His
             short_id: oid.to_string()[..7].to_string(),
             author: sig.name().unwrap_or("").to_string(),
             date: format_date(time.seconds(), time.offset_minutes()),
-            summary: commit.summary().unwrap_or("").to_string(),
+            summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
         });
         if out.len() >= limit {
             break;
@@ -623,7 +624,7 @@ pub fn blame(workdir: &Path, path: &Path, buffer: Option<&str>) -> Result<BlameI
                 author: a.name().unwrap_or("").to_string(),
                 email: a.email().unwrap_or("").to_string(),
                 time: c.time().seconds(),
-                summary: c.summary().unwrap_or("").to_string(),
+                summary: c.summary().ok().flatten().unwrap_or("").to_string(),
                 message: c.message().unwrap_or("").to_string(),
             });
             let i = (info.commits.len() - 1) as u32;

@@ -58,7 +58,7 @@ pub struct GitOps {
 pub(crate) fn first_remote(workdir: &Path) -> Option<String> {
     let repo = git2::Repository::open(workdir).ok()?;
     let remotes = repo.remotes().ok()?;
-    let names: Vec<String> = remotes.iter().flatten().map(str::to_string).collect();
+    let names: Vec<String> = remotes.iter().filter_map(|r| r.ok().flatten()).map(str::to_string).collect();
     names.iter().find(|n| *n == "origin").or(names.first()).cloned()
 }
 

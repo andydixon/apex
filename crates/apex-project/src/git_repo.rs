@@ -50,7 +50,7 @@ pub fn branches(workdir: &Path) -> Result<Vec<BranchInfo>, git2::Error> {
             upstream: b.upstream().ok().and_then(|u| u.name().ok().flatten().map(str::to_string)),
             head: b.is_head(),
             remote: kind == git2::BranchType::Remote,
-            summary: commit.as_ref().and_then(|c| c.summary().map(str::to_string)).unwrap_or_default(),
+            summary: commit.as_ref().and_then(|c| c.summary().ok().flatten().map(str::to_string)).unwrap_or_default(),
             time: commit.as_ref().map(|c| c.time().seconds()).unwrap_or(0),
             name,
         });
@@ -165,11 +165,11 @@ pub fn log(workdir: &Path, limit: usize) -> Result<Vec<LogRow>, git2::Error> {
     let repo = git2::Repository::open(workdir)?;
     let mut refs: HashMap<git2::Oid, Vec<String>> = HashMap::new();
     let head = repo.head().ok();
-    let head_name = head.as_ref().filter(|h| h.is_branch()).and_then(|h| h.shorthand().map(str::to_string));
+    let head_name = head.as_ref().filter(|h| h.is_branch()).and_then(|h| h.shorthand().ok().map(str::to_string));
     for r in repo.references()?.flatten() {
-        let Some(name) = r.shorthand().map(str::to_string) else { continue };
+        let Ok(name) = r.shorthand().map(str::to_string) else { continue };
         // Skip `origin/HEAD` (duplicate), stashes and our own backup refs.
-        if name.ends_with("/HEAD") || r.name().is_some_and(|n| n.starts_with("refs/stash") || n.starts_with("refs/apex-")) {
+        if name.ends_with("/HEAD") || r.name().is_ok_and(|n| n.starts_with("refs/stash") || n.starts_with("refs/apex-")) {
             continue;
         }
         let Ok(c) = r.peel_to_commit() else { continue };
@@ -261,7 +261,7 @@ pub fn log(workdir: &Path, limit: usize) -> Result<Vec<LogRow>, git2::Error> {
             parents: parents.len(),
             author: a.name().unwrap_or("").to_string(),
             time: c.time().seconds(),
-            summary: c.summary().unwrap_or("").to_string(),
+            summary: c.summary().ok().flatten().unwrap_or("").to_string(),
             refs: refs.remove(&oid).unwrap_or_default(),
             lane,
             top,

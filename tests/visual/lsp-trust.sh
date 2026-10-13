@@ -17,7 +17,7 @@ cargo build -q --bin apex
 export VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/lvp_icd.json}
 export WGPU_BACKEND=vulkan
 export APEX_CONFIG_DIR="$OUT/config" APEX_DATA_DIR="$OUT/data" APEX_RUNTIME_DIR="$OUT/run" APEX_LOG=warn
-export DISPLAY=:${LSP_DISPLAY:-79}
+export DISPLAY=:${LSP_DISPLAY:-81}
 
 MARKER="$OUT/server-started"
 printf 'fn main() {}\n' > "$OUT/proj/main.rs"
@@ -32,6 +32,7 @@ Xvfb "$DISPLAY" -screen 0 1024x700x24 >/dev/null 2>&1 &
 XPID=$!
 APID=""
 trap 'kill $APID 2>/dev/null; kill $XPID 2>/dev/null' EXIT
+trap 'exit 1' INT TERM
 sleep 1
 
 run_once() {
