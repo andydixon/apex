@@ -174,7 +174,13 @@ repaint when something arrives:
 | LSP server I/O | reader thread per server | message size limit; restart backoff |
 | File watcher | `notify` | coalesced into a rescan timer |
 | Second invocation / Apple Events | `open_requests` channel | polled every frame |
-| Native file dialogs | `file_dialogs.rs`: rfd's blocking dialog on a worker thread (Linux, Windows); on macOS `macos_dialogs.rs` queues an AppKit panel on the main run loop with `CFRunLoopPerformBlock` and shows it as a sheet (rfd's `dispatch_sync` path deadlocks: the panel service's reply cannot reach a nested run loop inside a main-queue block) | latest request wins (Linux, Windows); one sheet at a time (macOS); the window keeps repainting |
+| Native file dialogs | `file_dialogs.rs`: rfd on a worker thread (Linux, Windows); on macOS `macos_dialogs.rs` queues an AppKit panel on the main run loop with `CFRunLoopPerformBlock` and presents it as a sheet | latest request wins (Linux, Windows); one sheet at a time (macOS); results return through a channel; reported backend failures use the in-app path prompt |
+
+AppKit still creates macOS panels on the main thread. A stalled system panel
+service can block that call before Apex receives a result. Null panels and
+explicit panel aborts trigger the path prompt; ordinary cancellation does
+nothing. Programmatic editor focus registers an AccessKit node before
+requesting focus, including when a path prompt opens a view after rendering.
 
 The side-by-side diff is not a separate widget: a diff tab's own view shows
 the base text and a second view (in no tab) shows the other side, usually

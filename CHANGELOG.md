@@ -53,10 +53,12 @@ All notable changes to Apex are recorded here. The format follows
 - git2 0.21 (RUSTSEC-2026-0183 and RUSTSEC-2026-0184).
 
 ### Fixed
-- macOS: Open, Open Folder and Save As no longer hang the editor. The
-  system panel is now shown as a sheet from the main run loop instead of
-  through rfd, whose main-queue dispatch deadlocked against AppKit's panel
-  service.
+- macOS: Open, Open Folder and Save As retain the main-run-loop AppKit
+  sheet backend. Null panels and explicit panel aborts now fall back to
+  the in-app path prompt; ordinary cancellation stays quiet. A stalled
+  macOS panel service can still block panel creation.
+- Returning focus to an editor view opened by a path prompt registers its
+  AccessKit node first, preventing a missing-focus-node crash.
 
 ## [0.0.1] - 2026-10-12
 

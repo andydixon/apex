@@ -67,3 +67,33 @@ steps 1–11 is `tests/visual/smoke.sh` (Linux, Xvfb).
     the PATH option was chosen; uninstall removes the entries.
 22. **Linux**: the desktop entry appears in the launcher with the icon; a
     `.txt` file's "Open With" dialog lists Apex.
+
+## Native file dialogs
+
+Use a temporary folder and disposable files. Set `native_file_dialogs = true`.
+Record whether each check used the system panel or the automatic path prompt;
+a passing fallback check does not verify native selection.
+
+23. File > Open selects multiple files; Open Folder replaces the workspace;
+    Add Folder adds a root; Open Project loads a project file. Repeat each
+    request after closing its previous dialog. On macOS, confirm that each
+    panel appears as a sheet on Apex.
+24. Save As on an untitled document shows its proposed file name. Choose a
+    new path, confirm the file contents and tab name, edit again and save.
+    Cancel Save As: no file is written and the document stays dirty.
+25. Cancel each native panel: the request closes quietly, no fallback prompt
+    appears, and the next request works. Cancel Save As during a dirty-tab
+    close sequence: the tab and its unsaved text remain open.
+26. **macOS reported failure**: if AppKit returns a null panel or explicitly
+    aborts it, the in-app path prompt appears. This is distinct from Cancel.
+    Enter a path with Tab completion and confirm that the original open or
+    save operation completes. Opening a new view through the prompt must
+    return keyboard focus without an accessibility crash. Cancel the
+    fallback: unsaved work remains.
+27. **macOS system panel-service stall**: if panel creation hangs, record
+    whether the same problem affects other applications. Preserve unsaved
+    work before restarting macOS, then repeat the native checks. Reported
+    failure fallback does not protect against a blocked AppKit call.
+28. Set `native_file_dialogs = false`: Open, Open Folder and Save As show the
+    path prompt immediately, without creating a system panel. Restore the
+    previous setting after the check.

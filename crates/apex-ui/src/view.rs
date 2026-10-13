@@ -29,6 +29,13 @@ impl ViewId {
     pub fn egui_id(self) -> egui::Id {
         egui::Id::new(("apex-view", self.0))
     }
+
+    /// Focus this view, including when a dialog opens it after editor rendering.
+    pub(crate) fn request_focus(self, ctx: &egui::Context) {
+        // AccessKit needs a node even if the new view has not been rendered yet.
+        ctx.accesskit_node_builder(self.egui_id(), |_| {});
+        ctx.memory_mut(|m| m.request_focus(self.egui_id()));
+    }
 }
 
 /// One laid-out document line.
@@ -984,6 +991,18 @@ pub enum Motion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focusing_a_new_view_keeps_the_accessibility_tree_valid() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let view = ViewId::next();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| view.request_focus(ui.ctx()));
+        output.textures_delta.clear();
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert_eq!(update.focus, view.egui_id().accesskit_id());
+        assert!(update.nodes.iter().any(|(id, _)| *id == update.focus));
+    }
 
     /// A view of `doc` at its current revision.
     fn view_for(doc: &Document) -> View {

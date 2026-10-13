@@ -2353,7 +2353,7 @@ impl ApexApp {
     /// Give egui keyboard focus to the active view's widget id.
     pub(crate) fn focus_active_editor(&self, ctx: &egui::Context) {
         if let Some(v) = self.active_view_id() {
-            ctx.memory_mut(|m| m.request_focus(v.egui_id()));
+            v.request_focus(ctx);
         }
     }
 
@@ -3227,7 +3227,7 @@ impl ApexApp {
         if let Some(v) = to_activate {
             self.active_pane = pane_id;
             self.focus_view(v);
-            ui.ctx().memory_mut(|m| m.request_focus(v.egui_id()));
+            v.request_focus(ui.ctx());
         }
         if let Some(v) = to_close {
             self.active_pane = pane_id;

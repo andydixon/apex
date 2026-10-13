@@ -5,11 +5,8 @@
 //! * **Linux and Windows:** rfd's blocking API on a worker thread (the
 //!   portal / GTK and Win32 dialogs are happy off the UI thread). The answer
 //!   comes back through a channel.
-//! * **macOS:** AppKit's panels must be created from a plain main-thread
-//!   run-loop callout, neither from a GCD block (what rfd does for worker
-//!   threads, which deadlocks) nor from inside winit's drawing pass (where
-//!   egui's `update` runs). `macos_dialogs` queues the panel on the main run
-//!   loop and shows it as a sheet; see that module for the full story.
+//! * **macOS:** AppKit creates the panel on the main run loop and shows it
+//!   asynchronously as a sheet. See `macos_dialogs` for the threading constraints.
 //! * **Any platform, `native_file_dialogs` off:** an in-app path prompt with
 //!   Tab completion. This is also the fallback when a dialog cannot start.
 //!
@@ -49,6 +46,7 @@ pub(crate) enum Mode {
 }
 
 /// Dialog parameters, independent of the backend.
+#[derive(Clone)]
 pub struct FileDialogSpec {
     pub(crate) title: String,
     /// Folder the dialog opens in; the backend's default when `None`.
@@ -132,7 +130,9 @@ pub struct PendingFileDialog {
     /// What to do with the paths once they arrive.
     kind: FileDialogKind,
     /// Delivers the chosen paths (empty = cancelled) exactly once.
-    rx: Receiver<Vec<PathBuf>>,
+    rx: Receiver<Result<Vec<PathBuf>, String>>,
+    /// Retained for the in-app fallback when the native backend fails.
+    spec: FileDialogSpec,
 }
 
 impl PendingFileDialog {
@@ -141,28 +141,30 @@ impl PendingFileDialog {
     fn start(spec: FileDialogSpec, kind: FileDialogKind, ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
         #[cfg(target_os = "macos")]
-        crate::macos_dialogs::start(spec, tx, ctx);
+        crate::macos_dialogs::start(spec.clone(), tx, ctx);
         #[cfg(not(target_os = "macos"))]
-        std::thread::Builder::new()
-            .name("apex-file-dialog".into())
-            .spawn(move || {
-                let _ = tx.send(spec.run_sync());
-                // Wake the UI only when there is an answer: repainting while
-                // the dialog is up makes no difference to it.
+        {
+            let worker_spec = spec.clone();
+            let worker_ctx = ctx.clone();
+            if let Err(error) = std::thread::Builder::new().name("apex-file-dialog".into()).spawn(move || {
+                let _ = tx.send(Ok(worker_spec.run_sync()));
+                worker_ctx.request_repaint();
+            }) {
+                tracing::warn!("could not start the file dialog worker: {error}");
                 ctx.request_repaint();
-            })
-            .ok();
-        Self { kind, rx }
+            }
+        }
+        Self { kind, rx, spec }
     }
 
-    /// Some(paths) once the user has answered; empty = cancelled.
-    fn poll(&mut self) -> Option<Vec<PathBuf>> {
+    /// An answer or backend failure; an empty successful answer means cancelled.
+    fn poll(&mut self) -> Option<Result<Vec<PathBuf>, String>> {
         match self.rx.try_recv() {
             Ok(v) => Some(v),
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
             // The sender went away without answering (thread panicked or the
-            // panel failed): treat as cancelled so the slot is freed.
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Vec::new()),
+            // panel failed): use the path prompt so the request is still usable.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err("the file dialog stopped without a result".into())),
         }
     }
 }
@@ -176,9 +178,8 @@ impl ApexApp {
             return;
         }
         let Some(ctx) = self.egui_ctx.clone() else { return };
-        // On macOS the sheet blocks the window, so a second request while one
-        // is up can only come from a modeless panel; keep the first, it will
-        // answer. Elsewhere a dialog that never answered must not block the
+        // On macOS retain one request while its sheet is open.
+        // Elsewhere a dialog that never answered must not block the
         // next one: the new request replaces it and a late answer is ignored.
         if cfg!(target_os = "macos") && self.file_dialog.is_some() {
             return;
@@ -215,10 +216,17 @@ impl ApexApp {
     /// Called every frame: deliver a finished dialog's result.
     pub(crate) fn poll_file_dialog(&mut self, ctx: &egui::Context) {
         let Some(pending) = &mut self.file_dialog else { return };
-        let Some(paths) = pending.poll() else { return };
+        let Some(result) = pending.poll() else { return };
         // Take the slot before acting: the handler may open another dialog.
-        let Some(PendingFileDialog { kind, .. }) = self.file_dialog.take() else { return };
-        self.file_dialog_result(kind, paths);
+        let Some(PendingFileDialog { kind, spec, .. }) = self.file_dialog.take() else { return };
+        match result {
+            Ok(paths) => self.file_dialog_result(kind, paths),
+            Err(error) => {
+                tracing::warn!("{error}");
+                self.set_status("System file dialog unavailable; enter a path instead".into(), true);
+                self.prompt_for_path(&spec, kind);
+            }
+        }
         ctx.request_repaint();
     }
 
@@ -329,6 +337,19 @@ pub(crate) fn complete_path(text: &str, folders_only: bool) -> (String, Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_dialog_distinguishes_waiting_cancellation_and_failure() {
+        let (tx, rx) = channel();
+        let mut pending = PendingFileDialog { kind: FileDialogKind::OpenFiles, rx, spec: FileDialogSpec::open_files("Open File") };
+        assert!(pending.poll().is_none());
+        tx.send(Ok(Vec::new())).unwrap();
+        assert!(pending.poll().unwrap().unwrap().is_empty());
+        tx.send(Err("panel unavailable".into())).unwrap();
+        assert_eq!(pending.poll().unwrap().unwrap_err(), "panel unavailable");
+        drop(tx);
+        assert!(pending.poll().unwrap().is_err());
+    }
 
     /// Common-prefix completion with candidates, single-match completion,
     /// folders-only filtering and the no-separator passthrough.

@@ -1124,10 +1124,13 @@ thing to try.
   PATH. Configure the full path under \texttt{[lsp\_servers]}.
 \item[A build task is greyed out.] Tasks from a project file run only after
   \menu{Project > Trust Workspace}.
-\item[The Open dialog does not appear (macOS).] Make sure you are on a build
-  from October 2026 or later; the system panel is now shown as a sheet on
-  the window. As a fallback, set \setting{native\_file\_dialogs = false} for
-  an in-app path prompt with Tab completion.
+\item[The Open or Save As dialog does not appear (macOS).] If the system
+  reports a panel failure, Apex opens a path prompt instead. Enter the
+  file or folder path; \key{Tab} completes it. Cancelling keeps your
+  unsaved work. Set \setting{native\_file\_dialogs = false} to use the path
+  prompt immediately for every request. A stalled macOS panel service can
+  still block the system dialog. If file dialogs also hang in other
+  applications, preserve unsaved work and restart macOS.
 \item[Fonts show boxes.] Set \setting{font\_family} to an installed font
   with the glyphs you need.
 \item[Keys do nothing in the editor.] Vim mode may be on (the status bar

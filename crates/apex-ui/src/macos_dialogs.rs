@@ -1,46 +1,9 @@
-//! Native open and save panels on macOS, shown without deadlocking AppKit.
+//! Native macOS file panels, created on the main run loop and shown as sheets.
 //!
-//! # Why rfd is not used on macOS
-//!
-//! Creating an `NSOpenPanel` or `NSSavePanel` makes AppKit connect to the
-//! system's separate panel service (`com.apple.appkit.xpc.openAndSavePanelService`).
-//! `-[NSSavePanel _initBridgeAndStuff]` waits for that connection by spinning
-//! a *nested* run loop on the main thread, and the service's reply is
-//! delivered through the main dispatch queue (GCD).
-//!
-//! CoreFoundation never drains the main dispatch queue from a nested run loop
-//! that is itself running inside a main-queue block, so the panel can only be
-//! created from a plain run-loop callout. That rules out both ways rfd can be
-//! driven from an eframe app:
-//!
-//! * From a worker thread, rfd uses `dispatch_sync` onto the main queue. The
-//!   panel is then created *inside* a main-queue block, the reply can never
-//!   be delivered, and the whole process hangs. This is exactly what the
-//!   `sample` trace of the hang showed (`_dispatch_main_queue_drain` →
-//!   `pick_folder` → `_initBridgeAndStuff` → `HIRunLoopSemaphore wait:`).
-//! * From the UI thread, eframe's `update` runs inside winit's `drawRect:`,
-//!   that is in the middle of a view drawing pass. Nesting a modal run loop
-//!   there froze the editor before the panel appeared.
-//!
-//! # What this module does instead
-//!
-//! The panel is created and begun from a block queued on the main run loop
-//! with `CFRunLoopPerformBlock` in the common modes. Such a block runs as an
-//! ordinary run-loop callout after the current event has been handled:
-//! outside any GCD block and outside any drawing pass, so AppKit's nested
-//! wait can still service the main queue and the panel service attaches.
-//!
-//! The panel is shown as a sheet on the editor window (or as a modeless
-//! panel if there is no window yet) with `beginSheetModalForWindow:`, which
-//! returns immediately. Nothing blocks: winit keeps running the event loop,
-//! and the completion handler sends the chosen paths down a channel that
-//! `file_dialogs::poll_file_dialog` reads every frame.
-//!
-//! Filters (allowed file types) are not applied on macOS: the only caller
-//! that sets one is Open Project, where the panel's own type column already
-//! makes the right file easy to find.
-//! ponytail: add `objc2-uniform-type-identifiers` and `setAllowedContentTypes`
-//! if a dialog ever needs to restrict what can be chosen.
+//! AppKit must create these panels on the main thread, outside the editor's
+//! drawing pass and any main dispatch-queue callback. Asynchronous completion
+//! returns paths through a channel. A failed panel returns an error instead of
+//! panicking; macOS panel-service initialisation can still block the main thread.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -48,9 +11,9 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
 use block2::RcBlock;
-use objc2::MainThreadMarker;
 use objc2::rc::Retained;
-use objc2_app_kit::{NSApplication, NSModalResponse, NSModalResponseOK, NSOpenPanel, NSSavePanel};
+use objc2::{ClassType, MainThreadMarker, msg_send};
+use objc2_app_kit::{NSApplication, NSModalResponse, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSSavePanel};
 use objc2_core_foundation::{CFRunLoop, kCFRunLoopCommonModes};
 use objc2_foundation::{NSString, NSURL};
 
@@ -58,11 +21,11 @@ use crate::file_dialogs::{FileDialogSpec, Mode};
 
 /// Queue the panel on the main run loop. Must be called on the main thread
 /// (the egui `update` is); `tx` receives the chosen paths, or an empty list
-/// when the user cancels or the panel cannot be shown.
-pub(crate) fn start(spec: FileDialogSpec, tx: Sender<Vec<PathBuf>>, ctx: egui::Context) {
+/// when the user cancels, or an error when the panel cannot be shown.
+pub(crate) fn start(spec: FileDialogSpec, tx: Sender<Result<Vec<PathBuf>, String>>, ctx: egui::Context) {
     let Some(main) = CFRunLoop::main() else {
-        tracing::warn!("macOS file dialog not shown: no main run loop");
-        let _ = tx.send(Vec::new());
+        let _ = tx.send(Err("macOS file dialog has no main run loop".into()));
+        ctx.request_repaint();
         return;
     };
     // `Fn` because that is the block ABI; CoreFoundation runs it exactly once.
@@ -79,25 +42,39 @@ pub(crate) fn start(spec: FileDialogSpec, tx: Sender<Vec<PathBuf>>, ctx: egui::C
 
 /// Runs on the main thread from the run loop: build the panel from `spec`,
 /// show it and hand the result to `tx` when it closes.
-fn present(spec: &FileDialogSpec, tx: Sender<Vec<PathBuf>>, ctx: egui::Context) {
+fn present(spec: &FileDialogSpec, tx: Sender<Result<Vec<PathBuf>, String>>, ctx: egui::Context) {
     let Some(mtm) = MainThreadMarker::new() else {
         // Cannot happen for a block on the main run loop; answer rather than hang.
-        tracing::warn!("macOS file dialog block ran off the main thread");
-        let _ = tx.send(Vec::new());
+        let _ = tx.send(Err("macOS file dialog ran off the main thread".into()));
+        ctx.request_repaint();
         return;
     };
     let app = NSApplication::sharedApplication(mtm);
-    let panel: Retained<NSSavePanel> = match spec.mode {
-        Mode::SaveFile => NSSavePanel::savePanel(mtm),
+    // The generated bindings assume non-null, but AppKit returned nil after a
+    // panel-service failure during testing. Preserve that as a recoverable error.
+    let panel: Option<Retained<NSSavePanel>> = match spec.mode {
+        // SAFETY: the AppKit class and selector match the binding; we are on the main thread.
+        Mode::SaveFile => unsafe { msg_send![NSSavePanel::class(), savePanel] },
         mode => {
-            let p = NSOpenPanel::openPanel(mtm);
+            // SAFETY: the AppKit class and selector match the binding; we are on the main thread.
+            let p: Option<Retained<NSOpenPanel>> = unsafe { msg_send![NSOpenPanel::class(), openPanel] };
+            let Some(p) = p else {
+                let _ = tx.send(Err("macOS could not create the Open panel".into()));
+                ctx.request_repaint();
+                return;
+            };
             p.setCanChooseFiles(mode != Mode::PickFolder);
             p.setCanChooseDirectories(mode == Mode::PickFolder);
             p.setAllowsMultipleSelection(mode == Mode::PickFiles);
             // Folders a user picks as a workspace are often ones they are about to create.
             p.setCanCreateDirectories(mode == Mode::PickFolder);
-            Retained::into_super(p)
+            Some(Retained::into_super(p))
         }
+    };
+    let Some(panel) = panel else {
+        let _ = tx.send(Err("macOS could not create the Save panel".into()));
+        ctx.request_repaint();
+        return;
     };
     // `message` is the text above the file list; the title bar of a sheet is not shown.
     panel.setMessage(Some(&NSString::from_str(&spec.title)));
@@ -114,9 +91,9 @@ fn present(spec: &FileDialogSpec, tx: Sender<Vec<PathBuf>>, ctx: egui::Context) 
     let slot: Rc<RefCell<Option<Retained<NSSavePanel>>>> = Rc::new(RefCell::new(Some(panel.clone())));
     let handler = RcBlock::new(move |response: NSModalResponse| {
         let paths = match slot.borrow_mut().take() {
-            Some(panel) if response == NSModalResponseOK => chosen_paths(&panel),
-            // Cancelled, aborted by the system, or (impossibly) called twice.
-            _ => Vec::new(),
+            Some(panel) if response == NSModalResponseOK => Ok(chosen_paths(&panel)),
+            Some(_) if response == NSModalResponseCancel => Ok(Vec::new()),
+            _ => Err("macOS could not complete the file dialog".into()),
         };
         let _ = tx.send(paths);
         // Wake the UI thread so `poll_file_dialog` sees the answer promptly.

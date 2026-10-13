@@ -161,9 +161,8 @@ rewrite and backup tag, merge state and conflict parsing, log graph);
 commit/amend, blame, side-by-side staging, push/pull against a local bare
 remote, GitHub flows against a fake `gh`, branches, stash, a full conflict
 resolution and a history rewrite, checking every result with `git`.
-Not verified here: real GitHub (needs `gh auth login`), the native macOS file
-dialog (hangs inside AppKit's panel creation; in-app prompt is the macOS
-default meanwhile — see "Next step").
+Not verified here: real GitHub (needs `gh auth login`). The current macOS
+file-dialog status is recorded under Milestone 14.
 
 Fixed along the way: the backup tag of a history rewrite was itself
 rewritten (Nexus had the same flaw); remote-tracking refs are no longer
@@ -173,11 +172,33 @@ installed after AppKit's own; the Dock icon is Apex's.
 
 ## Milestone 14 — macOS dialogs, comments, guide and security audit (complete)
 
-* macOS Open, Open Folder and Save As no longer go through rfd. The hang was
-  rfd's main-queue dispatch deadlocking against AppKit's panel service; the
-  panel is now begun from a main run-loop block and shown as a sheet
-  (`macos_dialogs.rs`). Native dialogs are the default everywhere again.
-  Type-checked for macOS, not yet run on a Mac.
+* macOS Open, Open Folder and Save As retain the AppKit sheet backend
+  queued through `CFRunLoopPerformBlock` (`macos_dialogs.rs`). Null panels
+  and explicit panel aborts return an error to the existing path prompt;
+  ordinary cancellation does nothing. A system panel-service stall can
+  still block AppKit during panel creation.
+  Live investigation on 13 October 2026 found panel creation waiting for
+  60 seconds before returning null in Apex; plain Cocoa probes also
+  stalled, and the user reported Webex hanging and crashing on Open.
+  After a macOS reboot, the original Apex native Open dialog worked in a
+  live test, confirmed by the user. This supports a shared macOS service
+  fault; its exact cause remains unestablished.
+  Live checks of the final debug backend opened two selected files into
+  two tabs without an AccessKit crash, saved the exact expected contents
+  through native Save As, and opened a folder with its sidebar populated.
+  Cancelling native Save As preserved dirty text. Closing a dirty tab,
+  choosing Save and cancelling the native panel preserved the tab; choosing
+  a native save path wrote the expected contents and then closed it.
+  Native Open Project showed its single-file sheet and cancelled quietly;
+  a subsequent native Open request also opened and cancelled successfully.
+  The rebuilt, signed `dist/Apex.app` selected a file through native Open
+  and wrote the exact expected contents through native Save As. The macOS
+  package script also produced `dist/Apex-0.0.1-macos.dmg`.
+  AppKit null-panel and abort fault injection, project-file loading, and
+  Finder/Dock integration checks remain pending.
+* Returning focus after a path prompt opens a view now creates its
+  AccessKit node before requesting focus. A headless regression test
+  checks that the focused node exists in the accessibility update.
 * Every module has a header, and types and functions carry doc comments.
 * PDF user guide in LaTeX (`make guide`, `docs/user-guide/latex/`).
 * Security audit (`audits/20261013-0712-*`): language servers now need a
@@ -189,7 +210,11 @@ installed after AppKit's own; the Dock icon is Apex's.
 
 ## Test status
 
-Last full run (`cargo test --workspace`, 12 October 2026, after the Git work):
+Last full run (`cargo test --workspace`, 13 October 2026, after the dialog
+changes): 183 passed, one timing probe ignored. The successful run set
+`TMPDIR` to its canonical physical path. With the default macOS `TMPDIR`,
+two existing apex-project Git alias tests repeat failures caused by
+`/var` versus `/private/var` path spelling; those failures are unresolved.
 
 | Crate | Passed |
 |---|---|
@@ -198,15 +223,15 @@ Last full run (`cargo test --workspace`, 12 October 2026, after the Git work):
 | apex-edit | 43 (+ 8 property tests) |
 | apex-project | 51 |
 | apex-syntax | 15 (+1 ignored timing probe) |
-| apex-ui | 46 |
+| apex-ui | 48 |
 
-`cargo clippy --workspace --all-targets -- -D warnings` and
-`cargo fmt --all -- --check` clean.
+`cargo clippy --workspace --all-targets -- -D warnings` passed on 13 October
+2026. `cargo fmt --all -- --check` and `git diff --check` passed too.
 
 ## Next step
 
-1. macOS: confirm the native dialogs now open (`macos_dialogs.rs`, written
-   from the `sample` trace of the hang but not yet run on a Mac), and check
-   Finder "Open With" and the Dock icon.
+1. macOS: test reported panel failures with fault injection, project-file
+   loading, Finder "Open With" and the Dock icon using
+   `docs/development/manual-smoke-test.md`.
 2. Try the GitHub features against a real repository after `gh auth login`.
 3. Tag the next release following `docs/development/release-process.md`.
