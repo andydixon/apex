@@ -1461,7 +1461,8 @@ mod tests {
         assert_eq!(s.as_slice(), &[Selection::new(1, 2), Selection::new(3, 5), Selection::new(6, 7)]);
         let mut d = doc("one two three four five six");
         run(&mut d, |d| hard_wrap(d, &SelectionSet::default(), 12));
-        assert_eq!(d.text(), "one two\nthree four\nfive six");
+        // With no line break to detect, the document takes the platform's ending.
+        assert_eq!(d.text(), "one two\nthree four\nfive six".replace('\n', d.line_ending.as_str()));
     }
 
     /// Measures (and bounds at 200 ms) a 1,000-caret insert, checking offsets.
