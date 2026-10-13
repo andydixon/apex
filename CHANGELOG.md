@@ -3,7 +3,7 @@
 All notable changes to Apex are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.1.1] - 2026-10-13
 
 ### Added
 - Git menu. Staging through your installed `git`: stage/unstage file or all,
@@ -53,6 +53,21 @@ All notable changes to Apex are recorded here. The format follows
 - git2 0.21 (RUSTSEC-2026-0183 and RUSTSEC-2026-0184).
 
 ### Fixed
+- Deleting a block of text could close the editor at once: when the
+  document shrank below the scroll position (for example delete to the end
+  of the file, undo, delete again), the next frame read a line that no
+  longer existed. The scroll anchor is now kept inside the document.
+- Left/Right after Split into Lines puts every caret at its own line's
+  start or end; carets on blank lines no longer step onto the line above.
+- Horizontal scrolling stops at the end of the widest visible line, so text
+  never ends up hidden behind the minimap, and there is no sideways
+  scrolling when nothing overflows.
+- Git status, blame and history work in repositories reached through a
+  symlink (including macOS temporary folders, where `/var` is
+  `/private/var`).
+- Windows builds: the SCSS grammar is taken from upstream, where its build
+  script no longer passes a GCC-only flag to MSVC.
+- CI: the fuzz job runs on nightly despite `rust-toolchain.toml`.
 - Save Project As now uses the native dialog by default and honours
   `native_file_dialogs = false`, matching the other open and save commands.
 - macOS: Open, Open Folder and Save As retain the main-run-loop AppKit
@@ -61,6 +76,11 @@ All notable changes to Apex are recorded here. The format follows
   macOS panel service can still block panel creation.
 - Returning focus to an editor view opened by a path prompt registers its
   AccessKit node first, preventing a missing-focus-node crash.
+
+### Packaging
+- Signed `.deb`, `.rpm` and Arch packages for x86-64 at
+  [repo.dixon.cx](https://dixon.cx/repo) (`packaging/repo.sh`), and a
+  Homebrew formula (`brew install andydixon/tap/apex`).
 
 ## [0.0.1] - 2026-10-12
 

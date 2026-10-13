@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "apex-app"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "apex-project",
  "apex-ui",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "apex-buffer"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "encoding_rs",
@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "apex-edit"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "apex-buffer",
  "criterion",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "apex-project"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "apex-buffer",
  "apex-edit",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "apex-syntax"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "apex-buffer",
  "apex-edit",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "apex-ui"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "apex-buffer",
  "apex-edit",
@@ -4102,8 +4102,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-scss"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33909a9ca86390ebbf3461e9949c4bbe2767d2d024b486306d27616641d4ba24"
+source = "git+https://github.com/tree-sitter-grammars/tree-sitter-scss?rev=5da5ba71a558b007b352c505bfcd9095ae337022#5da5ba71a558b007b352c505bfcd9095ae337022"
 dependencies = [
  "cc",
  "tree-sitter",

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.91"
 license = "AGPL-3.0-or-later"
@@ -77,3 +77,8 @@ strip = false
 
 [profile.bench]
 inherits = "release"
+
+[patch.crates-io]
+# 1.0.0 (the latest release) passes a GCC-only flag that MSVC rejects, which
+# breaks Windows builds. Fixed upstream, not yet released.
+tree-sitter-scss = { git = "https://github.com/tree-sitter-grammars/tree-sitter-scss", rev = "5da5ba71a558b007b352c505bfcd9095ae337022" }

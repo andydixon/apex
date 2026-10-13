@@ -83,6 +83,9 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: Build and smoke-run each target for 20 s
         working-directory: fuzz
+        # rust-toolchain.toml pins stable; cargo-fuzz needs nightly.
+        env:
+          RUSTUP_TOOLCHAIN: nightly
         run: |
           cargo fuzz build
           for t in transactions offsets settings search session; do

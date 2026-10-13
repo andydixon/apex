@@ -100,6 +100,19 @@ pub fn discover(path: &Path) -> Option<git2::Repository> {
     Some(repo)
 }
 
+/// The repository's working directory, spelled the way the caller spelled
+/// `workdir`. libgit2 resolves symlinks (macOS's `/var` is `/private/var`),
+/// so its own path need not prefix paths built from the caller's.
+fn repo_root(repo: &git2::Repository, workdir: &Path) -> PathBuf {
+    let Some(wd) = repo.workdir() else { return workdir.to_path_buf() };
+    let canon_wd = wd.canonicalize().unwrap_or_else(|_| wd.to_path_buf());
+    let depth = workdir.canonicalize().ok().and_then(|c| c.strip_prefix(&canon_wd).ok().map(|r| r.components().count()));
+    match depth.and_then(|d| workdir.ancestors().nth(d)) {
+        Some(root) => root.to_path_buf(),
+        None => wd.to_path_buf(),
+    }
+}
+
 /// Working directory of the repository containing `path`, if any.
 pub fn workdir_of(path: &Path) -> Option<PathBuf> {
     discover(path).and_then(|r| r.workdir().map(Path::to_path_buf))
@@ -146,7 +159,7 @@ pub fn status(workdir: &Path, include_ignored: bool) -> Result<RepoStatus, git2:
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true).recurse_untracked_dirs(true).include_ignored(include_ignored).exclude_submodules(false).renames_head_to_index(true);
     let statuses = repo.statuses(Some(&mut opts))?;
-    let root = repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| workdir.to_path_buf());
+    let root = repo_root(&repo, workdir);
     let mut files = HashMap::new();
     let mut dirs: HashMap<PathBuf, FileStatus> = HashMap::new();
     let mut entries = Vec::new();
@@ -275,7 +288,7 @@ pub fn start_status(workdir: PathBuf, include_ignored: bool) -> StatusScan {
 /// this as a diff base, so exact encoding fidelity is not required.
 pub fn file_at(workdir: &Path, path: &Path, head: bool) -> Result<Option<String>, git2::Error> {
     let repo = git2::Repository::open(workdir)?;
-    let root = repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| workdir.to_path_buf());
+    let root = repo_root(&repo, workdir);
     let rel = path.strip_prefix(&root).map_err(|_| git2::Error::from_str("path is outside the repository"))?;
     let blob_oid = if head {
         let Ok(head_ref) = repo.head() else { return Ok(None) };
@@ -505,7 +518,7 @@ pub fn format_date(unix: i64, offset_minutes: i32) -> String {
 /// Renames are not followed. An unborn HEAD yields an empty list.
 pub fn file_history(workdir: &Path, path: &Path, limit: usize) -> Result<Vec<HistoryEntry>, git2::Error> {
     let repo = git2::Repository::open(workdir)?;
-    let root = repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| workdir.to_path_buf());
+    let root = repo_root(&repo, workdir);
     let rel = path.strip_prefix(&root).map_err(|_| git2::Error::from_str("path is outside the repository"))?;
     let mut walk = repo.revwalk()?;
     if walk.push_head().is_err() {
@@ -600,7 +613,7 @@ pub struct BlameInfo {
 /// `None`.
 pub fn blame(workdir: &Path, path: &Path, buffer: Option<&str>) -> Result<BlameInfo, git2::Error> {
     let repo = git2::Repository::open(workdir)?;
-    let root = repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| workdir.to_path_buf());
+    let root = repo_root(&repo, workdir);
     let rel = path.strip_prefix(&root).map_err(|_| git2::Error::from_str("path is outside the repository"))?;
     let base = repo.blame_file(rel, None)?;
     let blame = match buffer {
@@ -767,6 +780,26 @@ mod blame_tests {
         assert!(text.contains("    second\n\n    body\n"));
         assert!(text.contains("-b\n+B\n"), "{text}");
         assert!(commit_text(root, "HEAD~1").unwrap().contains("+a\n+b\n+c\n"));
+    }
+
+    /// A repository reached through a symlink (macOS temp dirs live under
+    /// `/var` -> `/private/var`) still resolves paths spelled via the link.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_workdir_resolves_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let repo = git2::Repository::init(&real).unwrap();
+        std::fs::write(real.join("f.txt"), "a\n").unwrap();
+        commit_all(&repo, "first", 1_000_000);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let f = link.join("f.txt");
+        assert_eq!(blame(&link, &f, None).unwrap().lines.len(), 1);
+        assert_eq!(file_at(&link, &f, true).unwrap().as_deref(), Some("a\n"));
+        std::fs::write(&f, "b\n").unwrap();
+        assert_eq!(status(&link, false).unwrap().entries[0].path, f);
     }
 
     /// Each unit boundary in both long and short form.

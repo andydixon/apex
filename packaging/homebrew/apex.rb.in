@@ -1,0 +1,29 @@
+# Homebrew formula template for Apex. `make brew-formula` fills in the tag
+# and the checksum of the GitHub source tarball and writes the result to
+# dist/homebrew/apex.rb; copy that into the tap
+# (github.com/andydixon/homebrew-tap, Formula/apex.rb).
+class Apex < Formula
+  desc "Native, high-performance text editor"
+  homepage "https://dixon.cx/apex"
+  url "https://github.com/andydixon/apex/archive/refs/tags/@TAG@.tar.gz"
+  sha256 "@SHA256@"
+  license "AGPL-3.0-or-later"
+  head "https://github.com/andydixon/apex.git", branch: "main"
+
+  depends_on "rust" => :build
+
+  def install
+    system "cargo", "install", *std_cargo_args(path: "crates/apex-app")
+    if OS.linux?
+      (share/"applications").install "packaging/linux/apex.desktop"
+      (share/"icons/hicolor/scalable/apps").install "assets/icons/apex.svg"
+      [16, 24, 32, 48, 64, 128, 256, 512].each do |s|
+        (share/"icons/hicolor/#{s}x#{s}/apps").install "assets/icons/png/apex-#{s}.png" => "apex.png"
+      end
+    end
+  end
+
+  test do
+    assert_match "Apex", shell_output("#{bin}/apex --help")
+  end
+end

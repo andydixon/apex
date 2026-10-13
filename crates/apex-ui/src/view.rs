@@ -447,9 +447,15 @@ impl View {
                 }
             }
         };
+        // When Left/Right collapse selections, empty carets stay put: after
+        // Split into Lines a blank line's caret would otherwise step onto the
+        // previous line while every other line's caret lands at its start.
+        let collapsing = !extend && self.sels.iter().any(|s| !s.is_empty());
         self.sels.transform(|s| {
             let head = s.head.min(rope.len_chars());
-            let collapse_to = |s: &Selection, start: bool| if !extend && !s.is_empty() { Some(if start { s.start() } else { s.end() }) } else { None };
+            let collapse_to = |s: &Selection, start: bool| {
+                if !extend && (collapsing || !s.is_empty()) { Some(if start { s.start() } else { s.end() }) } else { None }
+            };
             match motion {
                 Motion::Left => {
                     let p = collapse_to(&s, true).unwrap_or_else(|| prev_grapheme_boundary(text, head));
@@ -1035,6 +1041,23 @@ mod tests {
         assert_eq!(v.sels.primary().head, 0);
         v.move_cursors(&d, Motion::LineStart, false, 4);
         assert_eq!(v.sels.primary().head, 4);
+    }
+
+    /// Split into Lines then Left puts every caret at its own line's start;
+    /// a blank line's (empty) caret must not step back onto the line above.
+    #[test]
+    fn left_after_split_keeps_blank_line_carets() {
+        let d = Document::from_text("ab\n\ncd\n");
+        let mut v = view_for(&d);
+        v.sels.set_single(Selection::new(0, 6));
+        v.sels = apex_edit::ops::split_into_lines(&d, &v.sels);
+        v.move_cursors(&d, Motion::Left, false, 4);
+        let heads: Vec<usize> = v.sels.iter().map(|s| s.head).collect();
+        assert_eq!(heads, vec![0, 3, 4]);
+        // A lone caret still moves.
+        v.sels.set_single(Selection::point(3));
+        v.move_cursors(&d, Motion::Left, false, 4);
+        assert_eq!(v.sels.primary().head, 2);
     }
 
     /// Quick Add Next, skip, undo and add-all on repeated words.

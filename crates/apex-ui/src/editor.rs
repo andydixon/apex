@@ -293,17 +293,29 @@ pub struct VisibleRow {
 
 /// Compute the rows that fit in the viewport from the current anchor, laying
 /// out lines as needed. Also normalises the anchor onto a visible line.
+/// Keep the scroll anchor on a visible line inside the document. An edit
+/// (a delete, an undo, a change from another view of the same file) can
+/// shrink the document under a stale anchor, and every row walk starts from
+/// it, so each one calls this first.
+fn clamp_anchor(view: &mut View, doc: &Document) {
+    let n = doc.rope().len_lines();
+    if view.top_line >= n {
+        view.top_line = n.saturating_sub(1);
+        view.top_row = 0;
+    }
+    if view.is_line_hidden(doc, view.top_line) {
+        view.top_line = view.prev_visible_line(doc, view.top_line).unwrap_or(0);
+        view.top_row = 0;
+    }
+}
+
 pub fn visible_rows(ui: &Ui, geo: &Geometry, view: &mut View, doc: &Document, style: &EditorStyle, highlight: Option<&HighlightFn>) -> Vec<VisibleRow> {
     let mut out = Vec::with_capacity(geo.rows_fit() + 2);
     let n = geo.total_lines;
     if n == 0 {
         return out;
     }
-    view.top_line = view.top_line.min(n - 1);
-    if view.is_line_hidden(doc, view.top_line) {
-        view.top_line = view.prev_visible_line(doc, view.top_line).unwrap_or(0);
-        view.top_row = 0;
-    }
+    clamp_anchor(view, doc);
     let mut line = view.top_line;
     let mut row = view.top_row;
     let mut y = geo.text.min.y;
@@ -349,6 +361,7 @@ fn scroll_rows(ui: &Ui, geo: &Geometry, view: &mut View, doc: &Document, style: 
     if delta == 0 || geo.total_lines == 0 {
         return;
     }
+    clamp_anchor(view, doc);
     let mut remaining = delta;
     if remaining > 0 {
         // Do not scroll past the end: keep at least one row on screen (or allow
@@ -394,6 +407,7 @@ fn scroll_rows(ui: &Ui, geo: &Geometry, view: &mut View, doc: &Document, style: 
 /// Ensure the viewport is not showing more empty space below the last line
 /// than necessary.
 fn clamp_top_to_content(ui: &Ui, geo: &Geometry, view: &mut View, doc: &Document, style: &EditorStyle, highlight: Option<&HighlightFn>) {
+    clamp_anchor(view, doc);
     let fit = geo.rows_fit();
     // Count rows from the anchor to the end.
     let mut rows_below = 0usize;
@@ -445,6 +459,7 @@ fn locate(ui: &Ui, geo: &Geometry, view: &mut View, doc: &Document, style: &Edit
 
 /// Adjust the anchor so the primary caret is visible (or centred).
 pub fn scroll_to_cursor(ui: &Ui, rect: Rect, view: &mut View, doc: &Document, style: &EditorStyle, highlight: Option<&HighlightFn>) {
+    clamp_anchor(view, doc);
     if !(view.want_cursor_visible || view.want_centre) {
         return;
     }
@@ -1341,6 +1356,17 @@ pub fn paint(ui: &mut Ui, rect: Rect, view: &mut View, doc: &Document, style: &E
     }
     // Horizontal scrollbar (thin, only when content overflows).
     let content_w = max_width + TEXT_PAD * 2.0;
+    // Scroll no further than the end of the widest visible line (plus room
+    // for a caret after it), so text never hides behind the minimap and
+    // there is no sideways scrolling when nothing overflows. Applied next
+    // frame, hence the repaint.
+    // ponytail: visible rows only, so scrolling down to short lines pulls the
+    // view back left; track the document's widest line if that grates.
+    let max_scroll = (content_w + style.char_width - geo.text.width()).max(0.0);
+    if view.scroll.x > max_scroll {
+        view.scroll.x = max_scroll;
+        ui.ctx().request_repaint();
+    }
     if style.settings.scrollbars && geo.wrap_width.is_none() && (content_w > geo.text.width() || view.scroll.x > 0.0) {
         let track_w = geo.text.width();
         let total_w = content_w.max(view.scroll.x + geo.text.width());
