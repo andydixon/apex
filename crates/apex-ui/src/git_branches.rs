@@ -157,10 +157,12 @@ impl ApexApp {
                 let (name, remote) = (name.to_string(), remote == "true");
                 self.git_run("Switch branch", workdir, move |c| {
                     if remote {
-                        // origin/feature -> a local feature tracking it.
-                        c.git(&["switch", "--track", &name], None).map(|_| format!("Switched to a new branch tracking {name}"))
+                        // origin/feature -> a local feature tracking it. Ref names come
+                        // from the repository and may start with `-` (a fetched branch
+                        // called `--orphan=x` is a valid ref), so `--` ends the options.
+                        c.git(&["switch", "--track", "--", &name], None).map(|_| format!("Switched to a new branch tracking {name}"))
                     } else {
-                        c.git(&["switch", &name], None).map(|_| format!("Switched to {name}"))
+                        c.git(&["switch", "--", &name], None).map(|_| format!("Switched to {name}"))
                     }
                 });
             }
@@ -229,7 +231,7 @@ impl ApexApp {
                 }
                 self.git_run("Delete branch", workdir, move |c| {
                     // `-d` (not `-D`): never throw away unmerged work from the UI; tell the user how instead.
-                    c.git(&["branch", "-d", &name], None).map(|_| format!("Deleted {name}")).map_err(|e| {
+                    c.git(&["branch", "-d", "--", &name], None).map(|_| format!("Deleted {name}")).map_err(|e| {
                         if e.contains("not fully merged") {
                             format!("{name} has unmerged commits; delete it with `git branch -D {name}` if you are sure")
                         } else {
@@ -242,7 +244,7 @@ impl ApexApp {
                 let Some(name) = arg else { return true };
                 self.git_run("Merge", workdir, move |c| {
                     // A conflicted merge exits non-zero; turn git's wall of text into one instruction.
-                    c.git(&["merge", "--no-edit", &name], None).map(|_| format!("Merged {name}")).map_err(|e| {
+                    c.git(&["merge", "--no-edit", "--", &name], None).map(|_| format!("Merged {name}")).map_err(|e| {
                         if e.contains("CONFLICT") || e.contains("Automatic merge failed") {
                             "conflicts: resolve them, stage the files, then Continue".to_string()
                         } else {

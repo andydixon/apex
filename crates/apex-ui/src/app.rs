@@ -4194,6 +4194,31 @@ impl ApexApp {
     }
 }
 
+/// Write `text` to `<tmp>/apex-print-<pid>-<random>/<title>.txt` for the
+/// spooler and return the directory and file.
+///
+/// A fresh directory that must not exist yet: a guessable name reused with
+/// `create_dir_all` would let another local user pre-create it and plant a
+/// symlink, turning the write into an overwrite of one of our files.
+/// `create_dir` fails if the name is taken, the random suffix makes it
+/// unguessable, the directory is owner-only on Unix, and `create_new`
+/// refuses any existing name (a symlink included).
+fn private_temp_file(title: &str, text: &str) -> std::io::Result<(PathBuf, PathBuf)> {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("apex-print-{}-{:016x}", std::process::id(), fastrand::u64(..)));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&dir)?;
+    // The file name shows up as the job name, so keep it filesystem-safe.
+    let safe: String = title.chars().map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+    let path = dir.join(format!("{safe}.txt"));
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+    f.write_all(text.as_bytes())?;
+    f.flush()?;
+    Ok((dir, path))
+}
+
 /// Send plain text to the default printer. Returns the program used.
 ///
 /// Writes the text to a temporary file named after the document, hands
@@ -4201,15 +4226,7 @@ impl ApexApp {
 /// Windows, and removes the file afterwards. Blocks until the spooler
 /// accepts the job.
 fn print_text(title: &str, text: &str) -> std::io::Result<&'static str> {
-    use std::io::Write;
-    let dir = std::env::temp_dir().join(format!("apex-print-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    // The file name shows up as the job name, so keep it filesystem-safe.
-    let safe: String = title.chars().map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
-    let path = dir.join(format!("{safe}.txt"));
-    let mut f = std::fs::File::create(&path)?;
-    f.write_all(text.as_bytes())?;
-    f.flush()?;
+    let (dir, path) = private_temp_file(title, text)?;
     let try_run = |program: &'static str, args: &[&str]| -> Option<&'static str> {
         let mut cmd = std::process::Command::new(program);
         cmd.args(args).arg(&path).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -4602,6 +4619,22 @@ pub(crate) fn reveal_in_file_manager(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn print_temp_file_is_fresh_and_private() {
+        let (dir, path) = private_temp_file("a/b c", "hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        assert_eq!(path.file_name().unwrap(), "a_b_c.txt");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        let (dir2, _) = private_temp_file("a/b c", "x").unwrap();
+        assert_ne!(dir, dir2);
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(dir2).unwrap();
+    }
 
     /// Pins the accepted spellings of a goto-line target.
     #[test]

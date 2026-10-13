@@ -46,6 +46,10 @@ pub enum FileError {
     /// The path names a directory, not a file.
     #[error("{0} is a directory")]
     IsDirectory(PathBuf),
+    /// The path names a device, FIFO or socket. Reading one could block
+    /// forever (a FIFO) or never end (`/dev/zero`), so it is refused.
+    #[error("{0} is not a regular file")]
+    NotRegular(PathBuf),
     /// Reserved for callers that refuse binary content; `load` itself returns
     /// binary files as a `LoadedFile` with `binary` set rather than this.
     #[error("file contains binary data")]
@@ -89,11 +93,22 @@ pub fn load(path: &Path, forced_encoding: Option<Encoding>, fallback: Encoding) 
     if md.is_dir() {
         return Err(FileError::IsDirectory(path.to_path_buf()));
     }
+    // `metadata` follows symlinks, so a link to `/dev/zero` or a FIFO in a
+    // cloned repository is caught here: those report a size of 0 and would
+    // otherwise be read without end (memory) or block the caller (FIFO).
+    if !md.is_file() {
+        return Err(FileError::NotRegular(path.to_path_buf()));
+    }
     if md.len() > MAX_FILE_BYTES {
         return Err(FileError::TooLarge(md.len()));
     }
     let mut bytes = Vec::with_capacity(md.len() as usize);
-    File::open(path)?.read_to_end(&mut bytes)?;
+    // Bounded read: a file that grows after the size check (or was swapped
+    // for something larger) still cannot exceed the limit in memory.
+    File::open(path)?.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(FileError::TooLarge(bytes.len() as u64));
+    }
     let identity = FileIdentity::from_metadata(&md);
     // The readonly bit alone misses ACLs and ownership; `access(2)` asks the
     // kernel the real question.
@@ -405,6 +420,22 @@ mod tests {
     }
 
     /// A file with NUL bytes comes back as a read-only binary preview.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_devices_and_fifos_even_through_symlinks() {
+        // A repository can contain a symlink to /dev/zero; reading it would
+        // never finish. A FIFO would block the caller.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("README");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        assert!(matches!(load(&link, None, Encoding::Utf8), Err(FileError::NotRegular(_))));
+        let fifo = dir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path; mkfifo only reads it.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(matches!(load(&fifo, None, Encoding::Utf8), Err(FileError::NotRegular(_))));
+    }
+
     #[test]
     fn binary_files_are_not_decoded() {
         let dir = tempfile::tempdir().unwrap();
