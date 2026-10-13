@@ -1,4 +1,25 @@
 //! The application: documents, views, panes, menus, dialogs and command execution.
+//!
+//! `ApexApp` is the one top-level state object. `apex-app` builds it with
+//! `ApexApp::new` and hands it to eframe, which calls `eframe::App::ui` once
+//! per frame. Every other `*_ui.rs` module in this crate is an `impl ApexApp`
+//! block that adds methods; the fields they need all live in the struct here.
+//!
+//! Core model: a `Document` (text, undo, path) may be shown by several `View`s
+//! (selections, scroll, folds); each view is a tab in exactly one `Pane`;
+//! panes are leaves of the split `Layout` tree. `active_pane` plus the pane's
+//! active tab give the view most commands act on (`active_ids`).
+//!
+//! Data flow per frame (`ui`): global keys and background pollers run first,
+//! then the command `queue` is drained through `execute`, then the panels and
+//! panes are drawn (which may enqueue more commands, drained again), then the
+//! overlays and the single modal `dialog`. Commands are never run from inside
+//! a widget closure; widgets push onto `queue` so `execute` always has `&mut
+//! self` without a borrow in flight.
+//!
+//! Invariants: at most one modal `Dialog` at a time; a document with no
+//! remaining view is removed from `docs` (`close_view_now`); a diff tab's two
+//! views always open and close together.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -23,7 +44,9 @@ use apex_syntax::SyntaxState;
 /// Options passed from the command line.
 #[derive(Clone, Default)]
 pub struct StartupArgs {
+    /// Files to open, each with an optional 1-based line and column to jump to.
     pub files: Vec<(PathBuf, Option<usize>, Option<usize>)>,
+    /// Folders to add as workspace roots.
     pub folders: Vec<PathBuf>,
     /// Files and folders arriving after start-up (Finder "Open With", a second
     /// `apex` invocation). The sender must call `Context::request_repaint`.
@@ -34,7 +57,9 @@ pub struct StartupArgs {
     pub diff: Option<(PathBuf, PathBuf)>,
 }
 
+/// Manual `Debug`: the channel and callback fields have no `Debug` of their own.
 impl std::fmt::Debug for StartupArgs {
+    /// Print the plain fields and elide the channel and callback.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StartupArgs").field("files", &self.files).field("folders", &self.folders).field("diff", &self.diff).finish_non_exhaustive()
     }
@@ -46,107 +71,99 @@ pub type ViewClosedHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
 /// A request to open paths in the running editor.
 #[derive(Debug, Clone, Default)]
 pub struct OpenRequest {
+    /// Files to open, each with an optional 1-based line and column to jump to.
     pub files: Vec<(PathBuf, Option<usize>, Option<usize>)>,
+    /// Folders to add as workspace roots.
     pub folders: Vec<PathBuf>,
     /// Show a unified diff of two files.
     pub diff: Option<(PathBuf, PathBuf)>,
 }
 
+/// The modal dialog currently shown, if any (`ApexApp::dialog`). Only one is
+/// open at a time; `show_dialogs` draws the simple ones here and defers the
+/// workspace, git and GitHub ones to their own modules. Most variants carry
+/// the state the dialog needs so it survives across frames.
 #[derive(Debug, Clone)]
 pub(crate) enum Dialog {
     /// Ask about unsaved changes before running `then`.
-    ConfirmClose {
-        views: Vec<ViewId>,
-        then: AfterClose,
-        index: usize,
-    },
+    ConfirmClose { views: Vec<ViewId>, then: AfterClose, index: usize },
     /// File changed on disk while we have edits.
-    ExternalChange {
-        doc: DocId,
-    },
+    ExternalChange { doc: DocId },
     /// Save was refused because the file changed since it was loaded.
-    SaveConflict {
-        view: ViewId,
-    },
-    GotoLine {
-        text: String,
-    },
+    SaveConflict { view: ViewId },
+    /// The Go to Line box; `text` is the field contents, applied as it is typed.
+    GotoLine { text: String },
+    /// The About box.
     About,
+    /// Configuration problems found at start-up (`settings.toml`, themes, key map).
     Issues(Vec<SettingsIssue>),
+    /// Confirm deleting a file or folder from the explorer.
     ConfirmDelete(PathBuf),
+    /// Confirm a project-wide replace before it touches files.
     ConfirmReplaceInFiles,
-    Info {
-        title: String,
-        body: String,
-    },
-    ConfirmRevertHunk {
-        view: ViewId,
-        hunk_start: usize,
-        hunk_end: usize,
-        old_start: usize,
-        old_end: usize,
-    },
-    Trust {
-        root: PathBuf,
-        then: Option<(Command, Option<String>)>,
-    },
-    ConfirmWorkspaceEdit {
-        label: String,
-        edit: Box<apex_project::lsp::WorkspaceEdit>,
-    },
-    Prompt {
-        title: String,
-        text: String,
-        kind: crate::workspace_ui::PromptKind,
-    },
+    /// A plain message box with an OK button.
+    Info { title: String, body: String },
+    /// Confirm discarding one git hunk; the line ranges identify the hunk in
+    /// the buffer (`hunk_*`) and in the base text (`old_*`).
+    ConfirmRevertHunk { view: ViewId, hunk_start: usize, hunk_end: usize, old_start: usize, old_end: usize },
+    /// Ask whether to trust a folder before running its tasks or language
+    /// servers; `then` is re-run once trust is granted.
+    Trust { root: PathBuf, then: Option<(Command, Option<String>)> },
+    /// Preview and confirm a multi-file edit proposed by a language server.
+    ConfirmWorkspaceEdit { label: String, edit: Box<apex_project::lsp::WorkspaceEdit> },
+    /// A single-line text prompt (new file name, branch name, ...); `kind`
+    /// says what to do with the answer.
+    Prompt { title: String, text: String, kind: crate::workspace_ui::PromptKind },
+    /// Unsaved buffers found from a previous crash, offered for restoration.
     Recovery(Vec<apex_project::session::RecoveryEntry>),
     /// The Create Pull Request form.
-    CreatePr {
-        workdir: PathBuf,
-        branch: String,
-        base: String,
-        title: String,
-        body: String,
-        draft: bool,
-    },
+    CreatePr { workdir: PathBuf, branch: String, base: String, title: String, body: String, draft: bool },
     /// A credential prompt from git or ssh (askpass).
-    Askpass {
-        prompt: String,
-        text: String,
-        reply: crossbeam_channel::Sender<Option<String>>,
-    },
+    Askpass { prompt: String, text: String, reply: crossbeam_channel::Sender<Option<String>> },
     /// Confirm a destructive command, then run `then` again (it checks
     /// `git.ops.confirmed`).
-    Confirm {
-        title: String,
-        body: String,
-        button: String,
-        then: (Command, Option<String>),
-    },
+    Confirm { title: String, body: String, button: String, then: (Command, Option<String>) },
 }
 
+/// What `request_close` does once every requested view has been dealt with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AfterClose {
+    /// Just close them; open a fresh untitled buffer if nothing is left.
     CloseViews,
+    /// Set `quit_confirmed` so the next frame saves the session and exits.
     Quit,
 }
 
+/// State of the in-buffer find/replace bar. Matches are recomputed lazily by
+/// `update_matches` whenever `rev` no longer describes the current document,
+/// needle and options.
 #[derive(Debug, Default)]
 pub(crate) struct FindState {
+    /// The bar is visible (as a bottom panel).
     open: bool,
+    /// The second row with the replacement field is visible.
     replace_open: bool,
+    /// Search text; a regex when `options.regex` is set.
     needle: String,
+    /// Replacement text; `$1`..`$9` expand to capture groups in regex mode.
     replacement: String,
     options: SearchOptions,
+    /// Char ranges of every match in the active document, in order (capped at 100 000).
     matches: Vec<std::ops::Range<usize>>,
+    /// Index into `matches` of the one the caret was last moved to, for the "n of m" label.
     current: Option<usize>,
+    /// Regex compile error to show instead of the match count.
     error: Option<String>,
     /// Document revision the matches were computed for.
     rev: Option<(DocId, u64, String, SearchOptions)>,
+    /// Set by commands that open the bar so the needle field grabs focus next frame.
     focus_needle: bool,
+    /// Recent needles, most recent first, at most 20.
     history: VecDeque<String>,
 }
 
+/// What Reopen Closed Tab needs to restore a tab: the file plus where the
+/// user was in it. Only tabs with a path are remembered.
 #[derive(Debug, Clone)]
 pub(crate) struct ClosedTab {
     path: PathBuf,
@@ -154,76 +171,145 @@ pub(crate) struct ClosedTab {
     scroll: egui::Vec2,
 }
 
+/// The whole editor. See the module docs for how the pieces relate.
 pub struct ApexApp {
+    /// Live settings; edited in place by toggles and the settings panel.
     pub settings: Settings,
+    /// The active colour theme (a clone of one of `themes` or a user theme).
     pub theme: Theme,
+    /// Built-in themes, for the Colour Scheme menu and light/dark switching.
     pub(crate) themes: Vec<Theme>,
+    /// Defaults merged with the user's `keymap.toml`; also holds pending chord state.
     pub keymap: Keymap,
+    /// Every open document, keyed by id. A document stays only while at least one view shows it.
     pub(crate) docs: HashMap<DocId, Document>,
+    /// Every tab (including both halves of diff tabs), keyed by id.
     pub(crate) views: HashMap<ViewId, View>,
+    /// Tab strips, one per leaf of `layout`.
     pub(crate) panes: HashMap<PaneId, Pane>,
+    /// The split tree whose leaves are pane ids.
     pub(crate) layout: Layout,
+    /// The pane that has keyboard focus; its active tab is the target of most commands.
     pub(crate) active_pane: PaneId,
+    /// Counter for allocating `PaneId`s; never reused within a run.
     pub(crate) next_pane_id: u64,
+    /// Most recent first, at most `MAX_RECENT`, persisted to `recent.txt`.
     pub(crate) recent_files: VecDeque<PathBuf>,
+    /// Stack for Reopen Closed Tab (newest last, at most 20).
     pub(crate) closed_tabs: Vec<ClosedTab>,
+    /// Status bar message: text, when it was set, whether it is an error. Shown for 8 s.
     pub(crate) status: Option<(String, Instant, bool)>,
+    /// The one modal dialog, if any.
     pub(crate) dialog: Option<Dialog>,
+    /// Commands waiting to run, with an optional string argument. Drained twice per frame.
     pub(crate) queue: VecDeque<(Command, Option<String>)>,
+    /// Numbers new untitled buffers ("untitled 3").
     pub(crate) untitled_counter: u32,
+    /// Texts copied from the editor, most recent first, at most 32.
     pub(crate) clipboard_history: VecDeque<String>,
     /// Text last copied via a whole-line copy (no selection), for line-paste.
     pub(crate) line_clipboard: Option<String>,
+    /// Set when a paste command asks the platform for the clipboard; read back
+    /// when the text arrives as `Action::Paste` ("indent" selects Paste and Indent).
     pub(crate) pending_paste_mode: Option<String>,
+    /// Find/replace bar state.
     pub(crate) find: FindState,
+    /// Editor font zoom in points relative to `settings.font_size`, clamped to -8..=40.
     pub(crate) font_zoom: i32,
+    /// Set once every dirty buffer has been dealt with; the next frame closes the window.
     pub(crate) quit_confirmed: bool,
+    /// Problems found loading configuration at start-up, shown in the Issues dialog.
     pub(crate) settings_issues: Vec<SettingsIssue>,
+    /// `apply_fonts` runs once; this remembers that it has.
     pub(crate) fonts_applied: bool,
+    /// Where `settings.toml`, `keymap.toml` and `themes/` live.
     pub(crate) config_dir: PathBuf,
+    /// An editor context menu is open for this view at this screen position.
     pub(crate) context_menu_at: Option<(ViewId, egui::Pos2)>,
+    /// When `check_external_changes` last ran; it polls every 2 s and on window focus.
     pub(crate) last_focus_check: Instant,
+    /// Our record of the viewport's fullscreen state (toggled via viewport commands).
     pub fullscreen: bool,
+    /// Hide every panel and centre the editor at `settings.distraction_free_width`.
     pub(crate) distraction_free: bool,
+    /// Tree-sitter state per document, created lazily by `ensure_syntax`.
     pub(crate) syntax: HashMap<DocId, SyntaxState>,
+    /// Set during a frame when background work (parsing) means another frame is needed soon.
     pub(crate) pending_repaint: bool,
+    /// Workspace root folders, in sidebar order.
     pub(crate) roots: Vec<PathBuf>,
+    /// The `.apex-project` file the workspace was loaded from or saved to, if any.
     pub(crate) project_file: Option<PathBuf>,
+    /// File explorer widget state.
     pub(crate) sidebar: crate::sidebar::Sidebar,
+    /// Flat list of project files for Goto Anything and the symbol index.
     pub(crate) index: apex_project::index::FileIndex,
+    /// Handle of the running index scan, if one is in progress.
     pub(crate) index_scan: Option<apex_project::index::IndexScan>,
+    /// File system watcher over the roots; its events schedule `rescan_at`.
     pub(crate) watcher: Option<apex_project::watch::FsWatcher>,
+    /// Debounced time at which the index and explorer are refreshed after watcher events.
     pub(crate) rescan_at: Option<Instant>,
+    /// The command/goto palette.
     pub(crate) palette: crate::palette::Palette,
+    /// Tab opened as a preview by the palette while the user browses; closed or kept on dismiss.
     pub(crate) palette_preview: Option<ViewId>,
+    /// Find in Files state and results.
     pub(crate) fif: crate::find_in_files::FindInFiles,
+    /// The bottom panel (problems, output, git, tasks) is visible.
     pub(crate) panel_open: bool,
+    /// Recently run palette commands, shown first in the command palette.
     pub(crate) recent_commands: VecDeque<Command>,
+    /// Recently opened project files and folders.
     pub(crate) recent_projects: VecDeque<PathBuf>,
+    /// Navigation history for Navigate Back/Forward; `jump_pos` indexes into it.
     pub(crate) jumps: Vec<(DocId, SelectionSet)>,
     pub(crate) jump_pos: usize,
+    /// Per dirty document: recovery snapshot file name and the revision last written.
     pub(crate) recovery_ids: HashMap<DocId, (String, u64)>,
+    /// When recovery snapshots were last written (they are periodic).
     pub(crate) last_recovery: Instant,
+    /// When the session file was last written (also periodic).
     pub(crate) last_session_save: Instant,
+    /// Steps captured so far while a macro is being recorded; `None` when not recording.
     pub(crate) macro_recording: Option<Vec<crate::workspace_ui::MacroStep>>,
+    /// The most recently recorded macro, for Play Macro.
     pub(crate) last_macro: Vec<crate::workspace_ui::MacroStep>,
+    /// Named macros saved to disk.
     pub(crate) macros: std::collections::BTreeMap<String, Vec<crate::workspace_ui::MacroStep>>,
+    /// Accumulated project symbol index (see `symbol_index`).
     pub(crate) symbols: crate::symbol_index::ProjectSymbols,
+    /// Handle of the running symbol scan; dropping it cancels the thread.
     pub(crate) symbol_scan: Option<crate::symbol_index::SymbolScan>,
+    /// A tab drag in progress: which view, and the pane it started in.
     pub(crate) dragging_tab: Option<(ViewId, PaneId)>,
+    /// Fold regions per document, tagged with the revision they were computed for.
     pub(crate) fold_cache: HashMap<DocId, (u64, Vec<(usize, usize)>)>,
+    /// Char position under the mouse in a view, for LSP hover.
     pub(crate) hover_pos: Option<(ViewId, usize)>,
+    /// Git status cache, diff bases and blame.
     pub(crate) git: crate::git_ui::GitUi,
+    /// Build tasks and their output/problems.
     pub(crate) tasks: crate::tasks_ui::TasksUi,
+    /// Folders the user has agreed to run tasks and servers from.
     pub(crate) trust: crate::tasks_ui::TrustStore,
+    /// Which tab of the bottom panel is showing.
     pub(crate) panel_tab: crate::tasks_ui::PanelTab,
+    /// When git status was last polled.
     pub(crate) last_git_tick: Instant,
+    /// Language server clients and their per-document state.
     pub(crate) lsp: crate::lsp_ui::LspUi,
+    /// Last known pointer position, for anchoring hover popups.
     pub(crate) last_pointer: Option<egui::Pos2>,
+    /// Snippet definitions loaded from the configuration directory.
     pub(crate) snippets: Vec<apex_edit::snippet::SnippetDef>,
+    /// Tab-stop navigation state while a snippet is being filled in.
     pub(crate) snippet_session: Option<crate::snippets_ui::SnippetSession>,
+    /// Spell checker and its caches.
     pub(crate) spell: crate::spell_ui::SpellUi,
+    /// Vim emulation state (mode, pending operator, registers).
     pub(crate) vim: crate::vim::Vim,
+    /// The settings editor window state.
     pub(crate) settings_panel: crate::settings_ui::SettingsPanel,
     /// The native file dialog in progress, if any (see `file_dialogs.rs`).
     pub(crate) file_dialog: Option<crate::file_dialogs::PendingFileDialog>,
@@ -231,15 +317,23 @@ pub struct ApexApp {
     pub(crate) egui_ctx: Option<egui::Context>,
     /// Side-by-side diff tabs, keyed by the tab's (left) view.
     pub(crate) diffs: HashMap<ViewId, crate::diff_ui::DiffState>,
+    /// Open requests from the platform or a second process (see `StartupArgs::inbox`).
     pub(crate) inbox: Option<crossbeam_channel::Receiver<OpenRequest>>,
+    /// `apex --wait` callback, invoked from `close_view_now`.
     pub(crate) on_view_closed: Option<ViewClosedHook>,
     /// `APEX_FRAME_TIME=1`: show the frame interval in the status bar.
     pub(crate) show_frame_time: bool,
 }
 
+/// Length of the recent files list, in memory and on disk.
 const MAX_RECENT: usize = 30;
 
 impl ApexApp {
+    /// Build the application: load settings, theme and key map from the
+    /// configuration directory, apply the theme to egui, restore the previous
+    /// session if enabled, then open whatever the command line asked for.
+    /// Ends with either the configuration Issues dialog or the crash recovery
+    /// check, never both, because only one dialog can be open.
     pub fn new(cc: &eframe::CreationContext<'_>, args: StartupArgs) -> Self {
         let config_dir = apex_project::paths::config_dir();
         let (settings, issues) = Settings::load_file(&Settings::default(), &config_dir.join("settings.toml"));
@@ -252,6 +346,7 @@ impl ApexApp {
             for e in errors {
                 tracing::warn!("user keymap: {e}");
             }
+            // User bindings layer over the defaults; parse errors are logged, not fatal.
             keymap.merge(km);
         }
         theme.apply_to_egui(&cc.egui_ctx);
@@ -333,6 +428,8 @@ impl ApexApp {
             on_view_closed: args.on_view_closed.clone(),
             show_frame_time: std::env::var_os("APEX_FRAME_TIME").is_some(),
         };
+        // Side files first, then the session, then the command line, so files
+        // named on the command line end up as the active tabs.
         app.load_recent();
         app.load_macros();
         app.load_snippets();
@@ -345,6 +442,8 @@ impl ApexApp {
         if app.views.is_empty() {
             app.new_untitled();
         }
+        // One dialog at a time: configuration problems take precedence over
+        // offering crash recovery, which runs on the next start instead.
         if !app.settings_issues.is_empty() {
             app.dialog = Some(Dialog::Issues(app.settings_issues.clone()));
         } else {
@@ -378,6 +477,9 @@ impl ApexApp {
         }
     }
 
+    /// Resolve a theme name against the built-ins plus any user themes in
+    /// `<config>/themes/*.toml` (a user theme with the same name replaces the
+    /// built-in). Unknown names fall back to Apex Dark with a warning.
     pub(crate) fn pick_theme(themes: &[Theme], name: &str, config_dir: &Path) -> Theme {
         // User themes in <config>/themes/*.toml may add or override.
         let mut all: Vec<Theme> = themes.to_vec();
@@ -403,6 +505,8 @@ impl ApexApp {
 
     // ----- documents and views ------------------------------------------
 
+    /// The view that commands act on: the active tab of the active pane, or
+    /// the focused half if that tab is a side-by-side diff.
     pub(crate) fn active_view_id(&self) -> Option<ViewId> {
         let v = self.panes.get(&self.active_pane)?.active_view()?;
         // In a diff tab, the side that has focus.
@@ -412,6 +516,7 @@ impl ApexApp {
         }
     }
 
+    /// `active_view_id` together with its document id.
     pub(crate) fn active_ids(&self) -> Option<(ViewId, DocId)> {
         let v = self.active_view_id()?;
         Some((v, self.views.get(&v)?.doc))
@@ -455,6 +560,8 @@ impl ApexApp {
         }
     }
 
+    /// Create an empty untitled buffer in the active pane using the configured
+    /// indentation, line ending and encoding defaults. Returns its view id.
     pub(crate) fn new_untitled(&mut self) -> ViewId {
         self.untitled_counter += 1;
         let mut doc = Document::empty();
@@ -470,6 +577,8 @@ impl ApexApp {
         self.add_document(doc)
     }
 
+    /// Register a document, create a view for it and insert that view as a tab
+    /// after the active tab of the active pane. Does not change focus.
     pub(crate) fn add_document(&mut self, doc: Document) -> ViewId {
         let id = doc.id;
         let rev = doc.revision();
@@ -483,6 +592,13 @@ impl ApexApp {
     }
 
     /// Open (or focus) a file. Returns the view id.
+    /// Open (or focus) a file. Returns the view id.
+    ///
+    /// Directories become workspace roots instead and return `None`. A file
+    /// that is already open is focused rather than loaded twice. A missing
+    /// file opens as an empty buffer that will be created on save. Binary
+    /// files open as a read-only hex preview. Sets a status message for
+    /// decode errors or large files.
     pub fn open_path(&mut self, path: &Path) -> Option<ViewId> {
         let path = normalise_path(path);
         if path.is_dir() {
@@ -515,6 +631,8 @@ impl ApexApp {
             }
         };
         let encoding = loaded.encoding;
+        // Binary files get a generated hex dump; the "hex" override also stops
+        // `save_view` from writing the dump back over the original.
         let mut doc = if let Some(bytes) = loaded.binary {
             let mut d = Document::from_text(hex_preview(&bytes));
             d.read_only = true;
@@ -530,6 +648,8 @@ impl ApexApp {
         doc.had_decode_errors = loaded.had_decode_errors;
         doc.file_identity = Some(loaded.identity);
         doc.read_only |= loaded.read_only;
+        // Guess tabs/spaces from the content once; afterwards the document's own
+        // setting is authoritative.
         if self.settings.detect_indentation {
             doc.detect_indent_once(self.settings.indent());
         } else {
@@ -567,6 +687,8 @@ impl ApexApp {
         }
     }
 
+    /// Make `vid` the active tab of its pane and that pane the active one, and
+    /// ask the view to scroll its caret into sight on the next paint.
     pub(crate) fn focus_view(&mut self, vid: ViewId) {
         for (pid, pane) in &mut self.panes {
             if pane.tabs.contains(&vid) {
@@ -580,6 +702,8 @@ impl ApexApp {
         }
     }
 
+    /// Put a single caret at 1-based `line`:`col` (both clamped to the document)
+    /// and centre the view on it.
     pub(crate) fn goto_line_col(&mut self, vid: ViewId, line: usize, col: usize) {
         let Some(view) = self.views.get_mut(&vid) else { return };
         let Some(doc) = self.docs.get(&view.doc) else { return };
@@ -591,6 +715,10 @@ impl ApexApp {
         view.want_centre = true;
     }
 
+    /// Remove a view without asking about unsaved changes. When it was the
+    /// last view of its document the document, its syntax state and its
+    /// recovery snapshot go too, the `--wait` hook fires, and the tab is
+    /// remembered for Reopen Closed Tab.
     pub(crate) fn close_view_now(&mut self, vid: ViewId) {
         // Closing either side of a diff closes both.
         if let Some(tab) = self.diffs.iter().find(|(_, d)| d.right_view == vid).map(|(k, _)| *k) {
@@ -604,6 +732,8 @@ impl ApexApp {
         for pane in self.panes.values_mut() {
             pane.remove(vid);
         }
+        // Several views may share one document (split panes); only the last
+        // one closing releases it.
         let doc_still_viewed = self.views.values().any(|v| v.doc == view.doc);
         if !doc_still_viewed {
             self.syntax.remove(&view.doc);
@@ -617,6 +747,7 @@ impl ApexApp {
                 cb(&p);
             }
             self.closed_tabs.push(ClosedTab { path: p, sels: view.sels.clone(), scroll: view.scroll });
+            // Bounded stack; oldest entries fall off the front.
             if self.closed_tabs.len() > 20 {
                 self.closed_tabs.remove(0);
             }
@@ -628,8 +759,11 @@ impl ApexApp {
         // A diff closes as a whole: its tab plus the right-hand view.
         let mut views: Vec<ViewId> = views.into_iter().map(|v| self.diff_tab_of(v).unwrap_or(v)).collect();
         views.dedup();
+        // The right halves are not tabs, so they must be added explicitly.
         let rights: Vec<ViewId> = views.iter().filter_map(|v| self.diffs.get(v).map(|d| d.right_view)).collect();
         views.extend(rights);
+        // Only views whose document has no other view count as dirty here: a
+        // second view of the same document will keep the changes alive.
         let dirty: Vec<ViewId> = views
             .iter()
             .copied()
@@ -642,6 +776,7 @@ impl ApexApp {
         if dirty.is_empty() {
             self.finish_close(views, then);
         } else {
+            // Ask about the dirty ones first so a Cancel leaves the clean tabs open too.
             let mut ordered = dirty.clone();
             ordered.extend(views.into_iter().filter(|v| !dirty.contains(v)));
             if let Some(&first) = dirty.first() {
@@ -651,6 +786,8 @@ impl ApexApp {
         }
     }
 
+    /// Close the views unconditionally and carry out the `AfterClose` action.
+    /// Called once `request_close` has resolved every dirty document.
     pub(crate) fn finish_close(&mut self, views: Vec<ViewId>, then: AfterClose) {
         for v in views {
             self.close_view_now(v);
@@ -667,6 +804,8 @@ impl ApexApp {
 
     // ----- status / recent ------------------------------------------------
 
+    /// Show a message in the status bar for a few seconds and log it (warn
+    /// level for errors, info otherwise).
     pub fn set_status(&mut self, msg: String, is_error: bool) {
         if is_error {
             tracing::warn!("{msg}");
@@ -676,16 +815,20 @@ impl ApexApp {
         self.status = Some((msg, Instant::now(), is_error));
     }
 
+    /// Path of the persisted recent files list in the data directory.
     pub(crate) fn recent_path(&self) -> PathBuf {
         apex_project::paths::data_dir().join("recent.txt")
     }
 
+    /// Read `recent.txt` (one path per line) if it exists; otherwise leave the list empty.
     pub(crate) fn load_recent(&mut self) {
         if let Ok(s) = std::fs::read_to_string(self.recent_path()) {
             self.recent_files = s.lines().filter(|l| !l.is_empty()).map(PathBuf::from).take(MAX_RECENT).collect();
         }
     }
 
+    /// Move `path` to the front of the recent list, trim it to `MAX_RECENT`
+    /// and rewrite `recent.txt` atomically. Write failures are only logged.
     pub(crate) fn push_recent(&mut self, path: &Path) {
         self.recent_files.retain(|p| p != path);
         self.recent_files.push_front(path.to_path_buf());
@@ -700,6 +843,12 @@ impl ApexApp {
 
     // ----- saving ---------------------------------------------------------
 
+    /// Save the view's document to its path. Returns `true` only if the bytes
+    /// are on disk now: an untitled document opens the Save As dialog and
+    /// returns `false`, and a file that changed on disk since it was loaded
+    /// opens the Save Conflict dialog unless `force` is set. Applies the
+    /// trim-whitespace and final-newline settings as ordinary undoable edits
+    /// first, and reloads settings if the saved file is `settings.toml`.
     pub(crate) fn save_view(&mut self, vid: ViewId, force: bool) -> bool {
         let Some(view) = self.views.get(&vid) else { return false };
         let did = view.doc;
@@ -709,6 +858,7 @@ impl ApexApp {
             self.save_view_as_then(vid, None);
             return false;
         };
+        // The hex preview is a rendering of the file, not its contents.
         if doc.read_only && doc.language_override.as_deref() == Some("hex") {
             self.set_status("Binary previews are read-only".into(), true);
             return false;
@@ -720,6 +870,8 @@ impl ApexApp {
             self.run_edit(vid, ops::ensure_final_newline);
         }
         let doc = self.docs.get_mut(&did).expect("doc exists");
+        // `expected` lets `fileio` refuse to overwrite a file another program
+        // changed; `force` is set after the user chose Overwrite.
         let opts = SaveOptions { encoding: doc.encoding, line_ending: doc.line_ending, expected: doc.file_identity, force, in_place: false };
         match fileio::save(&path, &doc.text(), &opts) {
             Ok((identity, lossy)) => {
@@ -729,6 +881,7 @@ impl ApexApp {
                 let enc = doc.encoding;
                 self.forget_recovery(did);
                 self.git_mark_dirty();
+                // Saving settings.toml from inside the editor applies it on the next frame.
                 if path == self.settings_path() {
                     self.settings_panel.reload_pending = true;
                 }
@@ -757,6 +910,11 @@ impl ApexApp {
     }
 
     /// Save the view's document under a new path.
+    /// Save the view's document under a new path.
+    ///
+    /// Rebinds the document to `path` (clearing the hex/read-only state and
+    /// the untitled number), adds it to the recent list and saves with
+    /// `force` because there is no identity to compare against yet.
     pub(crate) fn save_view_to(&mut self, vid: ViewId, path: PathBuf) -> bool {
         let Some(view) = self.views.get(&vid) else { return false };
         let did = view.doc;
@@ -778,6 +936,15 @@ impl ApexApp {
     // ----- editing ----------------------------------------------------------
 
     /// Run an editing operation on a view and apply its result.
+    /// Run an editing operation on a view and apply its result.
+    ///
+    /// `f` sees the document and the view's selections and returns a
+    /// transaction plus the selections that should follow it, or `None` to
+    /// do nothing. Read-only documents refuse with a status message. An
+    /// empty transaction just moves the selections (no undo entry). A real
+    /// edit also invalidates the layout cache, scrolls the caret into view
+    /// and turns a preview tab into a permanent one. Returns whether
+    /// anything changed.
     pub(crate) fn run_edit(&mut self, vid: ViewId, f: impl FnOnce(&Document, &SelectionSet) -> Option<EditResult>) -> bool {
         let Some(view) = self.views.get_mut(&vid) else { return false };
         let Some(doc) = self.docs.get_mut(&view.doc) else { return false };
@@ -788,6 +955,7 @@ impl ApexApp {
         }
         let Some(result) = f(doc, &view.sels) else { return false };
         let before = view.sels.clone();
+        // Selection-only result: no edit, so no undo step and no dirty flag.
         if result.tx.is_empty() {
             view.set_selections(result.sels);
             return true;
@@ -805,6 +973,9 @@ impl ApexApp {
         }
     }
 
+    /// Run `f` with the view (synchronised to its document first) and the
+    /// document. For read-only operations such as cursor motion. `None` if
+    /// either no longer exists.
     pub(crate) fn with_view<R>(&mut self, vid: ViewId, f: impl FnOnce(&mut View, &Document) -> R) -> Option<R> {
         let view = self.views.get_mut(&vid)?;
         let doc = self.docs.get(&view.doc)?;
@@ -812,6 +983,9 @@ impl ApexApp {
         Some(f(view, doc))
     }
 
+    /// Type `text` at every caret, honouring auto-pair, auto-indent and
+    /// overwrite mode, record it for macros and tell the LSP layer so it can
+    /// trigger completion.
     pub(crate) fn insert_text(&mut self, vid: ViewId, text: &str) {
         self.record_step(crate::workspace_ui::MacroStep::Insert(text.to_string()));
         let opts = InsertOptions {
@@ -824,6 +998,10 @@ impl ApexApp {
         }
     }
 
+    /// Copy (or cut) the selections to the system clipboard and the clipboard
+    /// history. An empty selection copies its whole line including the
+    /// newline ("line mode"); `line_clipboard` remembers that so a later
+    /// paste can insert it as whole lines above the caret.
     pub(crate) fn copy_selection(&mut self, ctx: &egui::Context, vid: ViewId, cut: bool) {
         let Some(view) = self.views.get(&vid) else { return };
         let Some(doc) = self.docs.get(&view.doc) else { return };
@@ -845,12 +1023,15 @@ impl ApexApp {
                 parts.push(rope.slice(s.range()).into());
             }
         }
+        // Whole lines already end in newlines, so they concatenate; mixed or
+        // ranged selections are joined with newlines like most editors do.
         let text = if line_mode && parts.iter().all(|p| p.ends_with('\n')) { parts.concat() } else { parts.join("\n") };
         if text.is_empty() {
             return;
         }
         ctx.copy_text(text.clone());
         self.line_clipboard = if line_mode { Some(text.clone()) } else { None };
+        // Most recent first, no duplicates, bounded.
         self.clipboard_history.retain(|t| *t != text);
         self.clipboard_history.push_front(text);
         self.clipboard_history.truncate(32);
@@ -863,6 +1044,11 @@ impl ApexApp {
         }
     }
 
+    /// Insert clipboard text at every selection. Three behaviours: text that
+    /// came from a line-mode copy goes in as whole lines above the caret
+    /// line; `indent` re-indents a multi-line paste to the caret's
+    /// indentation (Paste and Indent); otherwise it is a plain replacement
+    /// of each selection via `ops::paste`.
     pub(crate) fn paste_text(&mut self, vid: ViewId, text: String, indent: bool) {
         let is_line = self.line_clipboard.as_deref() == Some(text.as_str());
         if is_line && self.views.get(&vid).is_some_and(|v| v.sels.iter().all(|s| s.is_empty())) {
@@ -888,8 +1074,11 @@ impl ApexApp {
                 let mut changes = Vec::new();
                 let mut new_sels = Vec::new();
                 let mut delta: isize = 0;
+                // Work in LF so splitting on '\n' is safe whatever the clipboard used.
                 let normalised = apex_buffer::line_ending::normalise(&text, LineEnding::Lf);
                 let lines: Vec<&str> = normalised.split('\n').collect();
+                // Strip the pasted block's common indentation, then re-indent each
+                // line relative to the caret line's leading whitespace (`base`).
                 let min_indent = lines.iter().filter(|l| !l.trim().is_empty()).map(|l| indent_settings.width_of(l)).min().unwrap_or(0);
                 for sel in s.iter() {
                     let line = rope.char_to_line(sel.start());
@@ -912,6 +1101,8 @@ impl ApexApp {
                     }
                     let n = out.chars().count();
                     new_sels.push(Selection::point((sel.start() as isize + delta) as usize + n));
+                    // Track how earlier replacements shift later positions so the new
+                    // carets land after each pasted block.
                     delta += n as isize - sel.len() as isize;
                     changes.push(apex_edit::Change::replace(sel.start(), sel.end(), out));
                 }
@@ -924,14 +1115,25 @@ impl ApexApp {
 
     // ----- commands -------------------------------------------------------
 
+    /// Queue a command without an argument; it runs in the next drain of `queue`.
     pub fn enqueue(&mut self, cmd: Command) {
         self.queue.push_back((cmd, None));
     }
 
+    /// Run one command now.
+    ///
+    /// Dispatch order matters: vim and settings get first refusal (they may
+    /// consume keys), then the command is recorded for macros, then each
+    /// feature module's `*_command` handler is tried in turn, and finally the
+    /// big `match` below handles the core file, edit, movement, find, view
+    /// and tab commands. Unknown commands show a "not available" status.
+    /// `arg` is the optional string argument (a path, an encoding id, a
+    /// line number, "force", ...) whose meaning depends on the command.
     pub(crate) fn execute(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) {
         if self.vim_command(ctx, cmd) || self.settings_command(ctx, cmd) {
             return;
         }
+        // Record before running so the macro replays in the same order.
         if cmd.is_recordable() {
             self.record_step(crate::workspace_ui::MacroStep::Command(cmd, arg.clone()));
         }
@@ -952,6 +1154,8 @@ impl ApexApp {
         }
         let active = self.active_ids();
         let tab_width = self.settings.tab_width;
+        // `view!()` yields the active view or returns early; `motion!` moves
+        // every caret with the given motion, extending the selection or not.
         macro_rules! view {
             () => {
                 match active {
@@ -972,6 +1176,8 @@ impl ApexApp {
                 let v = self.new_untitled();
                 self.focus_view(v);
             }
+            // With an argument (from the palette or a macro) open that path
+            // directly, relative to the active file's folder.
             Command::OpenFile if arg.is_some() => {
                 let raw = arg.clone().unwrap_or_default();
                 let p = std::path::PathBuf::from(&raw);
@@ -987,6 +1193,8 @@ impl ApexApp {
                     self.open_path(Path::new(&a));
                 }
             }
+            // Restore the last closed tab with its selections and scroll offset,
+            // clamped in case the file shrank meanwhile.
             Command::ReopenClosed => {
                 if let Some(t) = self.closed_tabs.pop()
                     && let Some(v) = self.open_path(&t.path)
@@ -1016,6 +1224,8 @@ impl ApexApp {
                 let v = view!();
                 self.save_view_as(v);
             }
+            // One save per document even if it has several views; untitled
+            // documents are skipped rather than prompting for each.
             Command::SaveAll => {
                 let ids: Vec<ViewId> = self.views.keys().copied().collect();
                 let mut seen = std::collections::HashSet::new();
@@ -1044,6 +1254,8 @@ impl ApexApp {
                     self.set_status(format!("Encoding set to {enc}; the file will be re-encoded on save"), false);
                 }
             }
+            // Change the document's line ending and rewrite the buffer's existing
+            // terminators to match, as one undoable edit.
             Command::SetLineEnding => {
                 if let (Some((v, d)), Some(le)) = (active, arg.as_deref().and_then(LineEnding::from_label)) {
                     if let Some(doc) = self.docs.get_mut(&d) {
@@ -1064,6 +1276,7 @@ impl ApexApp {
                     });
                 }
             }
+            // "force" (from the close-confirm flow) skips the dirty check.
             Command::CloseTab => {
                 let v = view!();
                 if arg.as_deref() == Some("force") {
@@ -1098,6 +1311,8 @@ impl ApexApp {
                     Err(e) => self.set_status(format!("Could not open a new window: {e}"), true),
                 }
             }
+            // Quit is a close of every view followed by `AfterClose::Quit`, so the
+            // dirty prompts are shared with Close All Tabs.
             Command::Quit | Command::CloseWindow => {
                 let all: Vec<ViewId> = self.views.keys().copied().collect();
                 if arg.as_deref() == Some("force") {
@@ -1132,6 +1347,8 @@ impl ApexApp {
             }
 
             // Edit
+            // Undo/redo come straight from the document; the view's selections are
+            // restored from the undo entry rather than through `run_edit`.
             Command::Undo | Command::Redo => {
                 let v = view!();
                 let view = self.views.get_mut(&v).expect("view");
@@ -1157,6 +1374,8 @@ impl ApexApp {
                 let v = view!();
                 self.copy_selection(ctx, v, false);
             }
+            // The clipboard is read by the platform layer; the text arrives next
+            // frame as `Action::Paste`, where `pending_paste_mode` is consumed.
             Command::Paste | Command::PasteAndIndent => {
                 // Ask the platform for clipboard contents; it arrives as Event::Paste.
                 self.pending_paste_mode = Some(if cmd == Command::PasteAndIndent { "indent".into() } else { arg.unwrap_or_default() });
@@ -1221,6 +1440,7 @@ impl ApexApp {
                 let v = view!();
                 self.run_edit(v, ops::reverse_lines);
             }
+            // Seeded from the clock so each shuffle differs but the op stays pure.
             Command::ShuffleLines => {
                 let v = view!();
                 let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
@@ -1230,6 +1450,8 @@ impl ApexApp {
                 let v = view!();
                 self.run_edit(v, ops::trim_trailing_whitespace);
             }
+            // Rewrite existing indentation and switch the document's setting so
+            // new lines follow suit.
             Command::ConvertIndentToSpaces | Command::ConvertIndentToTabs => {
                 let (v, d) = match active {
                     Some(a) => a,
@@ -1263,6 +1485,7 @@ impl ApexApp {
                 let now = local_datetime_string();
                 self.run_edit(v, |d, s| ops::insert_text(d, s, &now, InsertOptions { auto_pair: false, auto_indent: false, overwrite: false }));
             }
+            // Argument is "start" or "start,step"; defaults to 1,1.
             Command::InsertSequence => {
                 let v = view!();
                 let (start, step) = arg
@@ -1287,6 +1510,8 @@ impl ApexApp {
                 };
                 self.run_edit(v, |d, s| ops::change_case(d, s, op));
             }
+            // The indentation-aware edits. Tab first offers snippet expansion
+            // (`try_expand_trigger`) and only inserts a tab if nothing expanded.
             Command::Indent | Command::Outdent | Command::InsertTab | Command::InsertNewline | Command::DeleteBackward => {
                 let (v, d) = match active {
                     Some(a) => a,
@@ -1306,6 +1531,7 @@ impl ApexApp {
                     _ => ops::delete_backward(doc, s, ind, smart),
                 });
             }
+            // Like vim's o/O: open a new line without splitting the current one.
             Command::InsertNewlineBelow | Command::InsertNewlineAbove => {
                 let (v, d) = match active {
                     Some(a) => a,
@@ -1358,11 +1584,13 @@ impl ApexApp {
                     view.overwrite = !view.overwrite;
                 }
             }
+            // Wrap at the first ruler, else the wrap column, else 80.
             Command::HardWrap => {
                 let v = view!();
                 let width = self.settings.rulers.first().copied().unwrap_or(if self.settings.wrap_column > 0 { self.settings.wrap_column } else { 80 });
                 self.run_edit(v, |d, s| ops::hard_wrap(d, s, width));
             }
+            // Argument is one or two characters: open and close (close defaults to open).
             Command::SurroundWith => {
                 let v = view!();
                 let (open, close) = match arg.as_deref() {
@@ -1384,6 +1612,7 @@ impl ApexApp {
                     }
                 }
             }
+            // Wraps round at either end of the document.
             Command::NextBookmark | Command::PrevBookmark => {
                 if let Some((v, d)) = active {
                     let lines = self.docs[&d].bookmarked_lines();
@@ -1478,6 +1707,8 @@ impl ApexApp {
                 let v = view!();
                 self.with_view(v, |view, doc| view.select_to_brackets(doc));
             }
+            // Grow each selection to the smallest enclosing syntax node that is
+            // larger than it; without a parse tree fall back to bracket matching.
             Command::SelectScope => {
                 let (v, d) = match active {
                     Some(a) => a,
@@ -1507,6 +1738,8 @@ impl ApexApp {
                     self.with_view(v, |view, doc| view.select_to_brackets(doc));
                 }
             }
+            // "auto" clears the override. Dropping the syntax state forces a
+            // re-parse with the new grammar on the next frame.
             Command::SetLanguage => {
                 if let (Some((_, d)), Some(id)) = (active, arg) {
                     if let Some(doc) = self.docs.get_mut(&d) {
@@ -1554,6 +1787,7 @@ impl ApexApp {
                 let v = view!();
                 self.with_view(v, |view, doc| view.add_all_occurrences(doc));
             }
+            // Escape also closes the find bar when it is open but not focused.
             Command::SingleSelection => {
                 let v = view!();
                 if self.find.open && !self.find_has_focus(ctx) {
@@ -1577,6 +1811,7 @@ impl ApexApp {
                     view.want_cursor_visible = true;
                 });
             }
+            // Select the gaps between the current selections (and the ends of the document).
             Command::InvertSelection => {
                 let v = view!();
                 self.with_view(v, |view, doc| {
@@ -1600,6 +1835,7 @@ impl ApexApp {
             }
 
             // Find
+            // Seed the needle from a single-line selection, as Sublime does.
             Command::Find | Command::Replace => {
                 self.find.open = true;
                 self.find.replace_open = cmd == Command::Replace;
@@ -1619,6 +1855,8 @@ impl ApexApp {
             }
             Command::FindNext => self.find_step(true),
             Command::FindPrev => self.find_step(false),
+            // Search for the selection, or the word at the caret, without opening
+            // the bar for typing.
             Command::FindUnderCursor => {
                 let v = view!();
                 let needle = self.with_view(v, |view, doc| {
@@ -1632,6 +1870,7 @@ impl ApexApp {
                     self.find_step(true);
                 }
             }
+            // An argument (from the palette) is treated as a regex pattern.
             Command::UseSelectionForFind => {
                 let v = view!();
                 if let Some(pattern) = arg.clone() {
@@ -1684,6 +1923,7 @@ impl ApexApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
             }
             Command::ToggleDistractionFree => self.distraction_free = !self.distraction_free,
+            // Zen = distraction-free plus fullscreen, toggled together.
             Command::ToggleZenMode => {
                 self.distraction_free = !self.distraction_free;
                 self.fullscreen = self.distraction_free;
@@ -1700,6 +1940,7 @@ impl ApexApp {
                     self.invalidate_all_layouts();
                 }
             }
+            // Switch to the first theme of the opposite brightness.
             Command::ToggleLightDark => {
                 let want_dark = !self.theme.dark;
                 let name = self.themes.iter().find(|t| t.dark == want_dark).map(|t| t.name.clone());
@@ -1778,6 +2019,8 @@ impl ApexApp {
                     self.move_view_to_pane(v, target);
                 }
             }
+            // A second view of the same document in the next pane, splitting the
+            // window first if there is only one pane.
             Command::DuplicateView => {
                 let v = view!();
                 let dup = self.views[&v].duplicate();
@@ -1799,6 +2042,7 @@ impl ApexApp {
 
             // Goto
             Command::GotoLine => self.dialog = Some(Dialog::GotoLine { text: String::new() }),
+            // Wraps round within the active pane.
             Command::NextTab | Command::PrevTab => {
                 let pane = self.panes.entry(self.active_pane).or_default();
                 let n = pane.tabs.len();
@@ -1817,6 +2061,7 @@ impl ApexApp {
                     Command::Tab6 => 5,
                     Command::Tab7 => 6,
                     Command::Tab8 => 7,
+                    // Tab9 means "last tab", clamped below.
                     _ => usize::MAX,
                 };
                 let pane = self.panes.entry(self.active_pane).or_default();
@@ -1827,6 +2072,8 @@ impl ApexApp {
             }
             Command::MoveTabLeft => self.panes.entry(self.active_pane).or_default().move_active(-1),
             Command::MoveTabRight => self.panes.entry(self.active_pane).or_default().move_active(1),
+            // Pinning moves the tab to the end of the pinned group at the start of
+            // the strip; unpinning leaves it where it is.
             Command::PinTab => {
                 let v = view!();
                 let pane = self.panes.entry(self.active_pane).or_default();
@@ -1842,6 +2089,7 @@ impl ApexApp {
             }
 
             // Tools
+            // Create a commented template on first use so the user has something to edit.
             Command::OpenKeymapFile => {
                 let p = self.config_dir.join("keymap.toml");
                 if !p.exists() {
@@ -1855,6 +2103,7 @@ impl ApexApp {
                 self.open_path(&p);
             }
             Command::About => self.dialog = Some(Dialog::About),
+            // Counts the selections if there are any, else the whole document.
             Command::WordCount => {
                 if let Some((v, d)) = active {
                     let doc = &self.docs[&d];
@@ -1870,12 +2119,14 @@ impl ApexApp {
                     self.set_status(format!("{lines} lines, {words} words, {chars} characters"), false);
                 }
             }
+            // Commands handled by none of the modules above (not yet implemented).
             other => {
                 self.set_status(format!("{} is not available yet", other.name()), false);
             }
         }
     }
 
+    /// The document's indentation settings, or the global default if the document is gone.
     pub(crate) fn doc_indent(&self, d: DocId) -> apex_edit::IndentSettings {
         self.docs.get(&d).map(|doc| doc.indent).unwrap_or_else(|| self.settings.indent())
     }
@@ -1886,6 +2137,7 @@ impl ApexApp {
         if let Some(l) = doc.language_override.as_deref().and_then(apex_syntax::lookup) {
             return l;
         }
+        // The first line is enough for shebang and mode-line detection.
         let first: String = doc.rope().line(0).chars().take(200).collect();
         apex_syntax::detect(doc.path.as_deref(), &first)
     }
@@ -1897,16 +2149,20 @@ impl ApexApp {
         }
         let lang = self.language_of(d);
         if let Some(doc) = self.docs.get_mut(&d) {
+            // 12 ms initial parse budget keeps the frame smooth; larger files
+            // finish parsing in the background and `syntax_tick` picks them up.
             let st = SyntaxState::new(lang, doc, std::time::Duration::from_millis(12));
             self.syntax.insert(d, st);
         }
     }
 
+    /// The line comment prefix for the document's language, defaulting to `// `.
     pub(crate) fn comment_prefix(&self, d: DocId) -> String {
         let lang = self.language_of(d);
         lang.line_comment.map(str::to_string).unwrap_or_else(|| "// ".into())
     }
 
+    /// The block comment delimiters for the document's language, defaulting to `/*` and `*/`.
     pub(crate) fn block_comment(&self, d: DocId) -> (String, String) {
         let lang = self.language_of(d);
         let (o, c) = lang.block_comment.unwrap_or(("/*", "*/"));
@@ -1919,12 +2175,15 @@ impl ApexApp {
         self.ensure_syntax(d);
         let Some(st) = self.syntax.get_mut(&d) else { return };
         let Some(doc) = self.docs.get_mut(&d) else { return };
+        // 8 ms per frame for incremental re-parsing; `true` means the tree
+        // changed, so cached line layouts and fold regions are stale.
         if st.update(doc, std::time::Duration::from_millis(8)) {
             for v in self.views.values_mut().filter(|v| v.doc == d) {
                 v.cache.invalidate();
             }
             self.fold_cache.remove(&d);
         }
+        // Keep frames coming until the background parse lands.
         if st.is_parsing_in_background() {
             self.pending_repaint = true;
         }
@@ -1938,6 +2197,7 @@ impl ApexApp {
         {
             return regions.clone();
         }
+        // Fold computation is O(lines); skip it for very large files.
         if doc.len_lines() > 200_000 {
             return Vec::new();
         }
@@ -1958,6 +2218,8 @@ impl ApexApp {
         }
     }
 
+    /// Carry out one of the fold commands on the active view. `arg` is a
+    /// 0-based line (from a gutter click); otherwise the caret line is used.
     pub(crate) fn fold_command(&mut self, cmd: Command, arg: Option<usize>) {
         let Some((v, d)) = self.active_ids() else { return };
         self.ensure_syntax(d);
@@ -1991,6 +2253,7 @@ impl ApexApp {
                     }
                 }
             }
+            // Fold exactly one nesting level, replacing whatever was folded before.
             Command::FoldLevel1 | Command::FoldLevel2 | Command::FoldLevel3 => {
                 let level = match cmd {
                     Command::FoldLevel1 => 0,
@@ -2004,6 +2267,8 @@ impl ApexApp {
                     }
                 }
             }
+            // A region whose first line starts with a comment marker is taken to
+            // be a comment block.
             Command::FoldComments => {
                 let rope = doc.rope();
                 for (a, b) in &regions {
@@ -2022,10 +2287,14 @@ impl ApexApp {
         view.want_cursor_visible = true;
     }
 
+    /// Folder of the active document, used as the starting point for dialogs and relative paths.
     pub(crate) fn current_dir(&self) -> Option<PathBuf> {
         self.active_ids().and_then(|(_, d)| self.docs.get(&d)).and_then(|d| d.path.as_ref()).and_then(|p| p.parent().map(Path::to_path_buf))
     }
 
+    /// Re-read the document's file from disk (optionally forcing an encoding)
+    /// as a single undoable replacement, keeping the selections where they
+    /// were, and mark it clean. Binary files are refused.
     pub(crate) fn reload_view(&mut self, vid: ViewId, encoding: Option<Encoding>) {
         let Some(view) = self.views.get(&vid) else { return };
         let did = view.doc;
@@ -2054,6 +2323,7 @@ impl ApexApp {
         }
     }
 
+    /// Throw away every view's cached line layout, e.g. after a font or theme change.
     pub(crate) fn invalidate_all_layouts(&mut self) {
         for v in self.views.values_mut() {
             v.cache.invalidate();
@@ -2061,22 +2331,26 @@ impl ApexApp {
         }
     }
 
+    /// Set the editor font zoom (in points, clamped to -8..=40) and relayout.
     pub(crate) fn set_zoom(&mut self, steps: i32) {
         self.font_zoom = steps.clamp(-8, 40);
         self.invalidate_all_layouts();
     }
 
+    /// Set egui's zoom factor (clamped to 0.5..=3.0) and relayout.
     pub(crate) fn set_ui_scale(&mut self, ctx: &egui::Context, scale: f32) {
         self.settings.ui_scale = scale.clamp(0.5, 3.0);
         ctx.set_zoom_factor(self.settings.ui_scale);
         self.invalidate_all_layouts();
     }
 
+    /// Editor line height in points for the current font and zoom.
     pub(crate) fn line_height(&self, ctx: &egui::Context) -> f32 {
         let font = editor::font_for(&self.settings, self.font_zoom);
         editor::metrics(ctx, &font, self.settings.line_height).0
     }
 
+    /// Give egui keyboard focus to the active view's widget id.
     pub(crate) fn focus_active_editor(&self, ctx: &egui::Context) {
         if let Some(v) = self.active_view_id() {
             ctx.memory_mut(|m| m.request_focus(v.egui_id()));
@@ -2085,6 +2359,7 @@ impl ApexApp {
 
     // ----- panes ---------------------------------------------------------
 
+    /// Allocate an empty pane with a fresh id (not yet in the layout).
     pub(crate) fn new_pane(&mut self) -> PaneId {
         let id = PaneId(self.next_pane_id);
         self.next_pane_id += 1;
@@ -2092,6 +2367,8 @@ impl ApexApp {
         id
     }
 
+    /// Split the active pane along `axis`, show a second view of the active
+    /// document in the new pane and make the new pane active.
     pub(crate) fn split_active(&mut self, axis: Axis) {
         let new = self.new_pane();
         let active = self.active_pane;
@@ -2107,6 +2384,9 @@ impl ApexApp {
         }
     }
 
+    /// Replace the layout with `count` panes side by side along `axis` (or a
+    /// 2x2 grid), spreading the existing tabs across them round-robin when
+    /// there are at least as many tabs as panes.
     pub(crate) fn set_layout_count(&mut self, count: usize, axis: Axis, grid: bool) {
         // Collapse to a single pane first, moving every tab into it.
         let ids = self.layout.pane_ids();
@@ -2156,6 +2436,9 @@ impl ApexApp {
         }
     }
 
+    /// Close a pane and its tabs. If any tab is the only view of a dirty
+    /// document the usual close prompts run instead and the pane stays until
+    /// they resolve. The last pane cannot be closed.
     pub(crate) fn close_pane(&mut self, pane: PaneId) {
         if self.layout.pane_ids().len() <= 1 {
             return;
@@ -2180,6 +2463,7 @@ impl ApexApp {
         }
     }
 
+    /// Move a tab to another pane (after its active tab) and focus that pane.
     pub(crate) fn move_view_to_pane(&mut self, v: ViewId, target: PaneId) {
         for p in self.panes.values_mut() {
             p.remove(v);
@@ -2190,10 +2474,14 @@ impl ApexApp {
 
     // ----- find -----------------------------------------------------------
 
+    /// Is keyboard focus in the find bar's needle or replacement field?
     pub(crate) fn find_has_focus(&self, ctx: &egui::Context) -> bool {
         ctx.memory(|m| m.focused()).is_some_and(|id| id == egui::Id::new("apex-find-needle") || id == egui::Id::new("apex-find-replace"))
     }
 
+    /// Recompute `find.matches` for the active document if the document
+    /// revision, needle or options changed since last time; otherwise a
+    /// no-op. Regex errors land in `find.error`.
     pub(crate) fn update_matches(&mut self) {
         let Some((_, d)) = self.active_ids() else { return };
         let Some(doc) = self.docs.get(&d) else { return };
@@ -2214,6 +2502,9 @@ impl ApexApp {
         }
     }
 
+    /// Select the next (or previous) match relative to the primary selection,
+    /// wrapping if `settings.find_wrap` allows, and record the needle in the
+    /// history.
     pub(crate) fn find_step(&mut self, forward: bool) {
         self.update_matches();
         let Some((v, _)) = self.active_ids() else { return };
@@ -2242,6 +2533,9 @@ impl ApexApp {
         }
     }
 
+    /// Replace the match currently selected and move to the next one. If the
+    /// selection is not on a match this only finds the next one, so pressing
+    /// Replace repeatedly alternates find and replace like Sublime.
     pub(crate) fn replace_next(&mut self) {
         self.update_matches();
         let Some((v, _)) = self.active_ids() else { return };
@@ -2265,6 +2559,7 @@ impl ApexApp {
         self.find_step(true);
     }
 
+    /// Replace every match in one undoable transaction and report the count.
     pub(crate) fn replace_all(&mut self) {
         self.update_matches();
         let Some((v, _)) = self.active_ids() else { return };
@@ -2297,6 +2592,10 @@ impl ApexApp {
 
     // ----- external changes -------------------------------------------------
 
+    /// Compare each file-backed document against the file on disk. Clean
+    /// documents reload silently; dirty ones raise the External Change
+    /// dialog; deleted files keep their buffer and lose their identity so the
+    /// next save recreates them.
     pub(crate) fn check_external_changes(&mut self) {
         let ids: Vec<DocId> = self.docs.keys().copied().collect();
         for d in ids {
@@ -2305,6 +2604,7 @@ impl ApexApp {
             match fileio::identity(&path) {
                 Some(now) if !fileio::same_identity(&known, &now) => {
                     if doc.is_dirty() {
+                        // Do not stack dialogs; one external-change prompt at a time.
                         if !matches!(self.dialog, Some(Dialog::ExternalChange { .. })) {
                             self.dialog = Some(Dialog::ExternalChange { doc: d });
                         }
@@ -2317,6 +2617,8 @@ impl ApexApp {
                     // Deleted externally: keep the buffer; Save will recreate it.
                     doc.file_identity = None;
                     if !doc.is_dirty() {
+                        // Replacing the text with itself bumps the revision so the buffer
+                        // counts as dirty and the user is nudged to save it.
                         let sels = SelectionSet::default();
                         let text = doc.text();
                         doc.replace_all(&text, &sels);
@@ -2330,6 +2632,10 @@ impl ApexApp {
 
     // ----- UI ---------------------------------------------------------------
 
+    /// Draw the top menu bar. Items do not run commands directly: clicks are
+    /// pushed onto a local copy of the queue (taken out of `self` so the
+    /// closures can borrow the key map for shortcut labels) and put back
+    /// afterwards for the frame's second drain.
     pub(crate) fn show_menu_bar(&mut self, ui: &mut Ui) {
         let km = &self.keymap;
         let item = |ui: &mut Ui, queue: &mut VecDeque<(Command, Option<String>)>, cmd: Command| {
@@ -2339,6 +2645,7 @@ impl ApexApp {
                 ui.close();
             }
         };
+        // Take the queue so closures below can push without borrowing `self`.
         let mut q = std::mem::take(&mut self.queue);
         let recent = self.recent_files.clone();
         let themes: Vec<(String, bool)> = self.themes.iter().map(|t| (t.name.clone(), t.name == self.theme.name)).collect();
@@ -2715,6 +3022,11 @@ impl ApexApp {
         self.queue = q;
     }
 
+    /// Draw one pane's tab strip: titles with dirty dots and close buttons,
+    /// horizontal scrolling that keeps the active tab visible, drag to
+    /// reorder or move between panes, and a context menu. Click results are
+    /// collected during the loop and applied at the end so the pane and view
+    /// maps are not mutated while being read.
     pub(crate) fn show_tabs(&mut self, ui: &mut Ui, pane_id: PaneId) {
         let theme = self.theme.clone();
         let Some(pane) = self.panes.get(&pane_id) else { return };
@@ -2725,11 +3037,14 @@ impl ApexApp {
         let mut to_activate = None;
         let mut to_close = None;
         let mut ctx_cmd = None;
+        // Must match the 30 pt reserved in `show_pane`.
         let bar_h = 30.0;
         let (bar_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), bar_h), egui::Sense::hover());
         let painter = ui.painter_at(bar_rect);
         painter.rect_filled(bar_rect, 0.0, theme.ui.surface);
         let font = egui::FontId::proportional(self.settings.ui_font_size);
+        // Scroll offset lives in egui's temp data so it survives between frames
+        // without a field per pane.
         let scroll_id = ui.id().with(("tabscroll", pane_id.0));
         let mut tab_scroll: f32 = ui.ctx().data(|d| d.get_temp(scroll_id)).unwrap_or(0.0);
         let widths: Vec<f32> = tabs
@@ -2737,10 +3052,12 @@ impl ApexApp {
             .map(|v| {
                 let title = self.views.get(v).and_then(|v| self.docs.get(&v.doc)).map(|d| d.title()).unwrap_or_default();
                 let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(title, font.clone(), Color32::WHITE));
+                // Title plus 12 pt left padding, close button and right padding.
                 g.rect.width() + 44.0
             })
             .collect();
         let total: f32 = widths.iter().sum();
+        // Either scroll axis scrolls the strip: trackpads give x, wheels give y.
         if ui.rect_contains_pointer(bar_rect) {
             let d = ui.input(|i| i.smooth_scroll_delta);
             if d != egui::Vec2::ZERO {
@@ -2766,6 +3083,7 @@ impl ApexApp {
             let w = widths[i];
             let rect = Rect::from_min_size(pos2(x, bar_rect.min.y), vec2(w, bar_h));
             x += w;
+            // Fully scrolled out of view: skip interaction and painting.
             if rect.max.x < bar_rect.min.x || rect.min.x > bar_rect.max.x {
                 continue;
             }
@@ -2783,6 +3101,7 @@ impl ApexApp {
                 theme.ui.tab_inactive
             };
             painter.rect_filled(rect, 0.0, bg);
+            // Accent line marks the active tab of the focused pane only.
             if is_active && is_active_pane {
                 painter.rect_filled(Rect::from_min_size(rect.min, vec2(w, 2.0)), 0.0, theme.ui.accent);
             }
@@ -2802,6 +3121,7 @@ impl ApexApp {
             painter.text(pos2(rect.min.x + 12.0, rect.center().y), egui::Align2::LEFT_CENTER, &title, font.clone(), colour);
             let close_rect = Rect::from_center_size(pos2(rect.max.x - 16.0, rect.center().y), vec2(16.0, 16.0));
             let close_resp = ui.interact(close_rect, id.with("close"), egui::Sense::click());
+            // Dirty dot replaces the close cross until the cross is hovered.
             if doc.is_dirty() && !close_resp.hovered() {
                 painter.circle_filled(close_rect.center(), 4.0, if is_active { theme.ui.text } else { theme.ui.text_muted });
             } else if close_resp.hovered() || resp.hovered() || is_active {
@@ -2817,6 +3137,7 @@ impl ApexApp {
                 to_close = Some(*vid);
             } else if resp.clicked() {
                 to_activate = Some(*vid);
+            // Middle click closes, as in browsers.
             } else if resp.middle_clicked() {
                 to_close = Some(*vid);
             }
@@ -2840,7 +3161,9 @@ impl ApexApp {
                 }
             });
         }
-        // Drop a dragged tab onto this bar: reorder within the pane or move between panes.
+        // Drop a dragged tab onto this bar: reorder within the pane or move
+        // between panes. Every pane's strip runs this, so the one under the
+        // pointer claims the drop; `ui` clears a drop that nobody claimed.
         if let Some((dragged, from)) = self.dragging_tab {
             let pointer = ui.input(|i| i.pointer.interact_pos());
             let released = ui.input(|i| i.pointer.primary_released());
@@ -2865,6 +3188,7 @@ impl ApexApp {
                             if let Some(pane) = self.panes.get_mut(&pane_id)
                                 && let Some(cur) = pane.tabs.iter().position(|t| *t == dragged)
                             {
+                                // Removing the tab first shifts later indices down by one.
                                 let target = if insert_at > cur { insert_at - 1 } else { insert_at };
                                 let t = pane.tabs.remove(cur);
                                 let target = target.min(pane.tabs.len());
@@ -2887,6 +3211,7 @@ impl ApexApp {
                 } else if released {
                     // Released somewhere else: a later pane may claim it this frame; otherwise it is cleared at frame end.
                 }
+                // Ghost title follows the pointer on the tooltip layer so it draws above everything.
                 if self.dragging_tab.is_some() {
                     let title = self.views.get(&dragged).and_then(|v| self.docs.get(&v.doc)).map(|d| d.title()).unwrap_or_default();
                     ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tab-drag"))).text(
@@ -2915,6 +3240,10 @@ impl ApexApp {
         }
     }
 
+    /// Draw the bottom status bar: the transient status message and caret
+    /// position on the left; indentation, encoding, line ending, language,
+    /// git, LSP and problem counts on the right. Right-hand items have
+    /// context menus (`status_item_menu`) chosen by sniffing the label text.
     pub(crate) fn show_status_bar(&mut self, ui: &mut Ui) {
         let theme = self.theme.clone();
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), egui::Sense::hover());
@@ -2993,6 +3322,8 @@ impl ApexApp {
         let painter = ui.painter_at(rect);
         let mut x = rect.min.x + 12.0;
         let status_colour = theme.ui.text_muted;
+        // Messages fade after 8 s; repaint once a second so the fade happens
+        // without user input.
         if let Some((msg, at, is_error)) = &self.status
             && at.elapsed().as_secs() < 8
         {
@@ -3014,6 +3345,9 @@ impl ApexApp {
                 painter.rect_filled(r, 0.0, theme.ui.hover);
             }
             painter.galley(pos2(rx - w, rect.center().y - g.rect.height() / 2.0), g, status_colour);
+            // Decide which menu fits this item from its text. Kinds 4 and 5 look
+            // for glyphs that no current label produces (the git label starts
+            // with "git:"), so those items fall through to the language menu.
             let kind = if item.starts_with("Spaces") || item.starts_with("Tabs") {
                 0
             } else if apex_buffer::Encoding::from_label(item).is_some() || item.starts_with("UTF") {
@@ -3036,6 +3370,10 @@ impl ApexApp {
         }
     }
 
+    /// Context menu for a status bar item. `index` is the kind computed in
+    /// `show_status_bar`: 0 indentation, 1 encoding, 2 line ending, 4 git,
+    /// 5 problems, anything else the language picker. Chosen commands are
+    /// pushed onto `q` for the caller to enqueue.
     pub(crate) fn status_item_menu(ui: &mut Ui, index: usize, q: &mut Vec<(Command, Option<String>)>) {
         match index {
             0 => {
@@ -3104,10 +3442,15 @@ impl ApexApp {
         }
     }
 
+    /// Draw the find/replace bar. Typing searches incrementally and selects
+    /// the first match after the caret without taking focus from the field;
+    /// the buttons enqueue the corresponding find commands.
     pub(crate) fn show_find_bar(&mut self, ui: &mut Ui) {
         let theme = self.theme.clone();
         egui::Frame::new().fill(theme.ui.panel).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
             ui.horizontal(|ui| {
+                // Fixed ids so `find_has_focus` and the key handling in `ui` can
+                // recognise these fields.
                 let needle_id = egui::Id::new("apex-find-needle");
                 let resp = ui.add(egui::TextEdit::singleline(&mut self.find.needle).id(needle_id).hint_text("Find").desired_width(260.0).lock_focus(true));
                 if self.find.focus_needle {
@@ -3130,6 +3473,7 @@ impl ApexApp {
                         }
                     }
                 }
+                // Option toggles; `update_matches` notices the change via its key.
                 let toggle = |ui: &mut Ui, on: &mut bool, label: &str, tip: &str| {
                     if ui.selectable_label(*on, label).on_hover_text(tip).clicked() {
                         *on = !*on;
@@ -3197,6 +3541,10 @@ impl ApexApp {
         });
     }
 
+    /// Draw the current modal dialog, if any. The workspace, git and GitHub
+    /// dialogs are delegated to their modules; the close-confirm, external
+    /// change, save conflict, goto line, about and issues dialogs are here.
+    /// The dialog is cloned out of `self` so handlers can mutate the app.
     pub(crate) fn show_dialogs(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.dialog.clone() else { return };
         let mut close = false;
@@ -3221,6 +3569,9 @@ impl ApexApp {
             return;
         }
         match dialog {
+            // Walks `views` one dirty document at a time; `index` is the cursor.
+            // Each answer re-stores the dialog with `index + 1`, so the sequence
+            // continues next frame, until `finish_close` runs past the end.
             Dialog::ConfirmClose { views, then, index } => {
                 let Some(&vid) = views.get(index) else {
                     self.dialog = None;
@@ -3231,6 +3582,8 @@ impl ApexApp {
                 let unique_dirty = self.views.get(&vid).is_some_and(|view| {
                     self.views.values().filter(|x| x.doc == view.doc).count() == 1 && self.docs.get(&view.doc).is_some_and(|d| d.is_dirty())
                 });
+                // Already clean (saved from another view, or shares its document):
+                // skip without asking.
                 if !unique_dirty {
                     self.dialog = Some(Dialog::ConfirmClose { views, then, index: index + 1 });
                     return;
@@ -3253,6 +3606,7 @@ impl ApexApp {
                     })
                     .inner
                 });
+                // Enter saves, Escape cancels, matching the button order.
                 let choice = r.inner.or_else(|| {
                     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                         Some(2)
@@ -3273,6 +3627,8 @@ impl ApexApp {
                         }
                         if self.save_view(vid, false) {
                             self.dialog = Some(Dialog::ConfirmClose { views, then, index: index + 1 });
+                        // A failed save that did not open the conflict dialog aborts the
+                        // close; the conflict dialog takes over otherwise.
                         } else if !matches!(self.dialog, Some(Dialog::SaveConflict { .. })) {
                             self.dialog = None;
                         }
@@ -3286,6 +3642,7 @@ impl ApexApp {
                 }
                 return;
             }
+            // Dirty buffer whose file changed on disk.
             Dialog::ExternalChange { doc } => {
                 let title = self.docs.get(&doc).map(|d| d.title()).unwrap_or_default();
                 let r = egui::Modal::new(egui::Id::new("external-change")).show(ctx, |ui| {
@@ -3318,6 +3675,7 @@ impl ApexApp {
                         if let Some(d) = self.docs.get_mut(&doc)
                             && let Some(p) = &d.path
                         {
+                            // Adopt the new on-disk identity so the next save does not conflict.
                             d.file_identity = fileio::identity(p);
                         }
                         close = true;
@@ -3335,6 +3693,7 @@ impl ApexApp {
                     close = true;
                 }
             }
+            // The save was refused because the file changed since it was loaded.
             Dialog::SaveConflict { view } => {
                 let r = egui::Modal::new(egui::Id::new("save-conflict")).show(ctx, |ui| {
                     ui.set_width(420.0);
@@ -3372,6 +3731,7 @@ impl ApexApp {
                     close = true;
                 }
             }
+            // Jumps live as the user types; Enter or Escape closes.
             Dialog::GotoLine { mut text } => {
                 let mut go = false;
                 let mut changed = false;
@@ -3445,6 +3805,10 @@ impl ApexApp {
         }
     }
 
+    /// Draw the right-click menu for the editor at `context_menu_at`: spelling
+    /// suggestions for the word under the caret, then a fixed set of edit and
+    /// git commands (git ones only inside a repository, conflict ones only on
+    /// a conflict). Closes on a choice, a click outside or Escape.
     pub(crate) fn show_editor_context_menu(&mut self, ctx: &egui::Context) {
         let Some((vid, pos)) = self.context_menu_at else { return };
         let id = egui::Id::new(("editor-context", vid.0));
@@ -3505,6 +3869,8 @@ impl ApexApp {
                     }
                 }
             });
+        // The popup's own close-on-click handles choices; this catches clicks
+        // anywhere else so our state does not outlive egui's.
         let clicked_outside = ctx.input(|i| i.pointer.any_pressed()) && !popup.as_ref().is_some_and(|p| p.response.contains_pointer());
         if let Some((a, b, word, action)) = spell_action {
             match action {
@@ -3526,12 +3892,16 @@ impl ApexApp {
         }
     }
 
+    /// Draw one leaf pane into `rect`: the tab strip (unless hidden), then
+    /// either an empty placeholder, a diff tab or a single editor view.
+    /// Distraction-free mode narrows the editor to a centred column.
     pub(crate) fn show_pane(&mut self, ui: &mut Ui, pane_id: PaneId, rect: Rect) {
         let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
         ui.set_clip_rect(rect);
         let mut inner = rect;
         if self.settings.tabs && !self.distraction_free {
             self.show_tabs(&mut ui, pane_id);
+            // Tab strip height; see `bar_h` in `show_tabs`.
             inner.min.y += 30.0;
         }
         let Some(vid) = self.panes.get(&pane_id).and_then(|p| p.active_view()) else {
@@ -3556,6 +3926,8 @@ impl ApexApp {
             let width = (self.settings.distraction_free_width * char_width).min(inner.width());
             let cx = inner.center().x;
             ui.painter().rect_filled(rect, 0.0, self.theme.editor.background);
+            // Extra 60 pt on the left makes room for the gutter so the text
+            // column itself is centred.
             inner = Rect::from_min_max(pos2(cx - width / 2.0 - 60.0, inner.min.y), pos2(cx + width / 2.0, inner.max.y));
         }
         if self.diffs.contains_key(&vid) {
@@ -3582,6 +3954,7 @@ impl ApexApp {
         let font = editor::font_for(&self.settings, self.font_zoom);
         let (line_height, char_width) = editor::metrics(ui.ctx(), &font, self.settings.line_height);
         let Some(did) = self.views.get(&vid).map(|v| v.doc) else { return };
+        // Only highlight matches that were computed for this document.
         let matches: Vec<std::ops::Range<usize>> =
             if self.find.open && self.find.rev.as_ref().is_some_and(|r| r.0 == did) { self.find.matches.clone() } else { Vec::new() };
         let current_match = self.find.current;
@@ -3595,6 +3968,8 @@ impl ApexApp {
         let conflict_tints = if tints.is_none() { self.git_conflicts(did).map(|(t, _)| t) } else { None };
         let inline_note = if self.settings.git_blame_inline && focused && diff_side.is_none() { self.git_blame_caret_note() } else { None };
         let mut diagnostics = self.diagnostics_for(did);
+        // Spelling errors are rendered as diagnostics, computed only for the
+        // visible lines (plus a little slack) to keep it cheap.
         if self.spell_enabled_for(did) {
             let (first, count) = {
                 let v = &self.views[&vid];
@@ -3605,6 +3980,7 @@ impl ApexApp {
         let (wrap, large) = {
             let view = &self.views[&vid];
             let doc = &self.docs[&did];
+            // Wrapping is never applied to large files: layout would be too slow.
             (view.word_wrap.unwrap_or(self.settings.word_wrap) && !doc.large_file, doc.large_file)
         };
         let style = EditorStyle {
@@ -3631,14 +4007,18 @@ impl ApexApp {
         let mut actions = Vec::new();
         {
             let Some(doc) = self.docs.get(&did) else { return };
+            // The highlighter needs `&mut SyntaxState` while the editor holds `&Document`;
+            // a `RefCell` lets the closure borrow it lazily per line.
             let syntax_cell = std::cell::RefCell::new(self.syntax.get_mut(&did));
             let highlight = make_highlight(&syntax_cell, doc, &theme, muted);
             let view = self.views.get_mut(&vid).expect("view");
             view.sync(doc);
+            // Input first (may edit), then paint with fresh state below.
             editor::input(ui, inner, view, doc, &style, &mut self.keymap, Some(&highlight), &mut actions);
         }
         for a in actions {
             match a {
+                // Clicking into a view focuses its pane, and its half of a diff.
                 Action::Focus => {
                     self.active_pane = pane_id;
                     if let Some((tab, right)) = diff_side
@@ -3653,6 +4033,7 @@ impl ApexApp {
                     self.paste_text(vid, t, mode == "indent");
                 }
                 Action::Command(c, arg) => self.execute(ui.ctx(), c, arg),
+                // Files dropped onto the editor open; folders become roots.
                 Action::Dropped(paths) => {
                     for p in paths {
                         if p.is_dir() {
@@ -3680,6 +4061,8 @@ impl ApexApp {
         }
         self.syntax_tick(did);
         let fold_regions = self.fold_regions_for(did);
+        // Fold regions may have changed with the edits; everything else in
+        // `style` is still valid for this frame.
         let style = EditorStyle { fold_regions: &fold_regions, ..style };
         let doc = self.docs.get(&did).expect("doc");
         let syntax_cell = std::cell::RefCell::new(self.syntax.get_mut(&did));
@@ -3704,6 +4087,11 @@ impl ApexApp {
         self.lsp_diagnostics_for(d)
     }
 
+    /// Recursively lay out the split tree into `rect`, drawing each leaf with
+    /// `show_pane` and a draggable 4 pt divider between siblings. `path` is
+    /// the index route from the root, used to write resized fractions back
+    /// into `self.layout` (the tree is passed by value because `self` is
+    /// borrowed mutably while drawing).
     pub(crate) fn show_layout(&mut self, ui: &mut Ui, layout: Layout, rect: Rect, path: Vec<usize>) {
         match layout {
             Layout::Leaf(p) => self.show_pane(ui, p, rect),
@@ -3745,6 +4133,7 @@ impl ApexApp {
                                 Axis::Horizontal => resp.drag_delta().x,
                                 Axis::Vertical => resp.drag_delta().y,
                             } / total;
+                            // No child may shrink below 10% of the split.
                             let min = 0.1;
                             let d = d.clamp(-(new_fracs[i] - min).max(0.0), (new_fracs[i + 1] - min).max(0.0));
                             new_fracs[i] += d;
@@ -3760,6 +4149,7 @@ impl ApexApp {
         }
     }
 
+    /// Set the window title to "name • (folder) — Apex" for the active document.
     pub(crate) fn update_title(&self, ctx: &egui::Context) {
         let title = match self.active_ids() {
             Some((_, d)) => {
@@ -3780,6 +4170,9 @@ impl ApexApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
 
+    /// Once, on the first frame: set egui's zoom factor and text styles from
+    /// the UI font size setting. The editor font is handled separately in
+    /// `editor::font_for`.
     pub(crate) fn apply_fonts(&mut self, ctx: &egui::Context) {
         if self.fonts_applied {
             return;
@@ -3802,10 +4195,16 @@ impl ApexApp {
 }
 
 /// Send plain text to the default printer. Returns the program used.
+///
+/// Writes the text to a temporary file named after the document, hands
+/// it to `lp` (then `lpr`) on Unix or PowerShell's `Out-Printer` on
+/// Windows, and removes the file afterwards. Blocks until the spooler
+/// accepts the job.
 fn print_text(title: &str, text: &str) -> std::io::Result<&'static str> {
     use std::io::Write;
     let dir = std::env::temp_dir().join(format!("apex-print-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
+    // The file name shows up as the job name, so keep it filesystem-safe.
     let safe: String = title.chars().map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
     let path = dir.join(format!("{safe}.txt"));
     let mut f = std::fs::File::create(&path)?;
@@ -3820,6 +4219,7 @@ fn print_text(title: &str, text: &str) -> std::io::Result<&'static str> {
         }
     };
     let via = if cfg!(windows) {
+        // Single quotes are doubled to escape them inside a PowerShell literal.
         let script = format!("Get-Content -LiteralPath '{}' | Out-Printer", path.display().to_string().replace('\'', "''"));
         let st = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).status();
         match st {
@@ -3835,6 +4235,11 @@ fn print_text(title: &str, text: &str) -> std::io::Result<&'static str> {
 }
 
 /// Build the lazy per-line highlighter used by the editor widget.
+///
+/// Returns a closure mapping a line number to styled byte spans. `muted`
+/// blends every colour two-thirds of the way towards the plain foreground
+/// for the muted-syntax and low-distraction settings. With no syntax state
+/// (plain text) it returns no spans.
 fn make_highlight<'a>(
     syntax: &'a std::cell::RefCell<Option<&'a mut SyntaxState>>,
     doc: &'a Document,
@@ -3862,6 +4267,8 @@ fn make_highlight<'a>(
     }
 }
 
+/// Store new split fractions on the `Layout::Split` node at `path` (child
+/// indices from the root). Silently does nothing if the path hits a leaf.
 fn set_fractions(layout: &mut Layout, path: &[usize], fracs: Vec<f32>) {
     let mut node = layout;
     for &i in path {
@@ -3875,12 +4282,18 @@ fn set_fractions(layout: &mut Layout, path: &[usize], fracs: Vec<f32>) {
     }
 }
 
+/// The per-frame entry point; see the module docs for the order of operations.
 impl eframe::App for ApexApp {
+    /// One frame: handle global keys, poll background work, drain the
+    /// command queue, draw panels and panes, drain again, then overlays and
+    /// the modal dialog.
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.apply_fonts(&ctx);
 
-        // Global key handling for non-editor contexts (menus, find bar).
+        // Global key handling for non-editor contexts (menus, find bar): keys
+        // reach the editor widget through `editor::input`, so this block only
+        // handles bindings when something else has focus.
         let editor_focused = self.active_view_id().is_some_and(|v| ctx.memory(|m| m.has_focus(v.egui_id()))) || self.palette.open;
         // egui drops a text field's focus on Escape before we run, so treat the
         // find bar as focused whenever it is open and the editor is not.
@@ -3894,6 +4307,8 @@ impl eframe::App for ApexApp {
                     && let crate::keymap::Dispatch::Command(c, arg) = self.keymap.dispatch_event(key, physical_key, modifiers, &active_ctx)
                 {
                     let plain = !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.mac_cmd;
+                    // Unmodified keys in the find field are typing, except Enter/Escape/F3
+                    // which are find bindings.
                     if !(plain && find_focused && !matches!(key, egui::Key::Enter | egui::Key::Escape | egui::Key::F3)) {
                         self.queue.push_back((c, arg));
                         // Stop the text field from also receiving the key's character (Alt+R → "r").
@@ -3903,6 +4318,7 @@ impl eframe::App for ApexApp {
                 }
             }
         }
+        // Vim consumes raw keys itself, but never while a popup owns them.
         if self.settings.vim_mode
             && editor_focused
             && !self.palette.open
@@ -3918,10 +4334,13 @@ impl eframe::App for ApexApp {
         if self.lsp_completion_key(&ctx) || self.snippet_key(&ctx) {
             ctx.request_repaint();
         }
+        // Check for files changed by other programs on refocus and every 2 s.
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(true)))) || self.last_focus_check.elapsed().as_secs() >= 2 {
             self.last_focus_check = Instant::now();
             self.check_external_changes();
         }
+        // Window close button: veto it while there are unsaved changes and run
+        // the same prompts as Quit.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_confirmed {
             let dirty = self.docs.values().any(|d| d.is_dirty());
             if dirty {
@@ -3930,6 +4349,7 @@ impl eframe::App for ApexApp {
                 self.request_close(all, AfterClose::Quit);
             }
         }
+        // Everything is saved or discarded: persist state, stop servers, close.
         if self.quit_confirmed {
             self.save_session();
             self.write_recovery_snapshots();
@@ -3940,6 +4360,7 @@ impl eframe::App for ApexApp {
         if self.lsp_tick(&ctx) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+        // Files dropped on the window outside an editor view.
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         for p in dropped {
             if p.is_dir() {
@@ -3953,6 +4374,8 @@ impl eframe::App for ApexApp {
             self.execute(&ctx, c, arg);
         }
 
+        // Panels are declared outer to inner: top menu, bottom bars, left
+        // sidebar, then the central editor area takes what is left.
         let theme_bg = self.theme.ui.background;
         if self.settings.menu_bar && !self.distraction_free {
             egui::Panel::top("apex-menu").frame(egui::Frame::new().fill(theme_bg).inner_margin(egui::Margin::symmetric(4, 2))).show(ui, |ui| {
@@ -3992,6 +4415,7 @@ impl eframe::App for ApexApp {
                 .show(ui, |ui| {
                     self.show_sidebar(ui);
                 });
+            // Remember the user's resize for the session.
             self.sidebar.width = resp.response.rect.width();
         }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme_bg)).show(ui, |ui| {
@@ -4003,6 +4427,7 @@ impl eframe::App for ApexApp {
             self.execute(&ctx, c, arg);
             ctx.request_repaint();
         }
+        // A drag released over no tab strip ends here.
         if self.dragging_tab.is_some() && ctx.input(|i| i.pointer.primary_released() || !i.pointer.any_down()) {
             self.dragging_tab = None;
         }
@@ -4014,20 +4439,26 @@ impl eframe::App for ApexApp {
         self.show_dialogs(&ctx);
         self.show_editor_context_menu(&ctx);
         self.update_title(&ctx);
+        // Background parsing in progress: poll again shortly.
         if std::mem::take(&mut self.pending_repaint) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+        // Focus fell nowhere (a popup closed): return it to the editor so
+        // typing keeps working.
         if self.dialog.is_none() && !self.find.open && !self.palette.open && ctx.memory(|m| m.focused()).is_none() {
             self.focus_active_editor(&ctx);
         }
     }
 
+    /// Window clear colour: the editor background, so resizes do not flash.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         let c = self.theme.editor.background;
         [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
     }
 }
 
+/// Absolute, canonical form of a path for use as the document key, so the
+/// same file opened via different spellings matches one tab.
 pub(crate) fn normalise_path(p: &Path) -> PathBuf {
     let abs = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().map(|d| d.join(p)).unwrap_or_else(|_| p.to_path_buf()) };
     // Canonicalise the parent only, so a not-yet-existing file keeps its name
@@ -4038,6 +4469,7 @@ pub(crate) fn normalise_path(p: &Path) -> PathBuf {
     }
 }
 
+/// Parse "12", "12:8" or ":7" into (line, column), column defaulting to 1.
 pub(crate) fn parse_line_col(s: &str) -> Option<(usize, usize)> {
     let s = s.trim().trim_start_matches(':');
     let mut it = s.split(':');
@@ -4046,6 +4478,7 @@ pub(crate) fn parse_line_col(s: &str) -> Option<(usize, usize)> {
     Some((line, col))
 }
 
+/// The current local time as `YYYY-MM-DD HH:MM:SS`, computed without a date crate.
 pub(crate) fn local_datetime_string() -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
     let (y, m, d, hh, mm, ss) = civil_from_unix(now + local_utc_offset_seconds());
@@ -4053,6 +4486,9 @@ pub(crate) fn local_datetime_string() -> String {
 }
 
 /// Howard Hinnant's civil-from-days algorithm.
+///
+/// Converts seconds since the Unix epoch (already offset to local time)
+/// into (year, month, day, hour, minute, second).
 fn civil_from_unix(t: i64) -> (i64, u32, u32, u32, u32, u32) {
     let days = t.div_euclid(86_400);
     let secs = t.rem_euclid(86_400);
@@ -4069,6 +4505,7 @@ fn civil_from_unix(t: i64) -> (i64, u32, u32, u32, u32, u32) {
     (y, m, d, (secs / 3600) as u32, ((secs % 3600) / 60) as u32, (secs % 60) as u32)
 }
 
+/// The local time zone's offset from UTC in seconds, via `localtime_r`.
 #[cfg(unix)]
 fn local_utc_offset_seconds() -> i64 {
     use std::mem::MaybeUninit;
@@ -4084,11 +4521,15 @@ fn local_utc_offset_seconds() -> i64 {
     }
 }
 
+/// Non-Unix platforms: no offset support yet, so times are reported in UTC.
 #[cfg(not(unix))]
 fn local_utc_offset_seconds() -> i64 {
     0
 }
 
+/// Render bytes as a classic hex dump (offset, 16 bytes in two groups,
+/// ASCII column) for the read-only binary preview. Stops after 1 MiB so
+/// a huge binary does not become a huge buffer.
 fn hex_preview(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 4);
     out.push_str("Binary file (read-only hexadecimal preview)\n\n");
@@ -4141,6 +4582,9 @@ pub(crate) fn open_url(url: &str) -> bool {
     }
 }
 
+/// Show `path` in the platform file manager (selecting it where the
+/// platform supports that; on Linux the containing folder is opened).
+/// Failures are logged, not reported.
 pub(crate) fn reveal_in_file_manager(path: &Path) {
     #[cfg(target_os = "linux")]
     let cmd = std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn();
@@ -4159,6 +4603,7 @@ pub(crate) fn reveal_in_file_manager(path: &Path) {
 mod tests {
     use super::*;
 
+    /// Pins the accepted spellings of a goto-line target.
     #[test]
     pub(crate) fn parses_line_col() {
         assert_eq!(parse_line_col("12"), Some((12, 1)));
@@ -4167,12 +4612,14 @@ mod tests {
         assert_eq!(parse_line_col("x"), None);
     }
 
+    /// Pins the epoch and a known timestamp for the date algorithm.
     #[test]
     pub(crate) fn civil_date() {
         assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
         assert_eq!(civil_from_unix(1_700_000_000), (2023, 11, 14, 22, 13, 20));
     }
 
+    /// Pins the hex and ASCII columns of the preview format.
     #[test]
     pub(crate) fn hex_preview_shape() {
         let p = hex_preview(b"ABC\x00\xff");

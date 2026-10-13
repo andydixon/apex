@@ -3,6 +3,18 @@
 //!
 //! Every operation here is read-only; anything that writes to a repository
 //! runs the user's `git` through [`crate::git_cli`].
+//!
+//! Callers and flow: the workspace discovers repositories with `discover` /
+//! `workdir_of` when roots are added; it refreshes `RepoStatus` through
+//! `start_status` (a worker thread, polled each frame) whenever the watcher
+//! reports changes or every few seconds; the editor fetches `file_at` for the
+//! base text and runs `diff_hunks` against the buffer to draw gutter markers
+//! and to revert hunks; the blame view uses `start_blame`; the diff and
+//! history views use `file_history`, `commit_text` and `unified_diff`.
+//! Each function opens the repository with libgit2 on every call, which is
+//! cheap compared with the status walk itself and avoids sharing a
+//! non-`Sync` `Repository` across threads. All paths returned are absolute
+//! (joined onto the repository's working directory).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -11,6 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::{Receiver, bounded};
 
+/// Single summary state of a path, for colouring in the sidebar and tabs.
+/// When both the index and the working tree have changes, the working-tree
+/// state wins except for conflicts, which always win.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileStatus {
     Modified,
@@ -24,12 +39,18 @@ pub enum FileStatus {
     Staged,
 }
 
+/// Snapshot of a repository's state as the UI needs it.
 #[derive(Debug, Clone, Default)]
 pub struct RepoStatus {
+    /// Working directory as libgit2 reports it (trailing separator included).
     pub workdir: PathBuf,
+    /// Branch short name, `(abc1234)` when detached, or the branch HEAD
+    /// points to when unborn.
     pub branch: String,
     pub detached: bool,
+    /// HEAD points at a branch with no commits yet (fresh `git init`).
     pub unborn: bool,
+    /// Absolute path to summary state; includes ignored files when requested.
     pub files: HashMap<PathBuf, FileStatus>,
     /// Directories containing changes (for sidebar tinting).
     pub dirs: HashMap<PathBuf, FileStatus>,
@@ -46,6 +67,7 @@ pub struct RepoStatus {
 /// One changed path: what is staged and what is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusEntry {
+    /// Absolute path.
     pub path: PathBuf,
     /// Index vs HEAD: Added, Modified, Deleted or Renamed.
     pub staged: Option<FileStatus>,
@@ -54,6 +76,8 @@ pub struct StatusEntry {
     pub conflict: bool,
 }
 
+/// Upstream name and `(ahead, behind)` counts for the current branch, or
+/// `None` when HEAD is detached, unborn, or the branch has no upstream.
 fn upstream_info(repo: &git2::Repository) -> Option<(String, usize, usize)> {
     let head = repo.head().ok()?;
     if !head.is_branch() {
@@ -76,10 +100,14 @@ pub fn discover(path: &Path) -> Option<git2::Repository> {
     Some(repo)
 }
 
+/// Working directory of the repository containing `path`, if any.
 pub fn workdir_of(path: &Path) -> Option<PathBuf> {
     discover(path).and_then(|r| r.workdir().map(Path::to_path_buf))
 }
 
+/// `(branch name, detached, unborn)` for display. Detached HEAD shows the
+/// abbreviated commit in parentheses; an unborn branch shows the name HEAD
+/// symbolically points to (usually `main` or `master`).
 fn branch_info(repo: &git2::Repository) -> (String, bool, bool) {
     match repo.head() {
         Ok(head) => {
@@ -92,6 +120,8 @@ fn branch_info(repo: &git2::Repository) -> (String, bool, bool) {
             (name, detached, false)
         }
         Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
+            // Fresh `git init`: HEAD is a symbolic ref to a branch that does
+            // not exist yet. Read the ref file directly for its name.
             let name = repo
                 .find_reference("HEAD")
                 .ok()
@@ -104,6 +134,12 @@ fn branch_info(repo: &git2::Repository) -> (String, bool, bool) {
 }
 
 /// Compute the full status synchronously. Prefer [`start_status`] from the UI.
+///
+/// Walks every path libgit2 reports (untracked directories recursed so each
+/// file gets its own entry, renames detected between HEAD and index) and
+/// fills the three views of the same data: `entries` for the changes list,
+/// `files` for per-path colouring and `dirs` for tinting ancestors. Also
+/// gathers branch, upstream and pending-operation information.
 pub fn status(workdir: &Path, include_ignored: bool) -> Result<RepoStatus, git2::Error> {
     let repo = git2::Repository::open(workdir)?;
     let (branch, detached, unborn) = branch_info(&repo);
@@ -117,6 +153,7 @@ pub fn status(workdir: &Path, include_ignored: bool) -> Result<RepoStatus, git2:
     for e in statuses.iter() {
         let Some(rel) = e.path() else { continue };
         let s = e.status();
+        // Ignored files only matter for colouring, never for the changes list.
         if !s.is_ignored() {
             let staged = if s.is_index_new() {
                 Some(FileStatus::Added)
@@ -142,6 +179,7 @@ pub fn status(workdir: &Path, include_ignored: bool) -> Result<RepoStatus, git2:
             };
             entries.push(StatusEntry { path: root.join(rel), staged, unstaged, conflict: s.is_conflicted() });
         }
+        // Collapse the bit set into one colour, most urgent first.
         let kind = if s.is_conflicted() {
             FileStatus::Conflict
         } else if s.is_wt_new() {
@@ -163,6 +201,9 @@ pub fn status(workdir: &Path, include_ignored: bool) -> Result<RepoStatus, git2:
         };
         let path = root.join(rel);
         if kind != FileStatus::Ignored {
+            // Tint every ancestor directory up to (not including) the root.
+            // The first status seen sticks, except that a tracked change
+            // overrides "untracked" so new files do not mask real edits.
             let mut p = path.parent();
             while let Some(d) = p {
                 if d == root {
@@ -186,18 +227,28 @@ pub fn status(workdir: &Path, include_ignored: bool) -> Result<RepoStatus, git2:
     Ok(RepoStatus { workdir: root, branch, detached, unborn, files, dirs, entries, upstream, ahead, behind, operation })
 }
 
+/// Handle to a status computation running on a worker thread. The single
+/// result (or error message) arrives on `rx`.
 pub struct StatusScan {
+    /// Receives exactly one message unless the scan was cancelled first.
     pub rx: Receiver<Result<RepoStatus, String>>,
+    /// Checked by the worker before sending; set on drop.
     cancel: Arc<AtomicBool>,
 }
 
 impl Drop for StatusScan {
+    /// Dropping the handle does not stop the libgit2 walk (it cannot be
+    /// interrupted) but does suppress the result so a superseded scan never
+    /// overwrites a newer one.
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 }
 
 /// Compute status on a worker thread.
+///
+/// Spawns `apex-git-status`; a spawn failure is logged and the returned
+/// channel simply never delivers.
 pub fn start_status(workdir: PathBuf, include_ignored: bool) -> StatusScan {
     let (tx, rx) = bounded(1);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -216,6 +267,11 @@ pub fn start_status(workdir: PathBuf, include_ignored: bool) -> StatusScan {
 }
 
 /// Content of `path` in the index (staged) or HEAD, decoded leniently.
+///
+/// `path` must be absolute and inside `workdir`. Returns `Ok(None)` when the
+/// file is not in the requested tree, HEAD is unborn, or the blob is
+/// binary. Bytes are decoded with `from_utf8_lossy`; the editor only uses
+/// this as a diff base, so exact encoding fidelity is not required.
 pub fn file_at(workdir: &Path, path: &Path, head: bool) -> Result<Option<String>, git2::Error> {
     let repo = git2::Repository::open(workdir)?;
     let root = repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| workdir.to_path_buf());
@@ -230,6 +286,7 @@ pub fn file_at(workdir: &Path, path: &Path, head: bool) -> Result<Option<String>
         }
     } else {
         let index = repo.index()?;
+        // Stage 0 is the normal (non-conflicted) entry.
         match index.get_path(rel, 0) {
             Some(entry) => entry.id,
             None => return Ok(None),
@@ -259,14 +316,22 @@ pub struct Hunk {
     pub kind: HunkKind,
 }
 
+/// Shape of a hunk, for the gutter marker style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HunkKind {
+    /// `old_lines` is empty.
     Added,
+    /// Both sides non-empty.
     Modified,
+    /// `new_lines` is empty.
     Deleted,
 }
 
 /// Line-level diff of `base` → `current`, grouped into hunks.
+///
+/// Uses Myers (not patience) because this runs on every edit and the
+/// result only needs to be stable, not pretty. Consecutive deletes and
+/// inserts with no equal line between them form one hunk.
 pub fn diff_hunks(base: &str, current: &str) -> Vec<Hunk> {
     use similar::{ChangeTag, TextDiff};
     let diff = TextDiff::configure().algorithm(similar::Algorithm::Myers).diff_lines(base, current);
@@ -277,6 +342,7 @@ pub fn diff_hunks(base: &str, current: &str) -> Vec<Hunk> {
     for change in diff.iter_all_changes() {
         match change.tag() {
             ChangeTag::Equal => {
+                // An equal line closes the open hunk.
                 if let Some((os, oe, ns, ne)) = cur.take() {
                     hunks.push(make_hunk(os, oe, ns, ne));
                 }
@@ -301,6 +367,7 @@ pub fn diff_hunks(base: &str, current: &str) -> Vec<Hunk> {
     hunks
 }
 
+/// Build a `Hunk` from raw ranges, classifying by which side is empty.
 fn make_hunk(os: usize, oe: usize, ns: usize, ne: usize) -> Hunk {
     let kind = if oe == os {
         HunkKind::Added
@@ -314,6 +381,9 @@ fn make_hunk(os: usize, oe: usize, ns: usize, ne: usize) -> Hunk {
 
 /// Text that restores the base for one hunk: the base lines that the hunk
 /// replaced. The editor swaps `hunk.new_lines` for this text.
+///
+/// Line terminators are kept. Ranges are clamped so a hunk computed against
+/// an older base cannot panic.
 pub fn revert_hunk_text(base: &str, hunk: &Hunk) -> String {
     let lines: Vec<&str> = base.split_inclusive('\n').collect();
     lines[hunk.old_lines.start.min(lines.len())..hunk.old_lines.end.min(lines.len())].concat()
@@ -323,6 +393,7 @@ pub fn revert_hunk_text(base: &str, hunk: &Hunk) -> String {
 mod tests {
     use super::*;
 
+    /// Modified, added and deleted hunks get the right ranges and kinds.
     #[test]
     fn hunks_classify_changes() {
         let base = "a\nb\nc\nd\n";
@@ -338,6 +409,8 @@ mod tests {
         assert!(diff_hunks("same\n", "same\n").is_empty());
     }
 
+    /// Status entries, summary map and HEAD blob access on a small
+    /// libgit2-created repository.
     #[test]
     fn repository_status_and_blob_access() {
         let dir = tempfile::tempdir().unwrap();
@@ -373,6 +446,7 @@ mod tests {
         assert!(workdir_of(Path::new("/")).is_none() || true);
     }
 
+    /// A fresh `git init` reports `unborn` with a non-empty branch name.
     #[test]
     fn unborn_repository_is_handled() {
         let dir = tempfile::tempdir().unwrap();
@@ -386,32 +460,48 @@ mod tests {
 /// One commit that touched a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
+    /// Full hex id.
     pub id: String,
+    /// First seven hex digits.
     pub short_id: String,
     pub author: String,
+    /// `YYYY-MM-DD HH:MM` in the author's own UTC offset.
     pub date: String,
     pub summary: String,
 }
 
 /// `YYYY-MM-DD HH:MM` for a Unix timestamp with a UTC offset in minutes.
+///
+/// Civil-from-days conversion (Howard Hinnant's algorithm) done by hand so
+/// the crate needs no date dependency. Valid for any proleptic Gregorian
+/// date; `div_euclid` keeps pre-1970 times correct.
 pub fn format_date(unix: i64, offset_minutes: i32) -> String {
     let t = unix + offset_minutes as i64 * 60;
     let days = t.div_euclid(86_400);
     let secs = t.rem_euclid(86_400);
+    // Shift the epoch to 0000-03-01 so leap days fall at the end of a year.
     let z = days + 719_468;
+    // 400-year eras of 146,097 days each.
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    // Month index with March = 0; day within it.
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    // January and February belong to the following civil year.
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, (secs % 3600) / 60)
 }
 
 /// Commits in which `path` changed, newest first, bounded by `limit`.
+///
+/// Walks from HEAD in time order comparing the file's blob id with each
+/// parent's; at most 5000 commits are examined so a file untouched for a
+/// long time does not make the history view walk the whole repository.
+/// Renames are not followed. An unborn HEAD yields an empty list.
 pub fn file_history(workdir: &Path, path: &Path, limit: usize) -> Result<Vec<HistoryEntry>, git2::Error> {
     let repo = git2::Repository::open(workdir)?;
     let root = repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| workdir.to_path_buf());
@@ -453,6 +543,9 @@ pub fn file_history(workdir: &Path, path: &Path, limit: usize) -> Result<Vec<His
 }
 
 /// Unified diff text of `base` → `current` with the given labels.
+///
+/// Three lines of context, `---`/`+++` header from the labels; the same
+/// shape `git diff` prints, so it can be copied into a patch.
 pub fn unified_diff(base: &str, current: &str, base_label: &str, current_label: &str) -> String {
     similar::TextDiff::from_lines(base, current).unified_diff().context_radius(3).header(base_label, current_label).to_string()
 }
@@ -461,6 +554,7 @@ pub fn unified_diff(base: &str, current: &str, base_label: &str, current_label: 
 mod history_tests {
     use super::*;
 
+    /// Date formatting at the epoch and with an offset; unified diff header.
     #[test]
     fn dates_and_unified_diff() {
         assert_eq!(format_date(0, 0), "1970-01-01 00:00");
@@ -474,11 +568,15 @@ mod history_tests {
 /// A commit referenced by a blame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlameCommit {
+    /// Full hex id.
     pub id: String,
     pub author: String,
     pub email: String,
+    /// Commit time, seconds since the Unix epoch.
     pub time: i64,
+    /// Subject line.
     pub summary: String,
+    /// Full message, for the hover tooltip.
     pub message: String,
 }
 
@@ -486,12 +584,19 @@ pub struct BlameCommit {
 /// the line is not committed (edited in the buffer or new).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BlameInfo {
+    /// Distinct commits in first-seen order.
     pub commits: Vec<BlameCommit>,
+    /// One slot per line of the blamed text.
     pub lines: Vec<Option<u32>>,
 }
 
 /// Blame `path` as of HEAD, then against `buffer` (the editor's text) so
 /// unsaved edits show as not committed.
+///
+/// `path` must be absolute and inside `workdir`. Hunks whose final commit
+/// is the zero id are the buffer-only lines. `lines` is sized to the last
+/// hunk's end, so trailing lines without a hunk are absent rather than
+/// `None`.
 pub fn blame(workdir: &Path, path: &Path, buffer: Option<&str>) -> Result<BlameInfo, git2::Error> {
     let repo = git2::Repository::open(workdir)?;
     let root = repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| workdir.to_path_buf());
@@ -502,6 +607,7 @@ pub fn blame(workdir: &Path, path: &Path, buffer: Option<&str>) -> Result<BlameI
         None => base,
     };
     let mut info = BlameInfo::default();
+    // Dedupe commits: many hunks share one commit.
     let mut index: HashMap<git2::Oid, u32> = HashMap::new();
     for h in blame.iter() {
         let id = h.final_commit_id();
@@ -524,6 +630,7 @@ pub fn blame(workdir: &Path, path: &Path, buffer: Option<&str>) -> Result<BlameI
             index.insert(id, i);
             Some(i)
         };
+        // libgit2 line numbers are 1-based.
         let start = h.final_start_line().saturating_sub(1);
         let end = start + h.lines_in_hunk();
         if info.lines.len() < end {
@@ -537,6 +644,10 @@ pub fn blame(workdir: &Path, path: &Path, buffer: Option<&str>) -> Result<BlameI
 }
 
 /// Run [`blame`] on a worker thread.
+///
+/// Spawns `apex-git-blame`; the result (or error message) arrives once on
+/// the returned channel. On spawn failure the channel closes without a
+/// message.
 pub fn start_blame(workdir: PathBuf, path: PathBuf, buffer: String) -> Receiver<Result<BlameInfo, String>> {
     let (tx, rx) = bounded(1);
     let spawned = std::thread::Builder::new().name("apex-git-blame".into()).spawn(move || {
@@ -549,6 +660,11 @@ pub fn start_blame(workdir: PathBuf, path: PathBuf, buffer: String) -> Receiver<
 }
 
 /// "3 months ago" (long) or "3 mo" (short) for a Unix time.
+///
+/// Boundaries: under a minute is "now"; days up to two weeks; weeks up to
+/// two months (5,259,600 s); months (2,629,800 s, the mean Gregorian
+/// month) up to a year (31,557,600 s, the Julian year). A `time` in the
+/// future is treated as now.
 pub fn relative_age(time: i64, now: i64, short: bool) -> String {
     let s = (now - time).max(0);
     let (n, long, abbr) = match s {
@@ -565,6 +681,11 @@ pub fn relative_age(time: i64, now: i64, short: bool) -> String {
 
 /// `git show`-style text for a commit: header, message and the patch
 /// against its first parent.
+///
+/// `id` is anything `git rev-parse` accepts (`HEAD`, `HEAD~1`, a hash, a
+/// tag). A root commit is diffed against the empty tree. The patch is
+/// rebuilt from libgit2's line callback, which supplies the `+`/`-`/space
+/// origin separately from the content.
 pub fn commit_text(workdir: &Path, id: &str) -> Result<String, git2::Error> {
     let repo = git2::Repository::open(workdir)?;
     let commit = repo.revparse_single(id)?.peel_to_commit()?;
@@ -581,6 +702,7 @@ pub fn commit_text(workdir: &Path, id: &str) -> Result<String, git2::Error> {
         out.push_str(&format!("Merge:  {}\n", parents.join(" ")));
     }
     out.push('\n');
+    // Indent the message by four spaces like `git show`, keeping blank lines.
     for l in commit.message().unwrap_or("").trim_end().lines() {
         if l.is_empty() {
             out.push('\n');
@@ -592,6 +714,8 @@ pub fn commit_text(workdir: &Path, id: &str) -> Result<String, git2::Error> {
     let parent_tree = commit.parent(0).ok().map(|p| p.tree()).transpose()?;
     let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit.tree()?), None)?;
     diff.print(git2::DiffFormat::Patch, |_, _, line| {
+        // Header lines (`diff --git`, `@@`) carry their own text; only
+        // content lines need the origin character prepended.
         if matches!(line.origin(), '+' | '-' | ' ') {
             out.push(line.origin());
         }
@@ -605,6 +729,7 @@ pub fn commit_text(workdir: &Path, id: &str) -> Result<String, git2::Error> {
 mod blame_tests {
     use super::*;
 
+    /// Stage everything and commit with a fixed author time.
     fn commit_all(repo: &git2::Repository, msg: &str, time: i64) {
         let mut index = repo.index().unwrap();
         index.add_all(["*"], git2::IndexAddOption::DEFAULT, None).unwrap();
@@ -616,6 +741,8 @@ mod blame_tests {
         repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents).unwrap();
     }
 
+    /// Lines map to the right commits, buffer-only lines are `None`, and
+    /// `commit_text` has the `git show` shape.
     #[test]
     fn blame_tracks_commits_and_buffer_edits() {
         let dir = tempfile::tempdir().unwrap();
@@ -641,6 +768,7 @@ mod blame_tests {
         assert!(commit_text(root, "HEAD~1").unwrap().contains("+a\n+b\n+c\n"));
     }
 
+    /// Each unit boundary in both long and short form.
     #[test]
     fn ages() {
         assert_eq!(relative_age(100, 100, false), "just now");

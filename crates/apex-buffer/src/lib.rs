@@ -25,6 +25,14 @@
 //!
 //! The canonical document offset throughout Apex is the **char** offset; it is
 //! what [`ropey`] indexes by, and converting to the other spaces is `O(log n)`.
+//!
+//! # Dependencies and callers
+//!
+//! Depends only on `ropey`, `unicode-segmentation`, `unicode-width`,
+//! `encoding_rs` and `memchr`. `apex-edit` builds documents and selections on
+//! top of it; `apex-syntax` and the UI use the byte/char conversions when
+//! talking to tree-sitter and when laying out lines. Every function clamps
+//! out-of-range input rather than panicking, so stale positions are safe.
 
 pub mod encoding;
 pub mod line_ending;

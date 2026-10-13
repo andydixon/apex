@@ -1,35 +1,72 @@
 //! The built-in language registry and detection.
+//!
+//! [`LANGUAGES`] is a static table of [`LanguageDef`]s built with the `def!`
+//! macro; each entry names the tree-sitter grammar function and query sources
+//! (or a [`SimpleSyntax`] fallback), the file extensions, well-known file
+//! names and shebang interpreters that select it, and the comment syntax used
+//! by the toggle-comment command. Queries are compiled lazily by
+//! `highlight::compiled`, not here.
+//!
+//! [`detect`] is called by the application when a document is opened or
+//! renamed; [`lookup`] resolves user-facing names (settings, the language
+//! picker, Markdown fence info strings) to a definition. Both return
+//! `'static` references, so a `LanguageDef` pointer is stable for the life
+//! of the process and safe to store in syntax state.
 
 use std::path::Path;
 
 /// A declarative fallback highlighter for languages without a usable grammar.
+///
+/// Consumed by [`crate::simple::highlight_line`], which works one line at a
+/// time and therefore cannot represent multi-line strings or comments.
 pub struct SimpleSyntax {
+    /// Identifiers highlighted as `keyword`.
     pub keywords: &'static [&'static str],
+    /// Compare keywords ignoring ASCII case (Dockerfile instructions, SQL).
     pub case_insensitive: bool,
+    /// Token that starts a comment running to the end of the line (no trailing space).
     pub line_comment: Option<&'static str>,
+    /// Characters that open and close a string; `\` escapes inside.
     pub strings: &'static [char],
     /// Lines starting with this (after whitespace) are headings/sections.
     pub section_prefix: Option<char>,
 }
 
 /// A tree-sitter grammar and its queries.
+///
+/// Query sources are kept as `&'static str` and compiled on first use so that
+/// loading the registry costs nothing for languages the user never opens.
 pub struct Grammar {
+    /// Constructor for the tree-sitter `Language` (a function, not a value,
+    /// because `Language` is not `const`-constructible).
     pub language: fn() -> tree_sitter::Language,
+    /// Source of the highlights query (`highlights.scm`).
     pub highlights: &'static str,
+    /// Source of the injections query, for embedded languages (Markdown
+    /// fences, `<script>` in HTML).
     pub injections: Option<&'static str>,
+    /// Source of the tags query, used for the symbol outline.
     pub tags: Option<&'static str>,
 }
 
+/// Everything Apex knows about one language. Instances live in the static
+/// [`LANGUAGES`] table and are only ever handed out by `'static` reference.
 pub struct LanguageDef {
     /// Stable identifier (used in settings, overrides and injections).
     pub id: &'static str,
+    /// Human-readable name for the language picker and status bar.
     pub name: &'static str,
+    /// File extensions (lower-case, without the dot) that select this language.
     pub extensions: &'static [&'static str],
+    /// Whole file names matched case-insensitively (`Makefile`, `.bashrc`).
     pub filenames: &'static [&'static str],
     /// Interpreter names matched against a `#!` line.
     pub shebangs: &'static [&'static str],
+    /// Prefix inserted by toggle-line-comment, including its trailing space.
     pub line_comment: Option<&'static str>,
+    /// Open and close tokens for toggle-block-comment.
     pub block_comment: Option<(&'static str, &'static str)>,
+    /// Tree-sitter grammar; `None` means use `simple` or no highlighting at all.
     pub grammar: Option<Grammar>,
     /// Fallback highlighter when `grammar` is `None` (documented in the user guide).
     pub simple: Option<SimpleSyntax>,
@@ -37,6 +74,9 @@ pub struct LanguageDef {
     pub fold_kinds: &'static [&'static str],
 }
 
+/// Define a zero-argument function returning the tree-sitter `Language` for a
+/// grammar crate's `LANGUAGE` constant. Needed because `Grammar::language` is a
+/// plain `fn` pointer and the constants are `LanguageFn`s, not `Language`s.
 macro_rules! lang_fn {
     ($name:ident, $e:expr) => {
         fn $name() -> tree_sitter::Language {
@@ -76,12 +116,18 @@ lang_fn!(l_ini, tree_sitter_ini::LANGUAGE);
 lang_fn!(l_make, tree_sitter_make::LANGUAGE);
 lang_fn!(l_cmake, tree_sitter_cmake::LANGUAGE);
 lang_fn!(l_regex, tree_sitter_regex::LANGUAGE);
+/// The SCSS crate exposes a `language()` function rather than a `LANGUAGE`
+/// constant, so it cannot go through `lang_fn!`.
 fn l_scss() -> tree_sitter::Language {
     tree_sitter_scss::language()
 }
 
+/// Empty `fold_kinds`: only bracketed nodes (`{`, `(`, `[`, `<`) fold.
 const BRACES: &[&str] = &[];
 
+/// Build a [`LanguageDef`] literal. The first form takes a `grammar:` and a
+/// `fold:` kind list; the second takes a `simple:` fallback and folds on
+/// brackets only.
 macro_rules! def {
     ($id:literal, $name:literal, ext: [$($ext:literal),*], files: [$($f:literal),*], shebang: [$($sb:literal),*], line: $lc:expr, block: $bc:expr, grammar: $g:expr, fold: $fold:expr) => {
         LanguageDef { id: $id, name: $name, extensions: &[$($ext),*], filenames: &[$($f),*], shebangs: &[$($sb),*], line_comment: $lc, block_comment: $bc, grammar: $g, simple: None, fold_kinds: $fold }
@@ -91,6 +137,10 @@ macro_rules! def {
     };
 }
 
+/// The registry. Order matters twice: it is the presentation order in the
+/// language picker, and [`detect`] returns the first entry whose file name or
+/// extension matches (so `jsonc` must come after `json` for `tsconfig.json`
+/// to work by file name while `.json` still maps to plain JSON).
 static LANGUAGES: &[LanguageDef] = &[
     def!("plain", "Plain Text", ext: ["txt", "text", "log"], files: [], shebang: [], line: None, block: None, grammar: None, fold: BRACES),
     def!("rust", "Rust", ext: ["rs"], files: [], shebang: [], line: Some("// "), block: Some(("/*", "*/")),
@@ -181,6 +231,10 @@ pub fn languages() -> &'static [LanguageDef] {
 }
 
 /// Find a language by id, name (case-insensitive) or common alias.
+///
+/// Tries, in order: alias normalisation, exact id or case-insensitive name,
+/// then a registered file extension. This is the resolver for Markdown fence
+/// info strings (` ```js `) and for the `language` setting, so it is lenient.
 pub fn lookup(id: &str) -> Option<&'static LanguageDef> {
     let id = id.trim();
     let lower = id.to_ascii_lowercase();
@@ -209,6 +263,11 @@ pub fn lookup(id: &str) -> Option<&'static LanguageDef> {
 }
 
 /// Detect a language from path, shebang and content heuristics.
+///
+/// Precedence: exact file name, `Dockerfile.*` / `Makefile.*` prefixes,
+/// extension, dotfile-as-extension (`.bashrc`), shebang, then the first-line
+/// sniff in [`detect_content`]. Always returns something; `plain` is the
+/// last resort. `first_line` is only the first line of the document.
 pub fn detect(path: Option<&Path>, first_line: &str) -> &'static LanguageDef {
     if let Some(p) = path {
         let file_name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -248,6 +307,10 @@ pub fn detect(path: Option<&Path>, first_line: &str) -> &'static LanguageDef {
     detect_content(first_line)
 }
 
+/// Match a `#!` line against each language's `shebangs`.
+///
+/// Handles `#!/usr/bin/env [-flags] interp` and strips a version suffix so
+/// `python3.12` matches `python`.
 fn detect_shebang(first_line: &str) -> Option<&'static LanguageDef> {
     let line = first_line.strip_prefix("#!")?;
     let mut parts = line.split_whitespace();
@@ -256,10 +319,14 @@ fn detect_shebang(first_line: &str) -> Option<&'static LanguageDef> {
         // `#!/usr/bin/env -S python3 -u` → skip flags.
         interp = parts.find(|p| !p.starts_with('-'))?.to_string();
     }
+    // `python3.12` → `python`; both the full and the stripped name are tried
+    // because some registries list `python3` explicitly.
     let base: String = interp.chars().take_while(|c| !c.is_ascii_digit() && *c != '.').collect();
     LANGUAGES.iter().find(|l| l.shebangs.iter().any(|s| *s == interp || *s == base))
 }
 
+/// Last-resort sniff of the first line for files with no useful name or
+/// shebang: XML/HTML prologues, diff headers, JSON brackets and `<?php`.
 fn detect_content(first_line: &str) -> &'static LanguageDef {
     let t = first_line.trim_start();
     let id = if t.starts_with("<?xml") {
@@ -282,6 +349,7 @@ fn detect_content(first_line: &str) -> &'static LanguageDef {
 mod tests {
     use super::*;
 
+    /// One example per detection path in [`detect`] and [`lookup`].
     #[test]
     fn detects_by_name_extension_shebang_and_content() {
         assert_eq!(detect(Some(Path::new("src/main.rs")), "").id, "rust");
@@ -299,6 +367,8 @@ mod tests {
         assert!(lookup("nonexistent").is_none());
     }
 
+    /// Every bundled grammar links against this tree-sitter ABI and every
+    /// query source parses, so a bad upgrade fails here rather than at runtime.
     #[test]
     fn all_grammars_load_and_queries_compile() {
         for l in languages() {
@@ -316,6 +386,7 @@ mod tests {
         }
     }
 
+    /// Ids are used as cache keys and settings values, so they must be unique.
     #[test]
     fn ids_unique() {
         let mut seen = std::collections::HashSet::new();

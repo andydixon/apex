@@ -1,4 +1,15 @@
 //! Atomic multi-range replacements with inverse generation and position mapping.
+//!
+//! A [`Transaction`] is the only way text changes: [`ops`](crate::ops) build
+//! one from the selections, [`Document::apply`](crate::Document::apply)
+//! commits it and records the inverse in history, and views use
+//! [`Transaction::map_pos`] to carry selections, bookmarks and fold anchors
+//! across the edit. All offsets are **char** offsets in *pre-edit*
+//! coordinates; the inverse returned by `apply` is in post-edit coordinates,
+//! so applying it to the edited rope restores the original.
+//!
+//! Changes are applied last-to-first so that each change's pre-edit offsets
+//! are still valid when it is reached.
 
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
@@ -15,42 +26,55 @@ pub enum Assoc {
 /// Replace chars `start..end` with `text`. Coordinates are pre-edit char offsets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
+    /// First char replaced (inclusive).
     pub start: usize,
+    /// End of the replaced range (exclusive); equals `start` for a pure insert.
     pub end: usize,
+    /// Replacement text; empty for a pure delete.
     pub text: String,
 }
 
 impl Change {
+    /// Insert `text` at char offset `at` without removing anything.
     pub fn insert(at: usize, text: impl Into<String>) -> Self {
         Self { start: at, end: at, text: text.into() }
     }
 
+    /// Remove chars `start..end`.
     pub fn delete(start: usize, end: usize) -> Self {
         Self { start, end, text: String::new() }
     }
 
+    /// Replace chars `start..end` with `text`.
     pub fn replace(start: usize, end: usize, text: impl Into<String>) -> Self {
         Self { start, end, text: text.into() }
     }
 
+    /// Length of the inserted text in chars (`O(len)`; counts UTF-8 scalars).
     #[inline]
     pub fn new_len(&self) -> usize {
         self.text.chars().count()
     }
 
+    /// Length of the removed range in chars.
     #[inline]
     pub fn old_len(&self) -> usize {
         self.end - self.start
     }
 
+    /// True for an empty insert at a point: removes and adds nothing.
     pub fn is_noop(&self) -> bool {
         self.start == self.end && self.text.is_empty()
     }
 }
 
 /// A sorted, disjoint list of [`Change`]s applied atomically.
+///
+/// Immutable once built; `Serialize` so sessions can persist history-free
+/// snapshots of pending edits if needed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
+    /// Sorted by `start`, pairwise disjoint, no no-ops.
     changes: Vec<Change>,
     /// `prefix[i]` = total length delta of `changes[..i]`, for O(log n) position mapping.
     prefix: Vec<isize>,
@@ -90,19 +114,25 @@ impl Transaction {
         Self { changes, prefix }
     }
 
+    /// A transaction with one change.
     pub fn single(change: Change) -> Self {
         Self::new(vec![change])
     }
 
+    /// The changes, sorted by start.
     pub fn changes(&self) -> &[Change] {
         &self.changes
     }
 
+    /// True when applying would change nothing.
     pub fn is_empty(&self) -> bool {
         self.changes.is_empty()
     }
 
     /// Clamp all ranges into `rope` (defence against stale transactions).
+    ///
+    /// Clamping can make two changes touch but never overlap, so the result
+    /// is still a valid sorted, disjoint list.
     pub fn clamped(mut self, rope: &Rope) -> Self {
         let n = rope.len_chars();
         for c in &mut self.changes {
@@ -125,6 +155,8 @@ impl Transaction {
         }
         let mut inverse = vec![Change::insert(0, ""); self.changes.len()];
         let mut byte_edits = Vec::with_capacity(self.changes.len());
+        // Last-to-first: earlier changes' pre-edit offsets are untouched by
+        // edits made after them in the text.
         for (i, c) in self.changes.iter().enumerate().rev() {
             let n = rope.len_chars();
             let start = c.start.min(n);
@@ -138,6 +170,7 @@ impl Transaction {
             rope.insert(start, &c.text);
             let new_end_byte = start_byte + c.text.len();
             let new_end_point = point_of(rope, new_end_byte);
+            // Post-edit start = pre-edit start shifted by everything before it.
             let new_start = (start as isize + prefix[i]).max(0) as usize;
             inverse[i] = Change { start: new_start, end: new_start + c.new_len(), text: removed };
             byte_edits.push(crate::document::ByteEdit { start_byte, old_end_byte, new_end_byte, start_point, old_end_point, new_end_point });
@@ -148,6 +181,11 @@ impl Transaction {
     }
 
     /// Map a pre-edit position to its post-edit equivalent.
+    ///
+    /// `assoc` decides what happens when `pos` sits exactly at an insertion
+    /// point or inside a replaced range: `Before` keeps it at the start of
+    /// the new text, `After` moves it past the new text. A position at the
+    /// end of a replaced range always ends up after the replacement.
     pub fn map_pos(&self, pos: usize, assoc: Assoc) -> usize {
         // Changes are sorted and disjoint, so only the last change starting
         // before `pos` can contain it; everything earlier contributes a plain
@@ -199,6 +237,9 @@ impl Transaction {
     }
 
     /// Char range touched by the transaction in post-edit coordinates, if any.
+    ///
+    /// Used to decide which lines need re-layout or where to scroll after an
+    /// edit. `None` for an empty transaction.
     pub fn touched_range_after(&self) -> Option<std::ops::Range<usize>> {
         let first = self.changes.first()?;
         let last = self.changes.last()?;
@@ -207,6 +248,7 @@ impl Transaction {
     }
 }
 
+/// (row, byte column) of a byte offset, as tree-sitter's `Point` wants it.
 fn point_of(rope: &Rope, byte: usize) -> (usize, usize) {
     let byte = byte.min(rope.len_bytes());
     let line = rope.byte_to_line(byte);
@@ -217,6 +259,7 @@ fn point_of(rope: &Rope, byte: usize) -> (usize, usize) {
 mod tests {
     use super::*;
 
+    /// Applying then applying the inverse restores the text; the inverse's inverse is the original shape.
     #[test]
     fn apply_and_invert() {
         let mut r = Rope::from_str("hello world");
@@ -229,6 +272,7 @@ mod tests {
         assert_eq!(redo.changes().len(), 3);
     }
 
+    /// Pins `map_pos` semantics at and around inserts, deletes and replacements.
     #[test]
     fn map_positions() {
         let tx = Transaction::new(vec![Change::insert(2, "XX"), Change::delete(5, 8), Change::replace(10, 12, "Y")]);
@@ -246,6 +290,7 @@ mod tests {
         assert_eq!(tx.map_pos(20, Assoc::Before), 18);
     }
 
+    /// The earlier-starting change wins; a later touching change survives.
     #[test]
     fn overlapping_changes_are_dropped_deterministically() {
         let tx = Transaction::new(vec![Change::delete(0, 5), Change::delete(3, 8), Change::delete(5, 6)]);
@@ -253,6 +298,7 @@ mod tests {
         assert_eq!(tx.changes()[1].start, 5);
     }
 
+    /// Byte edits carry correct (row, column) points across an inserted newline.
     #[test]
     fn byte_edits_have_points() {
         let mut r = Rope::from_str("ab\ncd");

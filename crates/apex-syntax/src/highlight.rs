@@ -1,4 +1,24 @@
 //! Incremental parsing and per-line highlight spans.
+//!
+//! [`SyntaxState`] is owned by the application, one per open document. Each
+//! frame the app calls [`SyntaxState::update`], which drains the document's
+//! pending [`ByteEdit`]s into the tree-sitter trees (`Tree::edit`), reparses
+//! within a time budget (or hands off to a background thread for large
+//! files), and rebuilds injection layers for embedded languages. The painter
+//! then calls [`SyntaxState::spans_for_line`] per visible line and gets
+//! theme scopes over **byte** offsets relative to that line.
+//!
+//! Data flow: `LanguageDef` → `compiled()` (process-wide query cache) →
+//! `Layer` (root tree plus one per injected region) → `compute_line()` runs
+//! the highlights query of every layer touching the line, resolves overlaps,
+//! and the result is memoised in `line_cache` until the next edit.
+//!
+//! Invariants: `root` and `children` are always edited (`Tree::edit`) for
+//! every byte edit the document has produced, even when no reparse happened
+//! yet, so their byte positions are consistent with the current rope. A tree
+//! that is edited but not reparsed is "stale but aligned" and still yields
+//! usable highlights. `cache_valid == false` means `line_cache` must be
+//! cleared before use.
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -13,18 +33,30 @@ use tree_sitter::{InputEdit, Node, ParseOptions, Parser, Point, Query, QueryCurs
 use crate::language::{LanguageDef, lookup};
 
 /// A highlighted byte range within one line, with a theme scope.
+///
+/// Spans for a line never overlap and are sorted by `start`; gaps between
+/// them are unstyled text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
+    /// Byte offset from the start of the line (terminator excluded).
     pub start: usize,
+    /// Exclusive end byte offset from the start of the line.
     pub end: usize,
+    /// Theme scope such as `keyword` or `string.escape`; interned, so
+    /// comparing pointers is enough but `==` on the str is what callers use.
     pub scope: &'static str,
 }
 
 /// Injected content larger than this is left unhighlighted to bound work.
 const MAX_INJECTION_BYTES: usize = 1 << 20;
 /// Documents larger than this are never parsed synchronously.
+///
+/// Applies only to the first parse of a document (no old tree to reuse);
+/// incremental reparses are fast enough to attempt inline regardless of size.
 const SYNC_PARSE_LIMIT: usize = 256 * 1024;
 
+/// A language's queries compiled against its grammar, shared process-wide
+/// via [`QUERY_CACHE`] because `Query::new` is expensive (milliseconds).
 struct CompiledQueries {
     highlights: Query,
     injections: Option<Query>,
@@ -33,10 +65,17 @@ struct CompiledQueries {
     scopes: Vec<Option<&'static str>>,
 }
 
+/// Language id → compiled queries, or `None` if compilation failed (cached
+/// too, so a broken query is logged once rather than every frame).
 type QueryCache = Mutex<HashMap<&'static str, Option<Arc<CompiledQueries>>>>;
+/// Process-wide instance of [`QueryCache`], initialised on first use.
 static QUERY_CACHE: OnceLock<QueryCache> = OnceLock::new();
 
 /// Map a capture name to the theme's scope vocabulary.
+///
+/// Grammars from different authors use different naming conventions
+/// (`text.title` vs `markup.heading.1`); the theme only knows the canonical
+/// set, so aliases are folded here. An empty result means "no highlight".
 fn canonical_scope(name: &str) -> &'static str {
     let mapped = match name {
         "escape" => "string.escape",
@@ -60,6 +99,8 @@ fn canonical_scope(name: &str) -> &'static str {
     intern(mapped)
 }
 
+/// Return a `'static` copy of `s`, allocating (and leaking) at most once per
+/// distinct string. Lets `Span::scope` be `&'static str` without lifetimes.
 fn intern(s: &str) -> &'static str {
     static INTERNED: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let mut map = INTERNED.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
@@ -72,6 +113,8 @@ fn intern(s: &str) -> &'static str {
     leaked
 }
 
+/// Fetch (compiling on first use) the queries for `lang`. `None` when the
+/// language has no grammar or its highlights query does not compile.
 fn compiled(lang: &'static LanguageDef) -> Option<Arc<CompiledQueries>> {
     let cache = QUERY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(v) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(lang.id) {
@@ -82,6 +125,8 @@ fn compiled(lang: &'static LanguageDef) -> Option<Arc<CompiledQueries>> {
     built
 }
 
+/// Compile `lang`'s queries. The highlights query is mandatory; injections
+/// and tags are optional and a failure there only loses that feature.
 fn build_queries(lang: &'static LanguageDef) -> Option<CompiledQueries> {
     let g = lang.grammar.as_ref()?;
     let ts_lang = (g.language)();
@@ -97,6 +142,8 @@ fn build_queries(lang: &'static LanguageDef) -> Option<CompiledQueries> {
         .iter()
         .map(|n| {
             let s = canonical_scope(n);
+            // `injection.*`, `local.*` and `_private` captures are query
+            // plumbing, not things to paint.
             if s.is_empty() || n.starts_with("injection.") || n.starts_with("local.") || n.starts_with('_') { None } else { Some(s) }
         })
         .collect();
@@ -106,40 +153,66 @@ fn build_queries(lang: &'static LanguageDef) -> Option<CompiledQueries> {
 }
 
 /// One parsed layer: the root document or an injected sub-language region.
+///
+/// Child layers are parsed with `set_included_ranges` so their trees carry
+/// document-absolute byte positions, which is what lets `compute_line` query
+/// every layer with the same `ls..le` window.
 struct Layer {
     lang: &'static LanguageDef,
     queries: Arc<CompiledQueries>,
     tree: Tree,
     /// Byte range of the injected content (whole document for the root).
     range: std::ops::Range<usize>,
+    /// 0 for the root, 1 for injections. Deeper layers win when spans overlap.
     depth: u8,
 }
 
+/// Message from a background parse thread back to [`SyntaxState::update`].
 struct BgResult {
+    /// Copy of `bg_generation` at spawn time; a mismatch means a newer parse
+    /// superseded this one and its tree must be dropped.
     generation: u64,
+    /// Document revision the snapshot was taken at.
     revision: u64,
+    /// `None` if the grammar failed to load on the worker.
     tree: Option<Tree>,
 }
 
 /// Per-document syntax state.
+///
+/// Created by the application when a document is opened or its language
+/// changes; dropped with the document. Not `Sync`: all access happens on the
+/// UI thread, and the only cross-thread traffic is the `bg` channel.
 pub struct SyntaxState {
+    /// The language being parsed; swap by constructing a new state.
     pub lang: &'static LanguageDef,
+    /// Reused for root and injection parses (language switched as needed).
     parser: Parser,
+    /// The document-level tree, or `None` before the first parse completes.
     root: Option<Layer>,
+    /// Injection layers sorted by `range.start`.
     children: Vec<Layer>,
     /// Document revision the trees have been edited up to.
     revision: u64,
+    /// Memoised `spans_for_line` results, keyed by line; cleared on any edit.
     line_cache: HashMap<usize, Vec<Span>>,
+    /// False when `line_cache` holds results from a previous tree.
     cache_valid: bool,
+    /// Receiver for an in-flight background parse, if any.
     bg: Option<Receiver<BgResult>>,
+    /// Incremented per background parse so late results can be discarded.
     bg_generation: u64,
+    /// Edits made while a background parse was running, replayed onto its
+    /// tree when it arrives so the tree matches the current text.
     edits_since_bg: Vec<InputEdit>,
-    /// Edits not yet applied because there is no tree to apply them to.
+    /// Wall-clock time of the last synchronous parse attempt (for the status bar / probes).
     pub last_parse: Duration,
     /// Time spent rebuilding injection layers in the last update.
     pub last_injections: Duration,
     /// Byte ranges (post-edit) touched since the last injection rebuild.
     pending_dirty: Vec<std::ops::Range<usize>>,
+    /// False when there is nothing to highlight (no grammar and no simple
+    /// syntax, large-file mode, or the grammar failed to load).
     pub enabled: bool,
 }
 
@@ -157,6 +230,8 @@ fn merge_ranges(mut v: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize
     out
 }
 
+/// Convert the document's edit record into tree-sitter's `InputEdit`
+/// (same fields; `Point` rows and columns are zero-based bytes).
 fn to_input_edit(e: &ByteEdit) -> InputEdit {
     InputEdit {
         start_byte: e.start_byte,
@@ -168,9 +243,17 @@ fn to_input_edit(e: &ByteEdit) -> InputEdit {
     }
 }
 
+/// Parse `rope` without copying it, feeding tree-sitter chunk by chunk.
+///
+/// `old` enables incremental reuse (it must already have been told about
+/// the edits). With a `budget`, the parse is abandoned and `None` returned
+/// once that much wall-clock time has elapsed, so the caller can fall back
+/// to a background parse.
 fn parse_rope(parser: &mut Parser, rope: &Rope, old: Option<&Tree>, budget: Option<Duration>) -> Option<Tree> {
     let start = Instant::now();
     let len = rope.len_bytes();
+    // tree-sitter asks for "the bytes starting at `byte`"; returning the rest
+    // of the containing chunk lets it read large runs with few callbacks.
     let mut read = |byte: usize, _pt: Point| -> &[u8] {
         if byte >= len {
             return &[];
@@ -206,6 +289,7 @@ impl SyntaxState {
             last_parse: Duration::ZERO,
             last_injections: Duration::ZERO,
             pending_dirty: Vec::new(),
+            // Large-file mode disables highlighting entirely to keep the editor responsive.
             enabled: (lang.grammar.is_some() || lang.simple.is_some()) && !doc.large_file,
         };
         // Edits before we existed are irrelevant: we parse the current text.
@@ -216,17 +300,27 @@ impl SyntaxState {
         s
     }
 
+    /// True once a root tree exists (highlights and folds are available).
     pub fn has_tree(&self) -> bool {
         self.root.is_some()
     }
 
+    /// True while a worker thread is parsing; the status bar shows a spinner.
     pub fn is_parsing_in_background(&self) -> bool {
         self.bg.is_some()
     }
 
     /// Bring the trees up to date with the document. Call once per frame
     /// before asking for spans. Returns true if highlights changed.
+    ///
+    /// Steps: (1) drain the document's pending byte edits into every tree
+    /// and shift injection ranges and dirty ranges accordingly; (2) collect a
+    /// finished background parse, replaying edits made meanwhile; (3) if
+    /// anything changed and no background parse is running, reparse within
+    /// `budget`. Side effect: always consumes `doc`'s pending byte edits.
     pub fn update(&mut self, doc: &mut Document, budget: Duration) -> bool {
+        // No tree to maintain (simple syntax or disabled): just invalidate
+        // the line cache and discard the edit records.
         if !self.enabled || self.lang.grammar.is_none() {
             let edited = doc.has_pending_byte_edits();
             doc.take_pending_byte_edits();
@@ -246,6 +340,8 @@ impl SyntaxState {
                 for c in &mut self.children {
                     c.tree.edit(e);
                     // Keep the injected region's byte range in step with the text.
+                    // Entirely after the edit: shift. Overlapping: grow/shrink
+                    // the end but never below the start.
                     if c.range.start >= e.old_end_byte {
                         c.range.start = (c.range.start as isize + delta).max(0) as usize;
                         c.range.end = (c.range.end as isize + delta).max(0) as usize;
@@ -267,6 +363,8 @@ impl SyntaxState {
                 // Regions deleted outright are gone; a stale empty layer would linger.
                 self.children.retain(|c| c.range.end > c.range.start);
             }
+            // The worker parsed a snapshot; remember what changed since so
+            // its tree can be brought up to date on arrival.
             if self.bg.is_some() {
                 self.edits_since_bg.extend(edits.iter().copied());
             }
@@ -293,8 +391,10 @@ impl SyntaxState {
                         changed = true;
                     }
                 }
+                // Stale generation: a newer parse was started; drop this result.
                 Ok(_) => self.bg = None,
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
+                // Worker died (spawn failure or panic); allow a retry below.
                 Err(crossbeam_channel::TryRecvError::Disconnected) => self.bg = None,
             }
         }
@@ -305,6 +405,12 @@ impl SyntaxState {
         changed
     }
 
+    /// Reparse the root layer, incrementally if a previous tree exists.
+    ///
+    /// Tries synchronously within `budget` unless this is a first parse of
+    /// a document over [`SYNC_PARSE_LIMIT`]; on timeout or size, starts a
+    /// background parse instead. Disables the state permanently if the
+    /// queries or grammar cannot be loaded.
     fn reparse(&mut self, doc: &Document, budget: Duration) {
         let Some(queries) = compiled(self.lang) else {
             self.enabled = false;
@@ -317,6 +423,7 @@ impl SyntaxState {
             self.enabled = false;
             return;
         }
+        // The parser is shared with injection parsing; reset to whole-document mode.
         let _ = self.parser.set_included_ranges(&[]);
         let rope = doc.rope();
         let old = self.root.as_ref().map(|r| &r.tree);
@@ -326,9 +433,11 @@ impl SyntaxState {
         self.last_parse = start.elapsed();
         match tree {
             Some(t) => {
+                // `queries` was only fetched to fail early; the installer refetches it.
                 let _ = queries;
                 self.install_root_incremental(doc, t);
             }
+            // Timed out (or too large): keep the stale tree and parse off-thread.
             None => self.start_background(doc),
         }
     }
@@ -359,6 +468,9 @@ impl SyntaxState {
         self.rebuild_injections(doc, Some(dirty));
     }
 
+    /// Spawn a worker thread to parse a snapshot of the rope with no time
+    /// budget. The rope clone is cheap (shared structure). The old tree is
+    /// cloned too so the worker can still parse incrementally.
     fn start_background(&mut self, doc: &Document) {
         let Some(g) = self.lang.grammar.as_ref() else { return };
         self.bg_generation += 1;
@@ -382,6 +494,9 @@ impl SyntaxState {
             .ok();
     }
 
+    /// Replace the root layer with a tree that did not come from an
+    /// incremental reparse of the previous root (first parse or background
+    /// result), so all injections are rebuilt from scratch.
     fn install_root(&mut self, doc: &Document, tree: Tree) {
         let Some(queries) = compiled(self.lang) else { return };
         let len = doc.len_bytes();
@@ -396,11 +511,19 @@ impl SyntaxState {
     fn rebuild_injections(&mut self, doc: &Document, dirty: Option<Vec<std::ops::Range<usize>>>) {
         let started = Instant::now();
         // Incremental only when the dirty set is small; otherwise a full pass is cheaper.
+        // "Small" = at most 64 ranges covering under half the document.
         let dirty = dirty.map(merge_ranges).filter(|d| d.len() <= 64 && d.iter().map(|r| r.end - r.start).sum::<usize>() * 2 < doc.len_bytes().max(1));
         self.rebuild_injections_inner(doc, dirty);
         self.last_injections = started.elapsed();
     }
 
+    /// The body of [`rebuild_injections`]: run the injections query (over the
+    /// whole document, or only the dirty windows), collect the wanted
+    /// `(language, range)` pairs, then parse each one, reusing an existing
+    /// child tree when the same language covers exactly the same range.
+    ///
+    /// `dirty == None` means a full rebuild. Total injected bytes are capped
+    /// at [`MAX_INJECTION_BYTES`]; regions beyond that are left unhighlighted.
     fn rebuild_injections_inner(&mut self, doc: &Document, dirty: Option<Vec<std::ops::Range<usize>>>) {
         let Some(root) = &self.root else { return };
         let Some(inj) = root.queries.injections.as_ref() else {
@@ -434,6 +557,8 @@ impl SyntaxState {
         });
         let mut wanted: Vec<(&'static LanguageDef, Range)> = Vec::new();
         let touched = |c: &Layer, ws: &[std::ops::Range<usize>]| ws.iter().any(|r| c.range.start <= r.end && c.range.end >= r.start);
+        // Children outside every window are kept as-is; their bytes still
+        // count towards the injection budget.
         let mut total = self.children.iter().filter(|c| windows.as_ref().is_some_and(|w| !touched(c, w))).map(|c| c.range.end - c.range.start).sum::<usize>();
         let mut cursor = QueryCursor::new();
         let query_windows: Vec<std::ops::Range<usize>> = match &windows {
@@ -444,6 +569,9 @@ impl SyntaxState {
             cursor.set_byte_range(w.clone());
             let mut matches = cursor.matches(inj, root.tree.root_node(), |n: Node| rope.byte_slice(n.byte_range()).chunks().map(|c| c.as_bytes()));
             while let Some(m) = matches.next() {
+                // The language comes either from a `(#set! injection.language "x")`
+                // directive on the pattern or from an `@injection.language` capture
+                // (e.g. the info string of a Markdown fence).
                 let mut lang_name: Option<String> = inj
                     .property_settings(m.pattern_index)
                     .iter()
@@ -457,6 +585,8 @@ impl SyntaxState {
                 }
                 let Some(name) = lang_name else { continue };
                 let Some(lang) = lookup(name.trim()) else { continue };
+                // Self-injection would recurse forever; grammarless targets
+                // have nothing to highlight with.
                 if lang.grammar.is_none() || lang.id == self.lang.id {
                     continue;
                 }
@@ -479,6 +609,8 @@ impl SyntaxState {
                 }
             }
         }
+        // Split existing children into those we may reuse/replace (touched)
+        // and those that survive untouched.
         let (mut old, kept): (Vec<Layer>, Vec<Layer>) = match &windows {
             Some(ws) => std::mem::take(&mut self.children).into_iter().partition(|c| touched(c, ws)),
             None => (std::mem::take(&mut self.children), Vec::new()),
@@ -488,6 +620,8 @@ impl SyntaxState {
             let Some(queries) = compiled(lang) else { continue };
             let Some(g) = lang.grammar.as_ref() else { continue };
             let byte_range = range.start_byte..range.end_byte;
+            // Same language over the same (already shifted) range: the old
+            // tree has been `edit`ed, so it is a valid incremental base.
             let reuse = old.iter().position(|c| c.lang.id == lang.id && c.range == byte_range).map(|i| old.swap_remove(i));
             if self.parser.set_language(&(g.language)()).is_err() || self.parser.set_included_ranges(&[range]).is_err() {
                 continue;
@@ -503,6 +637,10 @@ impl SyntaxState {
     }
 
     /// Highlight spans for one line (line-local byte offsets).
+    ///
+    /// Results are memoised until the next edit. Returns an empty slice when
+    /// there is no tree yet or the line is out of range. Must be called after
+    /// [`SyntaxState::update`] in the same frame for accurate results.
     pub fn spans_for_line(&mut self, doc: &Document, line: usize) -> &[Span] {
         if !self.cache_valid {
             self.line_cache.clear();
@@ -510,6 +648,8 @@ impl SyntaxState {
         }
         if !self.line_cache.contains_key(&line) {
             let spans = self.compute_line(doc, line);
+            // Crude bound on memory for long scroll sessions; a clear just
+            // costs re-querying the visible lines.
             if self.line_cache.len() > 8192 {
                 self.line_cache.clear();
             }
@@ -518,6 +658,9 @@ impl SyntaxState {
         self.line_cache.get(&line).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// Compute spans for `line` from scratch: run the highlights query of the
+    /// root and of every injection layer intersecting the line, then flatten
+    /// the overlapping captures into a non-overlapping span list.
     fn compute_line(&self, doc: &Document, line: usize) -> Vec<Span> {
         let rope = doc.rope();
         if line >= rope.len_lines() {
@@ -567,6 +710,8 @@ impl SyntaxState {
             }
         });
         raw.sort_by_key(|r| std::cmp::Reverse(r.3 - r.2));
+        // Paint onto a per-byte "cover" array indexed into a small scope table;
+        // `u16::MAX` is the unpainted sentinel. Then run-length encode it.
         let width = le - ls;
         let mut cover: Vec<u16> = vec![u16::MAX; width];
         let mut scopes: Vec<&'static str> = Vec::new();
@@ -599,6 +744,9 @@ impl SyntaxState {
     }
 
     /// Byte ranges of the named nodes enclosing `byte`, innermost first.
+    ///
+    /// Drives "expand selection to scope". Consecutive identical ranges
+    /// (a node and its single wrapper) are collapsed so each step grows.
     pub fn enclosing_ranges(&self, byte: usize) -> Vec<(usize, usize)> {
         let Some(root) = &self.root else { return Vec::new() };
         let mut out = Vec::new();
@@ -613,10 +761,12 @@ impl SyntaxState {
         out
     }
 
+    /// The root layer's tree, for `fold` and `symbols`.
     pub(crate) fn root_tree(&self) -> Option<&Tree> {
         self.root.as_ref().map(|r| &r.tree)
     }
 
+    /// The root language's compiled tags query, if it has one.
     pub(crate) fn tags_query(&self) -> Option<&Query> {
         self.root.as_ref().and_then(|r| r.queries.tags.as_ref())
     }
@@ -632,17 +782,20 @@ mod tests {
     use super::*;
     use apex_edit::{Change, EditKind, SelectionSet, Transaction};
 
+    /// Build a document and a fully parsed state for it (generous budget).
     fn state_for(lang: &str, text: &str) -> (SyntaxState, Document) {
         let mut doc = Document::from_text(text);
         let s = SyntaxState::new(lookup(lang).unwrap(), &mut doc, Duration::from_secs(5));
         (s, doc)
     }
 
+    /// Spans of `line` as `(text, scope)` pairs for readable assertions.
     fn scopes(s: &mut SyntaxState, d: &Document, line: usize) -> Vec<(String, &'static str)> {
         let text = d.line_text(line);
         s.spans_for_line(d, line).iter().map(|sp| (text.as_bytes()[sp.start..sp.end].iter().map(|&b| b as char).collect(), sp.scope)).collect()
     }
 
+    /// Basic keyword, function, string and comment scopes come through.
     #[test]
     fn rust_highlights() {
         let (mut s, d) = state_for("rust", "fn main() {\n    let x = \"hi\"; // c\n}\n");
@@ -654,6 +807,7 @@ mod tests {
         assert!(l1.iter().any(|(t, sc)| t == "// c" && *sc == "comment"), "{l1:?}");
     }
 
+    /// After an insert at the top, lines shift and the new line is highlighted correctly.
     #[test]
     fn incremental_edit_keeps_highlights_right() {
         let (mut s, mut d) = state_for("rust", "fn a() {}\n");
@@ -666,6 +820,7 @@ mod tests {
         assert!(l1.contains(&("fn".into(), "keyword")), "{l1:?}");
     }
 
+    /// Markdown injects both the inline grammar (emphasis) and a fenced Rust block.
     #[test]
     fn markdown_injects_inline_and_code_blocks() {
         let (mut s, d) = state_for("markdown", "# Title\n\nSome *emph* text\n\n```rust\nfn x() {}\n```\n");
@@ -677,6 +832,7 @@ mod tests {
         assert!(l5.contains(&("fn".into(), "keyword")), "{l5:?}");
     }
 
+    /// HTML injects JavaScript into `<script>` and CSS into `<style>`.
     #[test]
     fn html_injects_script_and_style() {
         let (mut s, d) = state_for("html", "<html><script>\nlet x = 1;\n</script><style>\na { color: red }\n</style></html>\n");
@@ -686,6 +842,7 @@ mod tests {
         assert!(l3.iter().any(|(t, _)| t == "color"), "{l3:?}");
     }
 
+    /// A 1 ms budget forces the background path; the tree still arrives and highlights the last line.
     #[test]
     fn background_parse_for_large_document() {
         let text = "fn f() { let x = 1; }\n".repeat(20_000);
@@ -702,6 +859,7 @@ mod tests {
         assert!(l.contains(&("fn".into(), "keyword")), "{l:?}");
     }
 
+    /// Each enclosing range contains the previous one.
     #[test]
     fn enclosing_ranges_walk_up() {
         let (s, _d) = state_for("rust", "fn a() { b(c); }\n");
@@ -716,6 +874,7 @@ mod incremental_injection_tests {
     use super::*;
     use apex_edit::{Change, Document, EditKind, SelectionSet, Transaction};
 
+    /// Whether any span on `line` has a scope starting with `scope`.
     fn has_scope(st: &mut SyntaxState, doc: &Document, line: usize, scope: &str) -> bool {
         st.spans_for_line(doc, line).iter().any(|s| s.scope.starts_with(scope))
     }
@@ -725,6 +884,8 @@ mod incremental_injection_tests {
         st.children.iter().filter(|c| c.lang.id != "markdown_inline").map(|c| (c.lang.id, c.range.clone())).collect()
     }
 
+    /// Fence layers survive edits inside them, shift for edits before them,
+    /// appear for new fences and disappear when their fence is deleted.
     #[test]
     fn injections_follow_edits_incrementally() {
         let lang = crate::language::lookup("markdown").unwrap();
@@ -770,6 +931,7 @@ mod timing_probe {
     use super::*;
     use apex_edit::{Change, Document, EditKind, SelectionSet, Transaction};
 
+    /// Manual timing probe, not an assertion; see the module doc for how to run it.
     #[test]
     #[ignore]
     fn incremental_edit_breakdown() {

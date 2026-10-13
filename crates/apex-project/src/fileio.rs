@@ -1,5 +1,13 @@
 //! Reading and safely writing documents.
 //!
+//! This is the only place that reads a document from disk or writes one back.
+//! `load` is called when a tab opens or an external change is reloaded;
+//! `save` by Save/Save As and by Find-and-Replace in files; `save_atomic`
+//! directly by modules that persist their own small files (sessions,
+//! recovery snapshots, the user dictionary). Decoding and encoding are
+//! delegated to `apex_buffer`; identity tracking (inode/mtime/size) to
+//! `apex_edit::FileIdentity`.
+//!
 //! # Safe save
 //!
 //! [`save_atomic`] writes to a temporary file in the *target directory*,
@@ -25,16 +33,24 @@ use apex_edit::FileIdentity;
 /// Refuse to read files larger than this into memory (2 GiB).
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Everything that can go wrong opening or saving a document. The `Display`
+/// text is shown to the user as-is.
 #[derive(Debug, thiserror::Error)]
 pub enum FileError {
+    /// Any underlying filesystem error.
     #[error("{0}")]
     Io(#[from] io::Error),
+    /// The file exceeds `MAX_FILE_BYTES`; carries the actual size.
     #[error("file is too large to open ({0} bytes; the limit is {MAX_FILE_BYTES})")]
     TooLarge(u64),
+    /// The path names a directory, not a file.
     #[error("{0} is a directory")]
     IsDirectory(PathBuf),
+    /// Reserved for callers that refuse binary content; `load` itself returns
+    /// binary files as a `LoadedFile` with `binary` set rather than this.
     #[error("file contains binary data")]
     Binary,
+    /// `SaveOptions::expected` did not match the file on disk.
     #[error("the file changed on disk since it was opened")]
     ChangedOnDisk,
 }
@@ -42,13 +58,21 @@ pub enum FileError {
 /// A decoded file ready to become a document.
 #[derive(Debug)]
 pub struct LoadedFile {
+    /// The path as given to `load` (not symlink-resolved).
     pub path: PathBuf,
+    /// Decoded text with the file's original line endings intact.
     pub text: String,
+    /// Encoding that was detected or forced; used again on save.
     pub encoding: Encoding,
+    /// True if decoding substituted replacement characters.
     pub had_decode_errors: bool,
+    /// Dominant line ending, used as the default for new lines and on save.
     pub line_ending: LineEnding,
+    /// True when more than one line-ending style was seen.
     pub mixed_line_endings: bool,
+    /// On-disk identity at load time, for change detection before saving.
     pub identity: FileIdentity,
+    /// True when the file is not writable by us, or is binary.
     pub read_only: bool,
     /// The raw bytes when the file was detected as binary (for the hex preview).
     pub binary: Option<Vec<u8>>,
@@ -56,6 +80,10 @@ pub struct LoadedFile {
 
 /// Read and decode a file. Binary files are returned with `binary = Some(bytes)`
 /// and empty text so the caller can show a read-only preview.
+///
+/// `forced_encoding` skips detection (including binary detection, so a user
+/// can reopen a file "as UTF-8"); `fallback` is used when no BOM or valid
+/// UTF-8 is found. Errors: directory, too large, or I/O.
 pub fn load(path: &Path, forced_encoding: Option<Encoding>, fallback: Encoding) -> Result<LoadedFile, FileError> {
     let md = fs::metadata(path)?;
     if md.is_dir() {
@@ -67,6 +95,8 @@ pub fn load(path: &Path, forced_encoding: Option<Encoding>, fallback: Encoding) 
     let mut bytes = Vec::with_capacity(md.len() as usize);
     File::open(path)?.read_to_end(&mut bytes)?;
     let identity = FileIdentity::from_metadata(&md);
+    // The readonly bit alone misses ACLs and ownership; `access(2)` asks the
+    // kernel the real question.
     let read_only = md.permissions().readonly() || !is_writable(path);
     if forced_encoding.is_none() && apex_buffer::detect_binary(&bytes) {
         return Ok(LoadedFile {
@@ -82,6 +112,8 @@ pub fn load(path: &Path, forced_encoding: Option<Encoding>, fallback: Encoding) 
         });
     }
     let DecodeOutcome { text, encoding, had_errors } = apex_buffer::decode(&bytes, forced_encoding, fallback);
+    // Only the first 4 MiB are scanned for line endings; enough to pick the
+    // dominant style without a full pass over huge files.
     let stats = apex_buffer::line_ending::scan(&text, 4 << 20);
     Ok(LoadedFile {
         path: path.to_path_buf(),
@@ -96,6 +128,9 @@ pub fn load(path: &Path, forced_encoding: Option<Encoding>, fallback: Encoding) 
     })
 }
 
+/// Can the current user write to `path`? Uses `access(2)` on Unix (which
+/// honours ACLs and the effective uid); elsewhere falls back to the readonly
+/// attribute.
 fn is_writable(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -114,11 +149,14 @@ fn is_writable(path: &Path) -> bool {
 /// Options for writing a document.
 #[derive(Debug, Clone)]
 pub struct SaveOptions {
+    /// Target encoding; lossy conversions are reported, not refused.
     pub encoding: Encoding,
+    /// Every line ending in the text is normalised to this before encoding.
     pub line_ending: LineEnding,
     /// Expected on-disk identity; if it differs the save is refused with
     /// [`FileError::ChangedOnDisk`] unless `force` is set.
     pub expected: Option<FileIdentity>,
+    /// Skip the `expected` check (the user chose "overwrite anyway").
     pub force: bool,
     /// Write in place (truncate + write) instead of rename. Preserves hard
     /// links and special files at the cost of atomicity.
@@ -126,8 +164,14 @@ pub struct SaveOptions {
 }
 
 /// Encode `text` and write it safely. Returns the new identity.
+///
+/// The second element of the result is true when the encoding was lossy
+/// (characters not representable in `opts.encoding` were replaced). The
+/// identity check and the write both target the symlink-resolved path.
 pub fn save(path: &Path, text: &str, opts: &SaveOptions) -> Result<(FileIdentity, bool), FileError> {
     let target = resolve_symlink(path);
+    // A missing file (deleted since open, or Save As to a new name) is not
+    // "changed": only compare when metadata is readable.
     if !opts.force
         && let (Some(expected), Ok(md)) = (opts.expected, fs::metadata(&target))
     {
@@ -149,6 +193,10 @@ pub fn save(path: &Path, text: &str, opts: &SaveOptions) -> Result<(FileIdentity
 
 /// Compare identities ignoring sub-second timestamp noise on filesystems that
 /// truncate mtimes.
+///
+/// Size must match; on Unix so must device and inode (a rename-based save by
+/// another editor changes the inode). A missing mtime on either side is
+/// treated as a match rather than a change.
 pub fn same_identity(a: &FileIdentity, b: &FileIdentity) -> bool {
     if a.len != b.len {
         return false;
@@ -172,6 +220,8 @@ fn resolve_symlink(path: &Path) -> PathBuf {
     }
 }
 
+/// Truncate and rewrite `target` in place, then fsync. Not atomic: a crash
+/// mid-write leaves a partial file. Used only when `SaveOptions::in_place`.
 fn write_in_place(target: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(target)?;
     f.write_all(bytes)?;
@@ -179,7 +229,13 @@ fn write_in_place(target: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Temp-file + fsync + rename.
+///
+/// The temp file is created with `create_new` in the target's directory, so
+/// the final rename never crosses filesystems and an attacker who can write
+/// to the directory cannot pre-plant a symlink at the temp name. On any
+/// failure the temp file is removed and the original is left untouched.
 pub fn save_atomic(target: &Path, bytes: &[u8]) -> io::Result<()> {
+    // `parent()` of a bare file name is `Some("")`; treat that as `.`.
     let dir = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let file_name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
     // Unique temp name in the same directory so rename is on one filesystem.
@@ -199,12 +255,15 @@ pub fn save_atomic(target: &Path, bytes: &[u8]) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     };
+    // Closure so every `?` funnels into one cleanup path below.
     let result = (|| {
         file.write_all(bytes)?;
         file.sync_all()?;
+        // Close before rename: Windows cannot rename an open file.
         drop(file);
         copy_permissions(target, &tmp);
         replace_file(&tmp, target)?;
+        // Make the rename itself durable, not just the file contents.
         sync_dir(dir);
         Ok(())
     })();
@@ -214,6 +273,9 @@ pub fn save_atomic(target: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Copy mode bits (and, on Unix, owner/group) from the original file to the
+/// temp file so the renamed result looks like the original. Best effort: a
+/// missing original (new file) or a failed `chown` is silently ignored.
 fn copy_permissions(from: &Path, to: &Path) {
     if let Ok(md) = fs::metadata(from) {
         let _ = fs::set_permissions(to, md.permissions());
@@ -233,6 +295,9 @@ fn copy_permissions(from: &Path, to: &Path) {
     }
 }
 
+/// Move the temp file over the target. Windows version with retry and a
+/// copy-over fallback (see the module docs); the backup copy is removed only
+/// when the copy succeeded, so a failure leaves `target.apex-bak` behind.
 #[cfg(windows)]
 fn replace_file(tmp: &Path, target: &Path) -> io::Result<()> {
     match fs::rename(tmp, target) {
@@ -259,11 +324,15 @@ fn replace_file(tmp: &Path, target: &Path) -> io::Result<()> {
     }
 }
 
+/// Move the temp file over the target. On POSIX `rename(2)` replaces the
+/// destination atomically.
 #[cfg(not(windows))]
 fn replace_file(tmp: &Path, target: &Path) -> io::Result<()> {
     fs::rename(tmp, target)
 }
 
+/// fsync the directory so the rename survives a crash (Unix only; elsewhere
+/// directories cannot be opened for sync and this is a no-op).
 fn sync_dir(dir: &Path) {
     #[cfg(unix)]
     if let Ok(d) = File::open(dir) {
@@ -282,6 +351,7 @@ pub fn identity(path: &Path) -> Option<FileIdentity> {
 mod tests {
     use super::*;
 
+    /// BOM and CRLF survive a save/load cycle and no temp file is left over.
     #[test]
     fn save_and_load_round_trip_with_crlf_and_bom() {
         let dir = tempfile::tempdir().unwrap();
@@ -299,6 +369,7 @@ mod tests {
         assert!(fs::read_dir(dir.path()).unwrap().count() == 1, "temp file left behind");
     }
 
+    /// A stale `expected` identity blocks the save unless `force` is set.
     #[test]
     fn refuses_to_overwrite_changed_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -315,6 +386,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&p).unwrap(), "three");
     }
 
+    /// Saving through a symlink keeps the link and the target's mode bits.
     #[cfg(unix)]
     #[test]
     fn preserves_permissions_and_writes_through_symlinks() {
@@ -332,6 +404,7 @@ mod tests {
         assert_eq!(fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o755);
     }
 
+    /// A file with NUL bytes comes back as a read-only binary preview.
     #[test]
     fn binary_files_are_not_decoded() {
         let dir = tempfile::tempdir().unwrap();

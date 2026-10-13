@@ -2,6 +2,18 @@
 //! `Settings`; changes apply immediately and are written to the user
 //! `settings.toml` (only keys that differ from the defaults are stored, and
 //! unrelated keys in the file are kept).
+//!
+//! Flow: `ApexApp::show_settings_panel` runs each frame; it draws the
+//! `ENTRIES` table filtered by the search box, and when a row reports a
+//! change it writes that one key with `write_setting` and applies the
+//! difference with `apply_settings_delta`. Saving `settings.toml` from the
+//! editor sets `SettingsPanel::reload_pending`, which makes the next frame
+//! re-read the file through `reload_settings` (user file, then the project
+//! file's `[settings]` table minus `PROJECT_FORBIDDEN_KEYS`).
+//!
+//! Invariant: every `Settings` key except `lsp_servers` has exactly one
+//! `Entry`, and every entry resolves through the `*_field` accessors to a
+//! field of the right type; `entries_cover_settings` pins both.
 
 use std::path::PathBuf;
 
@@ -11,36 +23,56 @@ use crate::app::ApexApp;
 use crate::command::Command;
 use crate::settings::{Settings, WhitespaceMode};
 
+/// UI state of the settings window, owned by `ApexApp`.
 #[derive(Default)]
 pub struct SettingsPanel {
     pub open: bool,
+    /// Search text; entries are shown when every whitespace-separated word
+    /// occurs in the label, key, help or category.
     pub query: String,
+    /// Focus the search box on the next frame (set when the panel opens).
     pub focus_query: bool,
     /// Set when settings.toml was saved from the editor; reloaded on the next frame.
     pub reload_pending: bool,
 }
 
+/// Which widget edits an entry, with the allowed range where numeric.
 enum Kind {
     Bool,
+    /// `usize` drag value with inclusive bounds.
     Int(usize, usize),
+    /// `u64` drag value with inclusive bounds (millisecond/minute counts).
     U64(u64, u64),
+    /// `f32` drag value with inclusive bounds.
     Float(f32, f32),
+    /// Free-text field, committed on Enter or focus loss.
     Text,
+    /// Combo box over a fixed list of string values.
     Choice(&'static [&'static str]),
+    /// Combo box over the loaded theme names (key `theme`).
     Theme,
+    /// Comma-separated `Vec<String>`.
     List,
+    /// Comma-separated `Vec<usize>` (key `rulers`).
     IntList,
+    /// Combo box over `WhitespaceMode` (key `show_whitespace`).
     Whitespace,
 }
 
+/// One row of the settings panel.
 struct Entry {
+    /// TOML key / `Settings` field name.
     key: &'static str,
+    /// Heading the row is grouped under; rows must be contiguous per category.
     category: &'static str,
     label: &'static str,
+    /// Tooltip and inline hint; empty for self-explanatory rows.
     help: &'static str,
     kind: Kind,
 }
 
+/// The panel's rows in display order. Grouped by category because the
+/// heading is emitted whenever the category changes from the previous row.
 const ENTRIES: &[Entry] = &[
     Entry { key: "theme", category: "Appearance", label: "Theme", help: "Colour theme; user themes live in <config>/themes.", kind: Kind::Theme },
     Entry {
@@ -305,10 +337,14 @@ pub fn project_safe_settings(table: &toml::Table) -> toml::Table {
 }
 
 impl ApexApp {
+    /// Location of the user settings file.
     pub(crate) fn settings_path(&self) -> PathBuf {
         self.config_dir.join("settings.toml")
     }
 
+    /// Handle `Settings` (toggle the panel) and `OpenSettingsFile` (open the
+    /// file as a document, creating a commented stub if it does not exist).
+    /// Returns `true` if `cmd` was one of those.
     pub(crate) fn settings_command(&mut self, ctx: &egui::Context, cmd: Command) -> bool {
         match cmd {
             Command::Settings => {
@@ -317,6 +353,8 @@ impl ApexApp {
             }
             Command::OpenSettingsFile => {
                 let p = self.settings_path();
+                // Create the file so the user has something to edit; the
+                // header explains why it is (nearly) empty.
                 if !p.exists() {
                     let _ = apex_project::paths::ensure_private_dir(&self.config_dir);
                     let body = "# Apex settings. Keys not listed here keep their defaults;\n# Tools > Settings shows every key with its description.\n\n";
@@ -334,8 +372,12 @@ impl ApexApp {
     }
 
     /// Re-read settings.toml (and the project layer) and apply the result.
+    /// Replaces `self.settings` and `self.settings_issues`, applies the
+    /// delta to the UI and reports the outcome in the status bar.
     pub(crate) fn reload_settings(&mut self, ctx: &egui::Context) {
         let (mut s, mut issues) = Settings::load_file(&Settings::default(), &self.settings_path());
+        // Project layer: only the `[settings]` table of the project file, with
+        // keys that could name a program stripped.
         if let Some(p) = self.project_file.clone()
             && let Ok(src) = std::fs::read_to_string(&p)
             && let Ok(table) = toml::from_str::<toml::Table>(&src)
@@ -357,6 +399,10 @@ impl ApexApp {
     }
 
     /// Apply whatever changed between `old` and the current settings.
+    ///
+    /// Only the settings with cached derived state need explicit handling
+    /// (theme, zoom, fonts, Vim engine); everything else is read live. All
+    /// text layouts are invalidated regardless, as most keys affect them.
     fn apply_settings_delta(&mut self, ctx: &egui::Context, old: &Settings) {
         let s = &self.settings;
         if s.theme != old.theme {
@@ -367,6 +413,7 @@ impl ApexApp {
             ctx.set_zoom_factor(s.ui_scale);
         }
         if s.font_family != old.font_family || s.ui_font_size != old.ui_font_size || s.ligatures != old.ligatures {
+            // Fonts are (re)installed into egui at the start of the next frame.
             self.fonts_applied = false;
         }
         if s.vim_mode != old.vim_mode {
@@ -376,6 +423,11 @@ impl ApexApp {
     }
 
     /// Persist one key of the current settings to the user file.
+    ///
+    /// The file is read as a raw TOML table so comments on other keys and
+    /// keys this panel does not know are preserved. A value equal to the
+    /// default is removed from the file rather than written, keeping the
+    /// file a list of deliberate overrides. Errors go to the status bar.
     fn write_setting(&mut self, key: &str) {
         let path = self.settings_path();
         let mut table: toml::Table = match std::fs::read_to_string(&path) {
@@ -413,6 +465,8 @@ impl ApexApp {
         }
     }
 
+    /// Draw the settings window (when open) and act on what the user changed.
+    /// Also services a pending reload requested by saving settings.toml.
     pub(crate) fn show_settings_panel(&mut self, ctx: &egui::Context) {
         if self.settings_panel.reload_pending {
             self.settings_panel.reload_pending = false;
@@ -422,6 +476,8 @@ impl ApexApp {
             return;
         }
         let mut open = true;
+        // Actions are collected inside the window closure and performed after
+        // it, because the closure borrows `self.settings` mutably for the widgets.
         let mut changed_key: Option<&'static str> = None;
         let old = self.settings.clone();
         let theme_names: Vec<String> = self.themes.iter().map(|t| t.name.clone()).collect();
@@ -448,6 +504,7 @@ impl ApexApp {
                 let mut category = "";
                 let mut shown = 0;
                 for e in ENTRIES {
+                    // Every query word must appear somewhere in the row's text.
                     let hay = format!("{} {} {} {}", e.label, e.key, e.help, e.category).to_lowercase();
                     if !query.is_empty() && !query.split_whitespace().all(|w| hay.contains(w)) {
                         continue;
@@ -485,6 +542,8 @@ impl ApexApp {
         }
         if let Some(key) = changed_key {
             // Keep the file and runtime in step; numeric fields are clamped by the widgets.
+            // `ui_scale` goes through `set_ui_scale` so the zoom change is applied the
+            // same way as the Increase/Decrease Interface Scale commands.
             if key == "ui_scale" {
                 let v = self.settings.ui_scale;
                 self.set_ui_scale(ctx, v);
@@ -496,6 +555,10 @@ impl ApexApp {
 }
 
 /// One settings row. Returns true when the value changed this frame.
+///
+/// Mutates `s` directly through the `*_field` accessors; the caller decides
+/// whether to persist. Text-like widgets commit on focus loss, so a half-typed
+/// value is never written.
 fn setting_row(ui: &mut egui::Ui, s: &mut Settings, e: &Entry, themes: &[String]) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -504,6 +567,8 @@ fn setting_row(ui: &mut egui::Ui, s: &mut Settings, e: &Entry, themes: &[String]
         if !e.help.is_empty() {
             label.on_hover_text(e.help);
         }
+        // Right-to-left layout puts the widget at the right edge and the help
+        // text to its left, whatever the label width.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             match &e.kind {
                 Kind::Bool => {
@@ -530,6 +595,8 @@ fn setting_row(ui: &mut egui::Ui, s: &mut Settings, e: &Entry, themes: &[String]
                 Kind::Text => {
                     if let Some(v) = string_field(s, e.key) {
                         let r = ui.add(egui::TextEdit::singleline(v).desired_width(200.0));
+                        // Commit on focus loss only (Enter also drops focus), so each
+                        // keystroke does not rewrite the file.
                         changed |= r.lost_focus() && r.changed() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                     }
                 }
@@ -572,6 +639,9 @@ fn setting_row(ui: &mut egui::Ui, s: &mut Settings, e: &Entry, themes: &[String]
                 }
                 Kind::List => {
                     if let Some(v) = string_list_field(s, e.key) {
+                        // The list is edited as one comma-separated string. While the field
+                        // has focus the draft lives in egui's temp memory (so it is not
+                        // re-split every frame); it is parsed and dropped on focus loss.
                         let id = egui::Id::new(("settings-list", e.key));
                         let mut text: String = ui.memory(|m| m.data.get_temp::<String>(id)).unwrap_or_else(|| v.join(", "));
                         let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(320.0));
@@ -588,6 +658,8 @@ fn setting_row(ui: &mut egui::Ui, s: &mut Settings, e: &Entry, themes: &[String]
                     }
                 }
                 Kind::IntList => {
+                    // Same draft-in-memory scheme as `List`; only `rulers` uses it.
+                    // Non-numeric and out-of-range (0 or >= 1000) entries are dropped.
                     let id = egui::Id::new(("settings-intlist", e.key));
                     let mut text: String =
                         ui.memory(|m| m.data.get_temp::<String>(id)).unwrap_or_else(|| s.rulers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", "));
@@ -613,6 +685,10 @@ fn setting_row(ui: &mut egui::Ui, s: &mut Settings, e: &Entry, themes: &[String]
     changed
 }
 
+// The `*_field` accessors map a key to the matching `Settings` field so the
+// `ENTRIES` table can stay data. `None` means the key is not of that type.
+
+/// Mutable access to a `bool` setting by key.
 fn bool_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut bool> {
     Some(match key {
         "ligatures" => &mut s.ligatures,
@@ -668,6 +744,7 @@ fn bool_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut bool> {
     })
 }
 
+/// Mutable access to a `usize` setting by key.
 fn usize_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut usize> {
     Some(match key {
         "tab_width" => &mut s.tab_width,
@@ -678,6 +755,7 @@ fn usize_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut usize> {
     })
 }
 
+/// Mutable access to a `u64` setting by key.
 fn u64_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut u64> {
     Some(match key {
         "completion_delay_ms" => &mut s.completion_delay_ms,
@@ -688,6 +766,7 @@ fn u64_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut u64> {
     })
 }
 
+/// Mutable access to an `f32` setting by key.
 fn f32_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut f32> {
     Some(match key {
         "font_size" => &mut s.font_size,
@@ -701,6 +780,7 @@ fn f32_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut f32> {
     })
 }
 
+/// Mutable access to a `String` setting by key (used by `Text` and `Choice`).
 fn string_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut String> {
     Some(match key {
         "theme_mode" => &mut s.theme_mode,
@@ -714,6 +794,7 @@ fn string_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut String> {
     })
 }
 
+/// Mutable access to a `Vec<String>` setting by key.
 fn string_list_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut Vec<String>> {
     Some(match key {
         "exclude_patterns" => &mut s.exclude_patterns,
@@ -726,8 +807,7 @@ fn string_list_field<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut Vec<S
 mod tests {
     use super::*;
 
-    /// Every entry must resolve to a field of its declared kind, and every
-    /// settings key (except the structured lsp_servers map) must have an entry.
+    /// `lsp_servers` is stripped from a project `[settings]` table; other keys pass.
     #[test]
     fn project_settings_cannot_name_programs() {
         let t: toml::Table = toml::from_str("tab_width = 2\n[lsp_servers]\nrust = [\"evil\"]\n").unwrap();
@@ -736,6 +816,8 @@ mod tests {
         assert_eq!(safe.get("tab_width").and_then(|v| v.as_integer()), Some(2));
     }
 
+    /// Every entry must resolve to a field of its declared kind, and every
+    /// settings key (except the structured lsp_servers map) must have an entry.
     #[test]
     fn entries_cover_settings() {
         let mut s = Settings::default();

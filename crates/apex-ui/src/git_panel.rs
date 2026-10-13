@@ -2,6 +2,19 @@
 //! conflicts, staged and unstaged changes, and the commit box. Shown in the
 //! lower part of the sidebar (`git_sidebar`); every action dispatches a Git
 //! command, so the menu, palette and panel behave the same.
+//!
+//! Data flow: `show_source_control` reads the cached `RepoStatus` kept by
+//! `git_ui.rs` (filled by a libgit2 status scan on a worker thread), paints
+//! it, and collects the commands the user clicked into a local list that is
+//! appended to `ApexApp::queue` at the end of the frame. The commands are
+//! then executed by `git_commit_command` here (commit, amend, undo, open
+//! changes) or by `git_ops.rs`/`git_branches.rs`. Anything that writes to
+//! the repository runs the user's `git` binary as a background job through
+//! `git_run`, after the workspace has been trusted (`Dialog::Trust`).
+//!
+//! Gotcha: the panel never mutates `self` while a closure borrows it; clicks
+//! go into `cmds` and are queued afterwards, which is why the widget code
+//! looks indirect.
 
 use std::path::{Path, PathBuf};
 
@@ -12,22 +25,34 @@ use crate::app::ApexApp;
 use crate::command::Command;
 use crate::git_ops::rel_path;
 
+/// Persistent state of the Source Control panel, stored in `GitUi::sc`.
+/// Only the commit box and the chosen repository matter between frames;
+/// the file lists are rebuilt from the cached status every frame.
 pub struct SourceControl {
     /// Share of the sidebar height given to the panel.
     pub split: f32,
     /// Repository shown (work tree); follows the active file when unset.
     pub repo: Option<PathBuf>,
+    /// Text of the commit message box.
     pub message: String,
+    /// "Amend" checkbox: the next commit amends HEAD (an empty message keeps the old one).
     pub amend: bool,
+    /// "Sign-off" checkbox: pass `-s` to `git commit`.
     pub signoff: bool,
     /// Messages of earlier commits, newest last (Up/Down in an empty box).
     pub history: Vec<String>,
+    /// Index into `history` while the user browses it with Up/Down; `None`
+    /// when the box shows fresh text.
     history_pos: Option<usize>,
+    /// One-shot request to focus the message box on the next frame (set by
+    /// the commit command when the message is missing).
     pub focus_message: bool,
+    /// File row highlighted in the list (last single click).
     selected: Option<PathBuf>,
 }
 
 impl Default for SourceControl {
+    /// Half the sidebar, no repository chosen, empty commit box.
     fn default() -> Self {
         Self {
             split: 0.5,
@@ -43,6 +68,7 @@ impl Default for SourceControl {
     }
 }
 
+/// One-letter status badge drawn at the right of a file row.
 fn letter(s: FileStatus) -> &'static str {
     match s {
         FileStatus::Modified | FileStatus::Staged => "M",
@@ -55,15 +81,25 @@ fn letter(s: FileStatus) -> &'static str {
     }
 }
 
+/// Which of the three file lists a row belongs to; decides the inline
+/// actions (stage/unstage/discard) and which status of the entry is shown.
 #[derive(Clone, Copy, PartialEq)]
 enum Group {
+    /// Files with merge conflict markers in the index.
     Conflicts,
+    /// Files with changes in the index relative to HEAD.
     Staged,
+    /// Files with changes in the working tree relative to the index.
     Changes,
 }
 
 impl ApexApp {
     /// The repository the panel and repository-wide commands work on.
+    ///
+    /// Preference order: the repository picked in the panel's chooser (if it
+    /// is still open), then the active document's repository, then the
+    /// alphabetically first known repository. Returns `None` when no
+    /// repository has been discovered yet.
     pub(crate) fn git_panel_repo(&mut self) -> Option<PathBuf> {
         if let Some(r) = &self.git.sc.repo
             && self.git.repos.contains_key(r)
@@ -74,18 +110,26 @@ impl ApexApp {
         if let Some(a) = active.filter(|a| self.git.repos.contains_key(a)) {
             return Some(a);
         }
+        // Sorted so the fallback is stable across frames (HashMap order is not).
         let mut keys: Vec<&PathBuf> = self.git.repos.keys().collect();
         keys.sort();
         keys.first().map(|p| (*p).clone())
     }
 
+    /// Whether the sidebar should reserve space for the panel: the setting is
+    /// on and at least one open folder or file is inside a repository.
     pub(crate) fn git_panel_visible(&self) -> bool {
         self.settings.git_sidebar && self.git.has_repos()
     }
 
+    /// Paint the whole panel: header with the overflow menu, branch line with
+    /// Push/Pull/Fetch, the in-progress operation banner, the commit box and
+    /// the grouped file lists. Clicks are collected into `cmds` and queued at
+    /// the end, so nothing runs while the UI closures borrow `self`.
     pub(crate) fn show_source_control(&mut self, ui: &mut Ui) {
         let Some(repo) = self.git_panel_repo() else { return };
         let Some(entry) = self.git.repos.get(&repo) else { return };
+        // Cloned so the borrow of `self.git` ends before the widgets below mutate `self.git.sc`.
         let status = entry.status.clone();
         let theme = self.theme.clone();
         let ui_font = self.settings.ui_font_size;
@@ -104,6 +148,7 @@ impl ApexApp {
                     .color(muted)
                     .strong(),
             );
+            // Overflow menu: the less common repository-wide commands, by name.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button("…", |ui| {
                     for c in [
@@ -144,6 +189,8 @@ impl ApexApp {
                     (0, b) => format!("  ({b} behind)"),
                     (a, b) => format!("  ({a} ahead, {b} behind)"),
                 };
+                // The branch name is a clickable label rather than a button so it
+                // reads as text; clicking opens the branch switcher.
                 if ui
                     .add(egui::Label::new(egui::RichText::new(format!("{branch}{ab}")).size(ui_font - 1.0)).sense(egui::Sense::click()))
                     .on_hover_text(format!("Branch {} tracking {u}; click to switch branch", status.branch))
@@ -160,8 +207,11 @@ impl ApexApp {
                     cmds.push((Command::GitSwitchBranch, None));
                 }
             }
+            // Remote buttons are pointless before the first commit unless an
+            // upstream is already configured.
             if status.upstream.is_some() || !status.unborn {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Only one git job runs at a time; grey the buttons rather than queue silently.
                     let busy = self.git.ops.running.is_some();
                     for (label, tip, c) in [
                         ("Push", "Push commits to the upstream branch (publishes the branch the first time)", Command::GitPush),
@@ -198,6 +248,7 @@ impl ApexApp {
                     format!("{}: conflicts resolved", op.label())
                 };
                 ui.label(egui::RichText::new(text).color(theme.ui.warning));
+                // Continue is only possible once git no longer reports conflicts.
                 if ui.add_enabled(n == 0, egui::Button::new("Continue").small()).on_hover_text("Stage every resolved file first").clicked() {
                     cmds.push((Command::GitContinue, None));
                 }
@@ -217,6 +268,7 @@ impl ApexApp {
                 .desired_width(ui.available_width() - 6.0)
                 .font(egui::FontId::proportional(ui_font));
             let r = ui.add(edit);
+            // `focus_message` is a one-shot flag; `take` clears it.
             if std::mem::take(&mut self.git.sc.focus_message) {
                 r.request_focus();
             }
@@ -235,6 +287,7 @@ impl ApexApp {
                 let browsing = sc.message.is_empty() || sc.history_pos.is_some_and(|i| sc.history.get(i) == Some(&sc.message));
                 if browsing && !sc.history.is_empty() && (up || down) {
                     let n = sc.history.len();
+                    // Up walks towards older entries, Down back towards the empty box.
                     let pos = match (sc.history_pos, up) {
                         (None, true) => Some(n - 1),
                         (None, false) => None,
@@ -259,6 +312,7 @@ impl ApexApp {
             ui.checkbox(&mut self.git.sc.amend, "Amend");
             ui.checkbox(&mut self.git.sc.signoff, "Sign-off").on_hover_text("Add a Signed-off-by trailer (-s)");
             if summary_len > 0 {
+                // Conventional limits: 50 is the recommended summary length, 72 the hard wrap.
                 let colour = if summary_len > 72 {
                     theme.ui.error
                 } else if summary_len > 50 {
@@ -272,6 +326,8 @@ impl ApexApp {
         });
         ui.separator();
 
+        // An entry can be both staged and unstaged (partially staged file), so
+        // it may appear in two lists; conflicts appear only once.
         let mut conflicts: Vec<&StatusEntry> = Vec::new();
         let mut staged: Vec<&StatusEntry> = Vec::new();
         let mut changes: Vec<&StatusEntry> = Vec::new();
@@ -321,9 +377,14 @@ impl ApexApp {
         self.queue.extend(cmds);
     }
 
+    /// Paint one file row: name, directory, status letter, hover actions and
+    /// the context menu. A single click selects the row and previews the
+    /// file; a double click opens its diff. Commands go into `cmds` with the
+    /// file path as argument.
     fn git_panel_row(&mut self, ui: &mut Ui, repo: &Path, e: &StatusEntry, group: Group, row_h: f32, cmds: &mut Vec<(Command, Option<String>)>) {
         let theme = &self.theme;
         let ui_font = self.settings.ui_font_size;
+        // The same entry can sit in two lists; show the status relevant to this list.
         let st = match group {
             Group::Conflicts => FileStatus::Conflict,
             Group::Staged => e.staged.unwrap_or(FileStatus::Modified),
@@ -334,6 +395,8 @@ impl ApexApp {
             FileStatus::Deleted | FileStatus::Conflict => theme.editor.git_deleted,
             _ => theme.editor.git_modified,
         };
+        // The row is one click-sensitive rectangle painted by hand, so the
+        // hover buttons can be placed over it with `ui.put`.
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
         let hovered = ui.rect_contains_pointer(rect);
         let selected = self.git.sc.selected.as_deref() == Some(e.path.as_path());
@@ -372,6 +435,7 @@ impl ApexApp {
                     }
                 }
             }
+            // Square buttons slightly shorter than the row; 24 px leaves room for the letter.
             let bw = row_h - 2.0;
             let mut bx = rect.max.x - 24.0 - bw;
             for (icon, tip, c) in actions {
@@ -387,6 +451,7 @@ impl ApexApp {
             cmds.push((open_changes, path_arg.clone()));
         } else if resp.clicked() {
             self.git.sc.selected = Some(e.path.clone());
+            // A deleted file cannot be previewed: there is nothing on disk.
             if st != FileStatus::Deleted {
                 self.open_preview(&e.path);
             }
@@ -421,10 +486,18 @@ impl ApexApp {
     }
 
     /// Commit, amend and undo; the message comes from the panel.
+    ///
+    /// Also handles `GitToggleSourceControl` and the two "open changes"
+    /// commands because they belong to the panel. Returns `false` for
+    /// commands it does not own so the dispatcher tries the next handler.
+    /// Side effects: may open the Trust or Confirm dialog, moves the message
+    /// into `history`, clears the box, and queues a `git commit`/`git reset`
+    /// job whose result arrives through `git_ops_poll`.
     pub(crate) fn git_commit_command(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) -> bool {
         match cmd {
             Command::GitToggleSourceControl => {
                 self.settings.git_sidebar = !self.settings.git_sidebar;
+                // The panel lives inside the sidebar, so showing it must show the sidebar too.
                 if self.settings.git_sidebar {
                     self.settings.sidebar = true;
                 }
@@ -440,6 +513,8 @@ impl ApexApp {
             _ => return false,
         }
         let Some(workdir) = self.git_panel_repo().or_else(|| self.git_target(None).map(|t| t.0)) else { return true };
+        // `git commit` runs hooks, so the workspace must be trusted; the dialog
+        // re-executes this command after the user agrees.
         if !self.trust.is_trusted(&workdir) {
             self.dialog = Some(crate::app::Dialog::Trust { root: workdir, then: Some((cmd, arg)) });
             return true;
@@ -459,6 +534,7 @@ impl ApexApp {
             if !self.git_confirm("Undo last commit?", body, "Undo Commit", cmd, &arg) {
                 return true;
             }
+            // Put the message back before the reset so it is not lost if the job fails.
             self.git.sc.message = msg.trim_end().to_string();
             self.git_run("Undo commit", workdir, |c| {
                 c.git(&["reset", "--soft", "HEAD~1"], None).map(|_| "Undid the last commit; its changes are staged".into())
@@ -469,6 +545,7 @@ impl ApexApp {
         let message = self.git.sc.message.trim().to_string();
         if message.is_empty() && !amend {
             self.set_status("Enter a commit message".into(), false);
+            // Bring the box into view and focus it so the user can type straight away.
             self.settings.sidebar = true;
             self.settings.git_sidebar = true;
             self.git.sc.focus_message = true;
@@ -481,6 +558,7 @@ impl ApexApp {
         let staged = status.entries.iter().any(|e| e.staged.is_some());
         let tracked_changes = status.entries.iter().any(|e| matches!(e.unstaged, Some(s) if s != FileStatus::Untracked));
         let mut all = false;
+        // Nothing staged: offer `commit -a` (tracked files only), after confirmation.
         if !staged && !amend {
             if !tracked_changes {
                 self.set_status("Nothing to commit".into(), false);
@@ -497,12 +575,14 @@ impl ApexApp {
         }
         let signoff = self.git.sc.signoff;
         if !message.is_empty() {
+            // Most-recent-last, deduplicated, capped at 30 entries.
             self.git.sc.history.retain(|m| m != &message);
             self.git.sc.history.push(message.clone());
             if self.git.sc.history.len() > 30 {
                 self.git.sc.history.remove(0);
             }
         }
+        // Reset the box optimistically; a failed commit reports in the status bar and log.
         self.git.sc.history_pos = None;
         self.git.sc.message.clear();
         self.git.sc.amend = false;
@@ -518,9 +598,11 @@ impl ApexApp {
                 args.push("-s");
             }
             if message.is_empty() {
+                // Amend with an empty box: keep the existing message without opening an editor.
                 args.push("--no-edit");
                 c.git(&args, None)?;
             } else {
+                // The message goes through stdin so quoting and newlines are never an issue.
                 args.extend(["-F", "-"]);
                 c.git(&args, Some(message.as_bytes()))?;
             }
@@ -530,6 +612,7 @@ impl ApexApp {
         true
     }
 
+    /// Number of open documents under `workdir` with unsaved changes.
     fn dirty_docs_in(&self, workdir: &Path) -> usize {
         self.docs.values().filter(|d| d.is_dirty() && d.path.as_ref().is_some_and(|p| p.starts_with(workdir))).count()
     }
@@ -539,6 +622,7 @@ impl ApexApp {
 mod tests {
     use super::*;
 
+    /// Pins the badge letters, including the shared "M" for staged files.
     #[test]
     fn status_letters() {
         assert_eq!(letter(FileStatus::Untracked), "U");

@@ -1,4 +1,13 @@
 //! Fold regions from syntax trees and from indentation.
+//!
+//! The UI asks for a fresh `Vec<FoldRegion>` whenever the document changes:
+//! [`syntax_folds`] when a tree is available, [`indent_folds`] otherwise
+//! (plain text, or a language without a grammar). Both produce `(start, end)`
+//! **line** pairs and hand them to [`finish`], which clamps, keeps only the
+//! outermost region per start line and assigns nesting depths.
+//!
+//! Regions are recomputed from scratch rather than edited incrementally; the
+//! cost is one tree walk, which is cheap next to the parse that preceded it.
 
 use apex_buffer::Rope;
 use apex_buffer::position::line_len_chars;
@@ -8,13 +17,21 @@ use crate::highlight::SyntaxState;
 /// A foldable region: lines `start + 1 ..= end` are hidden when folded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FoldRegion {
+    /// Zero-based line that carries the fold marker and stays visible.
     pub start: usize,
+    /// Zero-based last hidden line (inclusive); always greater than `start`.
     pub end: usize,
     /// Nesting depth, 0 for top level.
     pub depth: u16,
 }
 
 /// Fold regions from the syntax tree. One region per start line (the outermost).
+///
+/// A named node folds when it spans more than one line and either starts
+/// with a bracket token, is listed in the language's `fold_kinds`, or is a
+/// multi-line comment. Runs of consecutive single-line comments are merged
+/// into one region so a doc-comment block folds as a unit. Only the root
+/// layer is walked; injected languages do not contribute folds.
 pub fn syntax_folds(state: &SyntaxState, rope: &Rope) -> Vec<FoldRegion> {
     let Some(tree) = state.root_tree() else { return Vec::new() };
     let kinds = state.lang.fold_kinds;
@@ -32,10 +49,12 @@ pub fn syntax_folds(state: &SyntaxState, rope: &Rope) -> Vec<FoldRegion> {
             end -= 1;
         }
         let kind = node.kind();
+        // Substring match so `line_comment`, `block_comment`, `Comment` all qualify.
         let is_comment = kind.contains("comment");
         if is_comment && node.is_named() {
             // Merge consecutive single-line comments into one region.
             match comment_run {
+                // Directly follows the previous comment: extend the run.
                 Some((s, e)) if start == e + 1 => comment_run = Some((s, end)),
                 Some((s, e)) => {
                     if e > s {
@@ -50,15 +69,21 @@ pub fn syntax_folds(state: &SyntaxState, rope: &Rope) -> Vec<FoldRegion> {
             && let Some((s, e)) = comment_run.take()
             && e > s
         {
+            // Any other named node breaks the comment run; flush it if it
+            // spans more than one line.
             regions.push((s, e));
         }
         if end > start && node.is_named() {
+            // Anything opened by a bracket folds regardless of language, which
+            // keeps the per-language `fold_kinds` lists short.
             let bracketed = node.child(0).is_some_and(|c| matches!(c.kind(), "{" | "(" | "[" | "<"));
             if bracketed || kinds.contains(&kind) || (is_comment && end > start) {
                 regions.push((start, end));
             }
         }
         let _ = &mut depth_stack;
+        // Pre-order: descend first, otherwise move to the next sibling,
+        // climbing back up as many levels as needed.
         if cursor.goto_first_child() {
             continue;
         }
@@ -80,8 +105,16 @@ pub fn syntax_folds(state: &SyntaxState, rope: &Rope) -> Vec<FoldRegion> {
 }
 
 /// Fold regions from indentation: a line followed by more-indented lines.
+///
+/// Blank lines are transparent (they neither extend nor end a region, so a
+/// blank line inside a Python block does not split the fold), but a region
+/// never ends on one: `end` is the last more-indented non-blank line.
+/// Indentation is measured in display columns with tabs expanded to
+/// `tab_width`. `O(n^2)` in the worst case (deeply nested, all-indented files);
+/// fine in practice because the inner scan stops at the first dedent.
 pub fn indent_folds(rope: &Rope, tab_width: usize) -> Vec<FoldRegion> {
     let n = rope.len_lines();
+    // Display-column indentation of a line, or `None` for a blank line.
     let indent_of = |line: usize| -> Option<usize> {
         if line_len_chars(rope, line) == 0 {
             return None;
@@ -118,6 +151,11 @@ pub fn indent_folds(rope: &Rope, tab_width: usize) -> Vec<FoldRegion> {
     finish(regions, rope)
 }
 
+/// Normalise raw `(start, end)` line pairs into the final region list:
+/// drop empty or out-of-range pairs, clamp `end` to the last line, keep only
+/// the widest region per start line, and compute nesting depth.
+///
+/// The output is sorted by start line, which the gutter relies on.
 fn finish(mut regions: Vec<(usize, usize)>, rope: &Rope) -> Vec<FoldRegion> {
     let last = rope.len_lines().saturating_sub(1);
     regions.retain(|(s, e)| e > s && *s <= last);
@@ -125,9 +163,13 @@ fn finish(mut regions: Vec<(usize, usize)>, rope: &Rope) -> Vec<FoldRegion> {
         r.1 = r.1.min(last);
     }
     // Outermost per start line.
+    // Sort by start ascending then end descending, so `dedup_by_key` keeps
+    // the longest region for each start line.
     regions.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     regions.dedup_by_key(|r| r.0);
     // Compute nesting depth with a stack of open regions.
+    // Regions are sorted by start, so popping every open region that ends
+    // before this one starts leaves exactly the enclosing regions on the stack.
     let mut out = Vec::with_capacity(regions.len());
     let mut stack: Vec<usize> = Vec::new();
     for (s, e) in regions {
@@ -147,6 +189,7 @@ mod tests {
     use apex_edit::Document;
     use std::time::Duration;
 
+    /// A three-line comment run folds as one region; nested blocks get increasing depth.
     #[test]
     fn rust_folds_blocks_and_comment_runs() {
         let src = "// a\n// b\n// c\nfn main() {\n    if x {\n        y();\n    }\n}\n";
@@ -158,6 +201,7 @@ mod tests {
         assert!(folds.contains(&FoldRegion { start: 4, end: 6, depth: 1 }), "{folds:?}");
     }
 
+    /// A blank line inside an indented block does not split the fold.
     #[test]
     fn indentation_folds() {
         let rope = Rope::from_str("a\n  b\n  c\n\n  d\ne\n");

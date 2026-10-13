@@ -1,41 +1,74 @@
 //! User settings with layered defaults. Stored as TOML in the config directory.
+//!
+//! [`Settings`] is a plain struct with a `Default` that is the documented
+//! default for every key. Loading is layered: `ApexApp` starts from
+//! `Settings::default()`, applies the user's `settings.toml` with
+//! [`Settings::load_file`], then the `[settings]` table of the project file
+//! (see `settings_ui.rs`, which also strips keys a project may not set).
+//! Each layer is parsed by [`Settings::parse_layer`], which never fails as a
+//! whole: unknown keys, wrong types and out-of-range values are reported as
+//! [`SettingsIssue`]s and the offending key keeps its previous value.
+//!
+//! Gotcha: `deny_unknown_fields` on the struct is what makes the round-trip
+//! test meaningful, but `parse_layer` filters unknown keys itself before
+//! deserialising so that one typo does not reject the whole file.
 
 use std::path::Path;
 
 use apex_edit::{IndentSettings, IndentStyle};
 use serde::{Deserialize, Serialize};
 
+/// When the editor draws spaces and tabs as visible glyphs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WhitespaceMode {
     None,
+    /// Only inside the selection.
     #[default]
     Selection,
     All,
 }
 
+/// Every user-tunable value. Field names are the TOML keys; see
+/// `settings_ui.rs` for the labels and help text shown in the panel.
+///
+/// Numeric fields have ranges enforced by `sanitise` (and mirrored by the
+/// panel's widgets). Mutated at runtime by the settings panel, by toggle
+/// commands (word wrap, Vim mode, ...) and by `reload_settings`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
+    /// Name of the colour theme (matches `Theme::name`).
     pub theme: String,
     /// `"auto"` switches between the dark and light variant of `theme` with the
     /// system preference; `"dark"` or `"light"` keeps `theme` as chosen.
     pub theme_mode: String,
+    /// Editor font family; `"monospace"` means the bundled font.
     pub font_family: String,
+    /// Editor font size in points (6–72).
     pub font_size: f32,
+    /// Font size for menus, sidebar and dialogs in points (8–40).
     pub ui_font_size: f32,
+    /// Line height as a multiple of the font size (0.8–3.0).
     pub line_height: f32,
     pub ligatures: bool,
+    /// egui zoom factor for the whole interface (0.5–3.0).
     pub ui_scale: f32,
 
+    /// Columns a tab character occupies (1–16).
     pub tab_width: usize,
+    /// Columns per indent level when indenting with spaces (1–16).
     pub indent_width: usize,
     pub use_tabs: bool,
+    /// Guess tabs/spaces and width from each file on open.
     pub detect_indentation: bool,
     pub auto_indent: bool,
     pub auto_pair: bool,
+    /// Backspace in leading whitespace removes one indent level.
     pub smart_backspace: bool,
+    /// Default for new views; `ToggleWordWrap` overrides per view.
     pub word_wrap: bool,
+    /// Wrap at this column; 0 wraps at the window edge.
     pub wrap_column: usize,
     pub line_numbers: bool,
     pub relative_line_numbers: bool,
@@ -44,9 +77,12 @@ pub struct Settings {
     pub highlight_word_occurrences: bool,
     pub show_whitespace: WhitespaceMode,
     pub indent_guides: bool,
+    /// Columns at which vertical ruler lines are drawn.
     pub rulers: Vec<usize>,
     pub minimap: bool,
+    /// Minimap width in pixels (20–400).
     pub minimap_width: f32,
+    /// Caret width in pixels (1–8).
     pub caret_width: f32,
     pub caret_blink: bool,
     pub scroll_past_end: bool,
@@ -60,12 +96,19 @@ pub struct Settings {
 
     pub trim_trailing_whitespace_on_save: bool,
     pub ensure_final_newline_on_save: bool,
+    /// Run the language server's formatter before saving.
     pub format_on_save: bool,
+    /// Idle time before an automatic save; 0 disables auto-save.
     pub auto_save_delay_ms: u64,
+    /// Snapshot unsaved changes for crash recovery.
     pub recovery: bool,
+    /// Interval between recovery snapshots.
     pub recovery_interval_ms: u64,
+    /// Reopen the previous session's files on start.
     pub restore_session: bool,
+    /// Encoding for new files (`"utf-8"`, `"utf-16le"`, ...).
     pub default_encoding: String,
+    /// Encoding tried when a file is not valid UTF-8.
     pub fallback_encoding: String,
     /// `"auto"`, `"lf"`, `"crlf"` or `"cr"` for new files.
     pub default_line_ending: String,
@@ -76,24 +119,32 @@ pub struct Settings {
     pub find_whole_word: bool,
     pub find_regex: bool,
 
+    /// Globs hidden from the explorer, Goto Anything and Find in Files.
     pub exclude_patterns: Vec<String>,
+    /// Globs opened in the hex preview rather than as text.
     pub binary_patterns: Vec<String>,
     pub follow_symlinks: bool,
     pub show_hidden_files: bool,
 
+    /// No animations or smooth scrolling.
     pub reduced_motion: bool,
+    /// Muted highlighting and quieter notifications.
     pub low_distraction: bool,
     pub muted_syntax: bool,
+    /// Text column width, in characters, in distraction-free mode (20–300).
     pub distraction_free_width: f32,
+    /// Keep the caret line vertically centred.
     pub typewriter_scrolling: bool,
     pub vim_mode: bool,
     pub spell_check: bool,
+    /// Hunspell dictionary code such as `en_GB`.
     pub spell_language: String,
     pub spell_in_comments: bool,
     pub spell_in_strings: bool,
     pub lsp_enabled: bool,
     /// Language id → server command (argv). Known servers found on PATH are used automatically.
     pub lsp_servers: std::collections::BTreeMap<String, Vec<String>>,
+    /// Files larger than this (MB) open in reduced-feature mode.
     pub large_file_mb: usize,
     pub git_gutter: bool,
     /// Use the system's file dialogs; off = an in-app path prompt.
@@ -106,11 +157,15 @@ pub struct Settings {
     pub git_pull_mode: String,
     /// Fetch in the background every N minutes (0 = never).
     pub git_auto_fetch_minutes: u64,
+    /// Show the completion popup while typing.
     pub completion: bool,
+    /// Delay after typing before the completion popup opens.
     pub completion_delay_ms: u64,
 }
 
 impl Default for Settings {
+    /// The documented defaults; also what `Reset all to defaults` restores
+    /// and what `write_setting` compares against to decide what to persist.
     fn default() -> Self {
         Self {
             theme: "Apex Dark".into(),
@@ -208,11 +263,14 @@ impl Default for Settings {
 /// A non-fatal problem found while loading settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsIssue {
+    /// Where it came from: a file path or a caller-supplied label.
     pub source: String,
     pub message: String,
 }
 
 impl Settings {
+    /// The indentation configuration documents start with, clamped to the
+    /// ranges the editor supports.
     pub fn indent(&self) -> IndentSettings {
         IndentSettings {
             style: if self.use_tabs { IndentStyle::Tabs } else { IndentStyle::Spaces },
@@ -223,6 +281,9 @@ impl Settings {
 
     /// Parse TOML on top of `base`. Unknown keys are reported as issues; the
     /// whole document is rejected only if it is not valid TOML.
+    ///
+    /// `source` labels the issues (normally the file path). Returns the
+    /// merged settings and every issue found, in file order.
     pub fn parse_layer(base: &Settings, src: &str, source: &str) -> (Settings, Vec<SettingsIssue>) {
         let mut issues = Vec::new();
         let table: toml::Table = match toml::from_str(src) {
@@ -244,6 +305,9 @@ impl Settings {
                     issues.push(SettingsIssue { source: source.into(), message: format!("unknown setting `{k}` ignored") });
                     continue;
                 }
+                // Type check against the base value's TOML type. An integer
+                // where a float is expected is accepted (`font_size = 14`),
+                // since TOML users rarely write `14.0`.
                 let expected = &known[&k];
                 if std::mem::discriminant(expected) != std::mem::discriminant(&v) && !(expected.is_float() && v.is_integer()) {
                     issues.push(SettingsIssue {
@@ -262,12 +326,16 @@ impl Settings {
                 (s, issues)
             }
             Err(e) => {
+                // Only reachable for a nested value of the right outer type
+                // but wrong shape (e.g. a non-string in `rulers`).
                 issues.push(SettingsIssue { source: source.into(), message: format!("could not apply settings: {e}") });
                 (base.clone(), issues)
             }
         }
     }
 
+    /// Clamp numeric fields into their supported ranges, recording an issue
+    /// for each one that had to change. Non-finite floats become the minimum.
     fn sanitise(&mut self, issues: &mut Vec<SettingsIssue>, source: &str) {
         let mut clamp = |name: &str, v: &mut f32, lo: f32, hi: f32| {
             if !v.is_finite() || *v < lo || *v > hi {
@@ -292,6 +360,8 @@ impl Settings {
         }
     }
 
+    /// Read `path` and layer it over `base`. A missing file is not an issue
+    /// (first run); any other read error is reported and `base` returned.
     pub fn load_file(base: &Settings, path: &Path) -> (Settings, Vec<SettingsIssue>) {
         match std::fs::read_to_string(path) {
             Ok(src) => Self::parse_layer(base, &src, &path.display().to_string()),
@@ -306,6 +376,7 @@ impl Settings {
     }
 }
 
+/// First line of a multi-line error message, for the status bar.
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").to_owned()
 }
@@ -314,6 +385,8 @@ fn first_line(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Unknown keys, wrong types, out-of-range values and invalid TOML each
+    /// produce an issue without losing the other settings.
     #[test]
     fn layering_and_diagnostics() {
         let base = Settings::default();
@@ -331,6 +404,7 @@ mod tests {
         assert_eq!(issues.len(), 1);
     }
 
+    /// `to_toml_string` output parses back to an identical struct.
     #[test]
     fn round_trips_through_toml() {
         let s = Settings::default();

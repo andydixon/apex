@@ -1,5 +1,20 @@
 //! Workspace-level behaviour of the application: folders, sidebar, file index,
 //! watcher, palette modes, Find in Files panel, sessions, recovery and macros.
+//!
+//! Everything here is `impl ApexApp`; the state lives on the app struct and
+//! this file groups the methods that deal with the workspace rather than a
+//! single editor. The main entry points are `poll_background` (once per frame,
+//! drains every background channel), `show_sidebar` / `show_bottom_panel` /
+//! `show_palette` / `show_workspace_dialog` (drawn by `ApexApp::update`), and
+//! `execute_workspace`, the command dispatcher for this module's commands
+//! (tried by `ApexApp::execute` after the editor-level handlers).
+//!
+//! Conventions: file-system changes made here go through `self.sidebar` so the
+//! tree updates immediately, and jumps that move the caret across files call
+//! `note_jump` first so Navigate Back works. Palette modes that preview as the
+//! user moves through the list save the view state in `palette.restore` and put
+//! it back on cancel. Session/recovery writes are driven by timers in
+//! `poll_background`.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -23,7 +38,9 @@ use crate::workspace::{Axis, Layout, PaneId};
 /// One recorded macro step.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum MacroStep {
+    /// A command with its optional argument, replayed through `execute`.
     Command(Command, Option<String>),
+    /// Typed text, replayed with `insert_text`.
     Insert(String),
 }
 
@@ -34,21 +51,31 @@ pub(crate) enum PromptKind {
     GitArg(Command, Option<String>),
     /// A typed path standing in for a file dialog (folder only = true).
     Path(Box<crate::file_dialogs::FileDialogKind>, bool),
+    /// Name of a file to create in the folder.
     NewFile(PathBuf),
+    /// Name of a folder to create in the folder.
     NewFolder(PathBuf),
+    /// Name under which to save `last_macro`.
     MacroName,
+    /// Mark name; `true` sets the mark, `false` jumps to it.
     MarkName(bool),
+    /// `start[,step]` for Insert Sequence.
     Sequence,
+    /// Delimiters for Surround With.
     Surround,
+    /// Path of the project file to write.
     SaveProject,
+    /// New symbol name for LSP rename.
     Rename,
 }
 
+/// Cap on the jump list; older entries are dropped from the front.
 const MAX_JUMPS: usize = 100;
 
 impl ApexApp {
     // ----- roots and index ----------------------------------------------------
 
+    /// Options for the background file index, from settings.
     pub(crate) fn walk_options(&self) -> WalkOptions {
         WalkOptions {
             exclude: self.settings.exclude_patterns.clone(),
@@ -59,6 +86,7 @@ impl ApexApp {
         }
     }
 
+    /// Options for the sidebar tree, from settings.
     pub(crate) fn tree_options(&self) -> TreeOptions {
         TreeOptions {
             show_hidden: self.settings.show_hidden_files,
@@ -67,6 +95,8 @@ impl ApexApp {
         }
     }
 
+    /// Add a folder to the workspace (canonicalised, deduplicated) and record
+    /// it as a recent project. Non-folders are rejected with a status message.
     pub(crate) fn add_root(&mut self, path: &Path) {
         let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if !path.is_dir() {
@@ -80,6 +110,7 @@ impl ApexApp {
         self.push_recent_project(&path);
     }
 
+    /// Remove a folder from the workspace and stop watching it.
     pub(crate) fn remove_root(&mut self, path: &Path) {
         self.roots.retain(|r| r != path);
         if let Some(w) = &mut self.watcher {
@@ -95,6 +126,8 @@ impl ApexApp {
         self.add_root(path);
     }
 
+    /// Propagate a change of roots: reset the sidebar, (re)start the watcher on
+    /// every root, restart the file index and drop the project symbol index.
     pub(crate) fn roots_changed(&mut self) {
         let opts = self.tree_options();
         self.sidebar.opts = opts;
@@ -116,6 +149,8 @@ impl ApexApp {
         self.symbol_scan = None;
     }
 
+    /// Start a fresh background scan of all roots (or clear the index when there
+    /// are none). The old scan handle is dropped; `poll_background` reads the new one.
     pub(crate) fn restart_index(&mut self) {
         if self.roots.is_empty() {
             self.index = FileIndex::default();
@@ -126,6 +161,7 @@ impl ApexApp {
         self.index_scan = Some(scan);
     }
 
+    /// Move `path` to the front of the recent projects list (capped at 20).
     pub(crate) fn push_recent_project(&mut self, path: &Path) {
         self.recent_projects.retain(|p| p != path);
         self.recent_projects.push_front(path.to_path_buf());
@@ -133,6 +169,8 @@ impl ApexApp {
     }
 
     /// Relative display path for a file under one of the roots.
+    /// With several roots the root's folder name is prefixed so paths stay
+    /// unambiguous; files outside every root are shown in full.
     pub(crate) fn display_path(&self, path: &Path) -> String {
         for r in &self.roots {
             if let Ok(rel) = path.strip_prefix(r) {
@@ -149,6 +187,12 @@ impl ApexApp {
     // ----- background polling ---------------------------------------------------
 
     /// Drain background channels. Called once per frame before commands run.
+    ///
+    /// Covers the file index and symbol scans, the file watcher (sidebar refresh,
+    /// external-change detection, Git dirtying, and a debounced index rescan),
+    /// Find in Files, every Git poller, tasks, and the recovery and session
+    /// timers. Requests a repaint shortly if anything is still in flight, so
+    /// progress shows without the UI spinning at full rate.
     pub(crate) fn poll_background(&mut self, ctx: &egui::Context) {
         let mut repaint = false;
         if let Some(scan) = &self.index_scan {
@@ -175,6 +219,8 @@ impl ApexApp {
             }
         }
         if let Some(w) = &mut self.watcher {
+            // The watcher delivers only after 300 ms of quiet, so a build touching
+            // hundreds of files produces one refresh rather than hundreds.
             if let Some(changes) = w.poll(Duration::from_millis(300)) {
                 if changes.overflow || changes.paths.len() > 50 {
                     self.sidebar.refresh_all();
@@ -183,6 +229,7 @@ impl ApexApp {
                         self.sidebar.refresh_path(p);
                     }
                 }
+                // Re-index 1.5 s after the last change, not on every change.
                 self.rescan_at = Some(Instant::now() + Duration::from_millis(1500));
                 self.check_external_changes();
                 self.git_mark_dirty();
@@ -210,6 +257,8 @@ impl ApexApp {
         if self.git_blame_poll() {
             repaint = true;
         }
+        // Periodic status refresh catches changes the watcher cannot see
+        // (e.g. operations in another tool that only touch .git).
         if self.git.has_repos() && self.last_git_tick.elapsed() >= Duration::from_secs(4) {
             self.last_git_tick = Instant::now();
             self.git_mark_dirty_status_only();
@@ -219,6 +268,7 @@ impl ApexApp {
             repaint = true;
         }
         self.tasks_refresh();
+        // Recovery snapshots at the configured interval, never faster than 1 s.
         if self.last_recovery.elapsed() >= Duration::from_millis(self.settings.recovery_interval_ms.max(1000)) {
             self.last_recovery = Instant::now();
             self.write_recovery_snapshots();
@@ -234,10 +284,15 @@ impl ApexApp {
 
     // ----- sidebar ---------------------------------------------------------------
 
+    /// Draw the sidebar: the folder tree and, when the Git panel is visible,
+    /// Source Control below it separated by a draggable divider. Reveals the
+    /// active file first if "follow active" is on, then applies the tree's actions.
     pub(crate) fn show_sidebar(&mut self, ui: &mut Ui) {
         let theme = self.theme.clone();
         let ui_font = self.settings.ui_font_size;
         let active_file = self.active_ids().and_then(|(_, d)| self.docs.get(&d)).and_then(|d| d.path.clone());
+        // Only reveal files under a root: revealing an outside file would fail
+        // and reset the selection every frame.
         if self.sidebar.follow_active
             && let Some(p) = &active_file
             && self.sidebar.selected.as_deref() != Some(p.as_path())
@@ -249,14 +304,20 @@ impl ApexApp {
             // Folders above, Source Control below, split by a draggable handle.
             let full = ui.available_rect_before_wrap();
             let frac = self.git.sc.split.clamp(0.15, 0.85);
+            // Source Control gets `frac` of the height but never less than 120 px
+            // nor so much that the tree drops below 80 px (on a tiny window the
+            // minimums win).
             let sc_h = (full.height() * frac).clamp(120.0_f32.min(full.height() * 0.5), (full.height() - 80.0).max(120.0));
             let split_y = full.max.y - sc_h;
             let top = egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, split_y - 2.0));
             let bottom = egui::Rect::from_min_max(egui::pos2(full.min.x, split_y + 2.0), full.max);
+            // Two child UIs with explicit rects and clips so each half scrolls
+            // independently and neither paints over the divider.
             let actions = ui.scope_builder(egui::UiBuilder::new().max_rect(top), |ui| {
                 ui.set_clip_rect(top.intersect(ui.clip_rect()));
                 self.sidebar.ui(ui, &theme, ui_font, active_file.as_deref())
             });
+            // A 6 px grab zone around the 1 px line is easier to hit.
             let handle = egui::Rect::from_min_max(egui::pos2(full.min.x, split_y - 3.0), egui::pos2(full.max.x, split_y + 3.0));
             let r = ui.interact(handle, ui.id().with("git-split"), egui::Sense::drag());
             if r.dragged() && full.height() > 0.0 {
@@ -270,6 +331,7 @@ impl ApexApp {
                 ui.set_clip_rect(bottom.intersect(ui.clip_rect()));
                 self.show_source_control(ui);
             });
+            // Claim the whole area so the parent layout accounts for it.
             ui.allocate_rect(full, egui::Sense::hover());
             actions.inner
         } else {
@@ -280,6 +342,8 @@ impl ApexApp {
         }
     }
 
+    /// Perform one action requested by the sidebar tree (open, create, rename,
+    /// delete, reveal, copy path, search in folder, root management).
     pub(crate) fn handle_sidebar_action(&mut self, ctx: &egui::Context, a: SidebarAction) {
         match a {
             SidebarAction::OpenPreview(p) => {
@@ -323,6 +387,10 @@ impl ApexApp {
     }
 
     /// Open a file as a preview tab (replacing the pane's current preview).
+    ///
+    /// If the file is already open anywhere, that view is focused and nothing
+    /// becomes a preview. The previous preview is closed only when it has no
+    /// unsaved edits.
     pub(crate) fn open_preview(&mut self, path: &Path) -> Option<ViewId> {
         let pane_id = self.active_pane;
         let already = self
@@ -349,6 +417,7 @@ impl ApexApp {
         Some(v)
     }
 
+    /// Turn a preview tab into an ordinary one (double-click, edit, explicit open).
     pub(crate) fn make_permanent(&mut self, v: ViewId) {
         for pane in self.panes.values_mut() {
             if pane.preview == Some(v) {
@@ -357,10 +426,13 @@ impl ApexApp {
         }
     }
 
+    /// Whether `v` is the preview tab of any pane.
     pub(crate) fn is_preview(&self, v: ViewId) -> bool {
         self.panes.values().any(|p| p.preview == Some(v))
     }
 
+    /// Create an empty file `dir/name`, reveal it in the sidebar and open it.
+    /// Rejects names with separators and existing paths with a status message.
     pub(crate) fn create_file(&mut self, dir: &Path, name: &str) {
         let name = name.trim();
         if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
@@ -372,6 +444,7 @@ impl ApexApp {
             self.set_status(format!("{} already exists", path.display()), true);
             return;
         }
+        // create_new fails rather than truncating if the file appeared meanwhile.
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(_) => {
                 self.sidebar.refresh_path(&path);
@@ -384,6 +457,7 @@ impl ApexApp {
         }
     }
 
+    /// Create folder `dir/name` and reveal it in the sidebar.
     pub(crate) fn create_folder(&mut self, dir: &Path, name: &str) {
         let name = name.trim();
         if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
@@ -400,6 +474,9 @@ impl ApexApp {
         }
     }
 
+    /// Rename `from` to `new_name` within its parent folder, re-pointing any
+    /// open documents at or under the old path so they keep saving to the right
+    /// place. Refuses to overwrite an existing path.
     pub(crate) fn rename_path(&mut self, from: &Path, new_name: &str) {
         let Some(parent) = from.parent() else { return };
         let to = parent.join(new_name);
@@ -426,6 +503,8 @@ impl ApexApp {
         }
     }
 
+    /// Copy a file to `name copy.ext` (then `name copy 2.ext`, …) beside it and
+    /// open the copy. Gives up silently after 1000 taken names.
     pub(crate) fn duplicate_path(&mut self, p: &Path) {
         let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
@@ -450,6 +529,10 @@ impl ApexApp {
         }
     }
 
+    /// Permanently delete a file or folder tree (no wastebasket). Open tabs for
+    /// deleted files are closed unless dirty, in which case the buffer is kept
+    /// and its on-disk identity cleared so the next save does not report an
+    /// external change.
     pub(crate) fn delete_path(&mut self, p: &Path) {
         let r = if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
         match r {
@@ -484,6 +567,8 @@ impl ApexApp {
 
     // ----- palette ---------------------------------------------------------------
 
+    /// Show the command palette with every command (editor-only ones hidden
+    /// when no editor is open), recently used commands boosted to the top.
     pub(crate) fn open_command_palette(&mut self) {
         let has_editor = self.active_view_id().is_some();
         let mut items = Vec::with_capacity(Command::ALL.len());
@@ -491,18 +576,23 @@ impl ApexApp {
             if c.needs_editor() && !has_editor {
                 continue;
             }
+            // Most recent command gets +40, decaying by 4 per place.
             let recent = self.recent_commands.iter().position(|r| r == c).map(|p| 40u32.saturating_sub(p as u32 * 4)).unwrap_or(0);
             items.push(PaletteItem {
                 label: format!("{}: {}", c.category().label(), c.name()),
                 detail: String::new(),
                 shortcut: self.keymap.shortcut_for(*c).unwrap_or_default(),
                 payload: Payload::Command(*c, None),
+                // Tiny tie-breaker so equal-score items keep their `ALL` order.
                 boost: recent + (Command::ALL.len() - i) as u32 / 100,
             });
         }
         self.palette.show_with(PaletteMode::Commands, items, "Command palette", "");
     }
 
+    /// Show Goto Anything: every indexed file (recent ones boosted), plus open
+    /// and recent files outside the roots. Highlighting an entry previews it,
+    /// so the current view state is saved for restore on cancel.
     pub(crate) fn open_goto_anything(&mut self, initial: &str) {
         self.remember_palette_restore();
         let mut items: Vec<PaletteItem> = Vec::with_capacity(self.index.files.len() + 16);
@@ -546,6 +636,8 @@ impl ApexApp {
         self.palette.show_with(PaletteMode::Anything, items, placeholder, initial);
     }
 
+    /// Save the active view's selections and scroll so `palette_cancel` can
+    /// undo any previewing the palette did while open.
     fn remember_palette_restore(&mut self) {
         self.palette_preview = None;
         if let Some(v) = self.active_view_id()
@@ -555,6 +647,8 @@ impl ApexApp {
         }
     }
 
+    /// Show the document symbol list (tree-sitter outline, indented by depth)
+    /// for the active file. Highlighting moves the caret; cancel restores it.
     pub(crate) fn open_symbol_palette(&mut self, initial: &str) {
         let Some((_, d)) = self.active_ids() else { return };
         self.remember_palette_restore();
@@ -577,6 +671,9 @@ impl ApexApp {
         self.palette.show_with(PaletteMode::Symbols, items, placeholder, initial);
     }
 
+    /// Show project-wide symbols from the background symbol index, starting
+    /// the scan on first use. The list may be empty while indexing; the
+    /// placeholder says so.
     pub(crate) fn open_project_symbol_palette(&mut self) {
         if self.symbol_scan.is_none() && !self.symbols.complete && !self.index.files.is_empty() {
             let files: Vec<PathBuf> = self.index.files.iter().map(|f| f.path.clone()).collect();
@@ -605,6 +702,10 @@ impl ApexApp {
         self.palette.show_with(PaletteMode::ProjectSymbols, items, placeholder, "");
     }
 
+    /// Show one of the simple list palettes (themes, languages, encodings,
+    /// line endings, recent files/projects, clipboard history, macros). Items
+    /// and placeholder depend on `mode`; `Themes` previews live so it saves the
+    /// restore state.
     pub(crate) fn open_list_palette(&mut self, mode: PaletteMode) {
         let items: Vec<PaletteItem> = match &mode {
             PaletteMode::Themes => self
@@ -626,6 +727,7 @@ impl ApexApp {
                     payload: Payload::Text("auto".into()),
                     boost: 1,
                 }];
+                // Injection-only grammars are not useful as a file's language.
                 v.extend(apex_syntax::languages().iter().filter(|l| l.id != "markdown_inline" && l.id != "regex").map(|l| PaletteItem {
                     label: l.name.to_string(),
                     detail: l.extensions.iter().take(4).map(|e| format!(".{e}")).collect::<Vec<_>>().join(" "),
@@ -709,11 +811,15 @@ impl ApexApp {
         self.palette.show_with(mode, items, placeholder, "");
     }
 
+    /// Draw the palette if open and act on its event: highlight (preview),
+    /// accept, free-text accept (`:line` in Goto Anything) or cancel. Also
+    /// switches Goto Anything into symbol/text mode when `@` or `#` is typed.
     pub(crate) fn show_palette(&mut self, ctx: &egui::Context) {
         if !self.palette.open {
             return;
         }
         // Operators of Goto Anything change the item set live.
+        // Only when nothing precedes the operator: `foo.rs@bar` is handled on accept.
         if self.palette.mode == PaletteMode::Anything
             && let Some((op, rest)) = self.palette.operator().map(|(o, r)| (o, r.to_string()))
         {
@@ -759,6 +865,8 @@ impl ApexApp {
     }
 
     /// `#text` operator: fuzzy search over the document's lines.
+    /// Reuses `PaletteMode::Symbols` so highlight/accept go to a line. Capped
+    /// at 100k lines.
     fn open_text_palette(&mut self, rest: &str) {
         let Some((_, d)) = self.active_ids() else { return };
         let Some(doc) = self.docs.get(&d) else { return };
@@ -788,6 +896,9 @@ impl ApexApp {
         self.palette.rescore();
     }
 
+    /// React to the highlighted palette item changing: preview files, move the
+    /// caret to symbols/lines, or apply a theme live. All of this is undone by
+    /// `palette_cancel`.
     fn palette_highlight(&mut self, _ctx: &egui::Context, p: Payload) {
         match p {
             Payload::File(path, _) if matches!(self.palette.mode, PaletteMode::Anything | PaletteMode::RecentFiles) => {
@@ -817,6 +928,9 @@ impl ApexApp {
         }
     }
 
+    /// Act on the accepted palette item according to the mode it was opened
+    /// in. LSP and snippet palettes get first refusal. Most branches end by
+    /// refocusing the editor.
     fn palette_accept(&mut self, ctx: &egui::Context, p: Payload, query: &str) {
         let mode = self.palette.mode.clone();
         let operator = self.palette.operator().map(|(o, r)| (o, r.to_string()));
@@ -837,6 +951,7 @@ impl ApexApp {
                 self.note_jump();
                 if let Some(v) = self.open_path(&path) {
                     self.make_permanent(v);
+                    // `file:12:3` opens the file and jumps.
                     if let Some((':', rest)) = operator
                         && let Some((l, c)) = crate::app::parse_line_col(&rest)
                     {
@@ -892,6 +1007,9 @@ impl ApexApp {
         }
     }
 
+    /// Close the palette and undo its previews: close a preview tab it opened
+    /// (if clean), revert a live theme preview, and restore the saved
+    /// selections and scroll of the originating view.
     fn palette_cancel(&mut self, ctx: &egui::Context) {
         let restore = self.palette.restore.take();
         let mode = self.palette.mode.clone();
@@ -923,6 +1041,8 @@ impl ApexApp {
     }
 
     /// Place the caret at a byte offset (or line start) and centre it.
+    /// `byte` beyond the document (e.g. `usize::MAX` from LSP locations) falls
+    /// back to the start of `line`. `preview` is currently unused.
     pub(crate) fn goto_byte(&mut self, v: ViewId, line: usize, byte: usize, preview: bool) {
         let Some(view) = self.views.get_mut(&v) else { return };
         let Some(doc) = self.docs.get(&view.doc) else { return };
@@ -935,6 +1055,10 @@ impl ApexApp {
 
     // ----- jump history -----------------------------------------------------------
 
+    /// Record the current position before a jump so Navigate Back can return.
+    /// Going forward from the middle of the list discards the entries after
+    /// the current position (browser-style). Consecutive identical positions
+    /// are not duplicated.
     pub(crate) fn note_jump(&mut self) {
         let Some((v, d)) = self.active_ids() else { return };
         let sels = self.views[&v].sels.clone();
@@ -949,6 +1073,9 @@ impl ApexApp {
         self.jump_pos = self.jumps.len();
     }
 
+    /// Navigate Back (`back`) or Forward through the jump list. Entries are
+    /// `(document, selections)`; an entry whose document is closed is skipped
+    /// silently. The target is focused and centred.
     pub(crate) fn jump(&mut self, back: bool) {
         if back {
             if self.jump_pos == self.jumps.len() {
@@ -981,6 +1108,8 @@ impl ApexApp {
 
     // ----- find in files ------------------------------------------------------------
 
+    /// Open the bottom panel on the Find tab and focus the query, seeding it
+    /// with `initial` or else the primary selection (if short and non-empty).
     pub(crate) fn open_find_in_files(&mut self, initial: Option<String>) {
         self.panel_open = true;
         self.panel_tab = crate::tasks_ui::PanelTab::Find;
@@ -996,6 +1125,10 @@ impl ApexApp {
         }
     }
 
+    /// Draw the bottom panel: the tab strip, then the selected tab. The Find
+    /// tab's actions are handled here: the empty-path sentinel starts a search,
+    /// other `Open`s jump to the match (in the next pane for Ctrl-click), and
+    /// the Replace button's flag opens the confirmation dialog.
     pub(crate) fn show_bottom_panel(&mut self, ui: &mut Ui) {
         use crate::tasks_ui::PanelTab;
         let theme = self.theme.clone();
@@ -1044,6 +1177,8 @@ impl ApexApp {
                 FifAction::Open { path, line, col, neighbour } => {
                     self.note_jump();
                     if neighbour {
+                        // Open beside the results' source: split if there is only
+                        // one pane, otherwise move to the next pane in visual order.
                         let ids = self.layout.pane_ids();
                         if ids.len() == 1 {
                             self.split_active(Axis::Horizontal);
@@ -1053,6 +1188,8 @@ impl ApexApp {
                     }
                     if let Some(v) = self.open_path(&path) {
                         self.make_permanent(v);
+                        // The search reports a byte column; goto_line_col wants a
+                        // 1-based char column, so convert through the rope.
                         let col_chars = self.docs.get(&self.views[&v].doc).map(|d| {
                             let rope = d.rope();
                             let ls = rope.line_to_byte(line.min(rope.len_lines().saturating_sub(1)));
@@ -1073,7 +1210,14 @@ impl ApexApp {
     }
 
     /// Perform the project-wide replacement after confirmation.
+    ///
+    /// Recompiles the pattern from the panel's options, then for each
+    /// non-excluded result file: dirty open documents are skipped, clean open
+    /// documents are edited in the editor (undoable) and saved, and files not
+    /// open are rewritten on disk by `replace_in_file`. Reports counts and
+    /// failures in the status bar and re-runs the search.
     pub(crate) fn apply_replace_in_files(&mut self) {
+        // Only the pattern fields matter to `compile`; the rest are placeholders.
         let req = apex_project::search::SearchRequest {
             roots: Vec::new(),
             pattern: self.fif.query.clone(),
@@ -1156,6 +1300,10 @@ impl ApexApp {
 
     // ----- session and recovery ----------------------------------------------------
 
+    /// Snapshot the workspace into a `Session`: roots, project file, recent
+    /// lists, find history, theme, zoom, and one window with its panes, tabs
+    /// (path or recovery id, selections, scroll, pinned, language override) and
+    /// layout tree. Untitled clean documents are left out.
     pub(crate) fn build_session(&self) -> Session {
         let pane_ids = self.layout.pane_ids();
         let mut panes = Vec::new();
@@ -1182,6 +1330,7 @@ impl ApexApp {
                 .collect();
             panes.push(PaneState { tabs, active: pane.active });
         }
+        // Pane ids are session-local; serialise leaves as indices into `pane_ids`.
         fn layout_state(l: &Layout, ids: &[PaneId]) -> LayoutState {
             match l {
                 Layout::Leaf(p) => LayoutState::Leaf { pane: ids.iter().position(|x| x == p).unwrap_or(0) },
@@ -1215,6 +1364,7 @@ impl ApexApp {
         }
     }
 
+    /// Write the session file if session restore is enabled; failures are logged.
     pub(crate) fn save_session(&mut self) {
         if !self.settings.restore_session {
             return;
@@ -1225,6 +1375,12 @@ impl ApexApp {
     }
 
     /// Restore a saved session. Returns true if any tab was restored.
+    ///
+    /// Roots that no longer exist are dropped. Tabs whose file is missing are
+    /// recreated from a recovery snapshot when one exists, otherwise skipped;
+    /// untitled tabs come back only from recovery. The layout tree is adopted
+    /// only if it references exactly the panes created, else panes are laid out
+    /// as columns. Empty panes (other than the first) are removed.
     pub(crate) fn restore_session(&mut self, s: Session) -> bool {
         let mut any = false;
         for r in &s.roots {
@@ -1304,6 +1460,8 @@ impl ApexApp {
                 pane.active = p.active.min(pane.tabs.len().saturating_sub(1));
             }
         }
+        // Inverse of `layout_state`; a split with fewer than two valid children
+        // collapses to its first child.
         fn layout_from(l: &LayoutState, ids: &[PaneId]) -> Option<Layout> {
             match l {
                 LayoutState::Leaf { pane } => ids.get(*pane).map(|p| Layout::Leaf(*p)),
@@ -1348,6 +1506,11 @@ impl ApexApp {
     }
 
     /// Snapshot dirty buffers whose revision changed since the last snapshot.
+    ///
+    /// Each document gets a stable recovery id on first snapshot
+    /// (`<unix time>-<doc id>` in hex). A document that is clean again has its
+    /// entry removed. The on-disk mtime is stored so the recovery dialog can
+    /// warn when the file changed after the snapshot.
     pub(crate) fn write_recovery_snapshots(&mut self) {
         if !self.settings.recovery {
             return;
@@ -1393,12 +1556,15 @@ impl ApexApp {
         }
     }
 
+    /// Delete the recovery entry for a document (after a save, reload or close).
     pub(crate) fn forget_recovery(&mut self, d: DocId) {
         if let Some((rid, _)) = self.recovery_ids.remove(&d) {
             RecoveryEntry::remove(&rid);
         }
     }
 
+    /// Bring a recovery snapshot back as an open, dirty document and focus it.
+    /// The entry stays on disk under the same id until the document is saved.
     pub(crate) fn restore_recovery_entry(&mut self, e: &RecoveryEntry) {
         let v = match &e.path {
             Some(p) => {
@@ -1446,6 +1612,7 @@ impl ApexApp {
 
     // ----- macros ----------------------------------------------------------------
 
+    /// Append a step to the macro being recorded, if any (capped at 10k steps).
     pub(crate) fn record_step(&mut self, step: MacroStep) {
         if let Some(rec) = &mut self.macro_recording
             && rec.len() < 10_000
@@ -1454,6 +1621,7 @@ impl ApexApp {
         }
     }
 
+    /// Start recording, or stop and keep the recording as `last_macro`.
     pub(crate) fn toggle_macro_recording(&mut self) {
         match self.macro_recording.take() {
             Some(steps) => {
@@ -1467,6 +1635,8 @@ impl ApexApp {
         }
     }
 
+    /// Replay steps against the active view. Refused while recording, which
+    /// would otherwise record the replay into itself.
     pub(crate) fn play_macro(&mut self, ctx: &egui::Context, steps: &[MacroStep]) {
         if self.macro_recording.is_some() {
             return;
@@ -1480,16 +1650,19 @@ impl ApexApp {
         }
     }
 
+    /// Replay a saved macro by name; unknown names do nothing.
     pub(crate) fn run_macro_named(&mut self, ctx: &egui::Context, name: &str) {
         if let Some(steps) = self.macros.get(name).cloned() {
             self.play_macro(ctx, &steps);
         }
     }
 
+    /// `<config>/macros.json`.
     pub(crate) fn macros_path(&self) -> PathBuf {
         self.config_dir.join("macros.json")
     }
 
+    /// Load saved macros at start-up; a missing or invalid file leaves them empty.
     pub(crate) fn load_macros(&mut self) {
         if let Ok(bytes) = std::fs::read(self.macros_path())
             && let Ok(m) = serde_json::from_slice::<std::collections::BTreeMap<String, Vec<MacroStep>>>(&bytes)
@@ -1498,6 +1671,7 @@ impl ApexApp {
         }
     }
 
+    /// Write all saved macros atomically, reporting failures in the status bar.
     pub(crate) fn save_macros(&mut self) {
         let _ = apex_project::paths::ensure_private_dir(&self.config_dir);
         match serde_json::to_vec_pretty(&self.macros) {
@@ -1512,10 +1686,15 @@ impl ApexApp {
 
     // ----- prompts -----------------------------------------------------------------
 
+    /// Show the single-line text prompt dialog; the answer goes to `prompt_accepted`.
     pub(crate) fn prompt(&mut self, title: &str, initial: &str, kind: PromptKind) {
         self.dialog = Some(Dialog::Prompt { title: title.into(), text: initial.into(), kind });
     }
 
+    /// Handle the text entered in a prompt according to its `kind`, then
+    /// refocus the editor. `Path` prompts validate the path against what the
+    /// stand-in dialog expects (folder, existing file, or a new file in an
+    /// existing folder for Save As) before handing it to `file_dialog_result`.
     pub(crate) fn prompt_accepted(&mut self, ctx: &egui::Context, kind: PromptKind, text: String) {
         match kind {
             PromptKind::NewFile(dir) => self.create_file(&dir, &text),
@@ -1542,6 +1721,8 @@ impl ApexApp {
             }
             PromptKind::Rename => self.execute(ctx, Command::LspRename, Some(text)),
             PromptKind::GitArg(cmd, extra) => {
+                // Git commands take one string argument; pack the extra value in
+                // with the separator git_branches knows how to split on.
                 let arg = match extra {
                     Some(e) => format!("{text}{}{e}", crate::git_branches::SEP),
                     None => text,
@@ -1589,6 +1770,9 @@ impl ApexApp {
 
     // ----- project files -------------------------------------------------------------
 
+    /// Write a `.apex-project` TOML file listing the roots relative to the
+    /// file, with commented examples for settings and tasks. Becomes the
+    /// current project file and a recent project.
     pub(crate) fn save_project_file(&mut self, path: &Path) {
         let path = if path.extension().is_none() { path.with_extension("apex-project") } else { path.to_path_buf() };
         let base = path.parent().unwrap_or(Path::new("."));
@@ -1607,6 +1791,10 @@ impl ApexApp {
         }
     }
 
+    /// Load a project file: replace the roots with its `folders` (relative to
+    /// the file; missing ones dropped), take its `[[tasks]]` as untrusted
+    /// project tasks, and layer its `[settings]` (filtered to project-safe
+    /// keys) over the current settings.
     pub(crate) fn open_project_file(&mut self, path: &Path) {
         let src = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -1657,6 +1845,14 @@ impl ApexApp {
 
     // ----- workspace dialogs ------------------------------------------------------------
 
+    /// Draw the modal dialog handled by this module and act on its buttons.
+    ///
+    /// `dialog` is a clone of `self.dialog` made by `show_dialogs`; each branch
+    /// either writes an updated copy back (still open, possibly with edited
+    /// text) or sets `self.dialog = None` (closed). Branches use a small integer
+    /// from the button row (1 = confirm, 2 = cancel, 0 = nothing) because the
+    /// closure cannot touch `self`. `show_dialogs` only routes the variants
+    /// matched here, so the catch-all arm is not reached in practice.
     pub(crate) fn show_workspace_dialog(&mut self, ctx: &egui::Context, dialog: Dialog) {
         match dialog {
             Dialog::ConfirmDelete(p) => {
@@ -1727,6 +1923,8 @@ impl ApexApp {
                 let r = egui::Modal::new(egui::Id::new("prompt")).show(ctx, |ui| {
                     ui.set_width(if path_mode.is_some() { 560.0 } else { 380.0 });
                     ui.label(&title);
+                    // Tab is consumed before the TextEdit sees it, so it completes
+                    // instead of moving focus.
                     let tab = path_mode.is_some() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
                     let mut candidates = Vec::new();
                     if let Some(folder) = path_mode
@@ -1735,6 +1933,8 @@ impl ApexApp {
                         let (t, c) = crate::file_dialogs::complete_path(&text, folder);
                         text = t;
                         candidates = c;
+                        // The candidate list must survive to later frames (the dialog
+                        // is rebuilt every frame), so it is parked in egui's temp data.
                         ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("path-candidates"), candidates.clone()));
                     } else if path_mode.is_some() {
                         candidates = ui.ctx().data(|d| d.get_temp::<Vec<String>>(egui::Id::new("path-candidates"))).unwrap_or_default();
@@ -1747,6 +1947,7 @@ impl ApexApp {
                         state.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
                         state.store(ui.ctx(), id);
                     }
+                    // Typing invalidates the candidate list.
                     if resp.changed() {
                         ui.ctx().data_mut(|d| d.remove::<Vec<String>>(egui::Id::new("path-candidates")));
                     }
@@ -1832,6 +2033,8 @@ impl ApexApp {
                 }
             }
             Dialog::Askpass { prompt, mut text, reply } => {
+                // Mask the field when git's prompt looks like it asks for a secret
+                // (substring match so "Password"/"password" both hit).
                 let secret = ["assword", "assphrase", "PIN", "token"].iter().any(|k| prompt.contains(k));
                 let mut done: Option<Option<String>> = None;
                 egui::Modal::new(egui::Id::new("askpass")).show(ctx, |ui| {
@@ -1856,6 +2059,8 @@ impl ApexApp {
                 }
                 match done {
                     Some(answer) => {
+                        // The git helper thread is blocked on this channel; `None`
+                        // tells it the user cancelled.
                         let _ = reply.send(answer);
                         self.dialog = None;
                     }
@@ -1882,6 +2087,8 @@ impl ApexApp {
                 match r.inner {
                     1 => {
                         self.dialog = None;
+                        // Re-run the command with the confirmation flag set so the
+                        // Git handler skips asking again.
                         self.git.ops.confirmed = true;
                         self.execute(ctx, then.0, then.1);
                         self.git.ops.confirmed = false;
@@ -1969,6 +2176,8 @@ impl ApexApp {
                         self.lsp_confirm_workspace_edit(&edit, false);
                     }
                     _ => {
+                        // Closing by other means still has to answer the server's
+                        // applyEdit request, or it waits forever.
                         if r.should_close() {
                             self.dialog = None;
                             self.lsp_confirm_workspace_edit(&edit, false);
@@ -1990,6 +2199,9 @@ impl ApexApp {
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                         for (i, e) in entries.iter().enumerate() {
                             ui.horizontal(|ui| {
+                                // Compare the file's current mtime with the one stored at
+                                // snapshot time; a difference means restoring may clobber
+                                // newer edits made elsewhere.
                                 let changed = e
                                     .path
                                     .as_ref()
@@ -2051,6 +2263,11 @@ impl ApexApp {
     }
 
     /// Commands handled by this module. Returns false if not handled.
+    ///
+    /// Covers folder/project management, sidebar file commands, palettes,
+    /// navigation history, the bottom panel, macros, recovery and the prompts
+    /// for commands that need an argument. Several arms match only when `arg`
+    /// is `None`: with an argument the same command is handled elsewhere.
     pub(crate) fn execute_workspace(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) -> bool {
         match cmd {
             Command::OpenFolderByPath => {
@@ -2063,6 +2280,7 @@ impl ApexApp {
                 self.show_file_dialog(spec, crate::file_dialogs::FileDialogKind::OpenFolder { replace: cmd == Command::OpenFolder });
             }
             Command::RemoveFolder => {
+                // Prefer the root containing the sidebar selection, else the last root.
                 let target =
                     self.sidebar.selected.clone().and_then(|s| self.roots.iter().find(|r| s.starts_with(r)).cloned()).or_else(|| self.roots.last().cloned());
                 if let Some(r) = target {
@@ -2203,6 +2421,8 @@ impl ApexApp {
         true
     }
 
+    /// At start-up, offer recovery snapshots that the session restore did not
+    /// already bring back, via `Dialog::Recovery`.
     pub(crate) fn startup_recovery_check(&mut self) {
         if self.settings.recovery && RecoveryEntry::exists_any() {
             let entries = RecoveryEntry::list();
@@ -2215,17 +2435,22 @@ impl ApexApp {
         }
     }
 
+    /// Alias of `is_preview` used by the tab strip.
     pub(crate) fn tab_is_preview(&self, v: ViewId) -> bool {
         self.is_preview(v)
     }
 }
 
+/// Format strings as a TOML array literal (`["a", "b"]`), using Rust's debug
+/// quoting which is TOML-compatible for ordinary paths.
 fn toml_array(items: &[String]) -> String {
     let inner: Vec<String> = items.iter().map(|s| format!("{s:?}")).collect();
     format!("[{}]", inner.join(", "))
 }
 
 /// Relative path from `base` to `target` using `..` where needed.
+/// Always uses `/` separators (for the project file) and returns `.` when
+/// the paths are equal.
 fn pathdiff_relative(base: &Path, target: &Path) -> String {
     let base: Vec<_> = base.components().collect();
     let target_c: Vec<_> = target.components().collect();
@@ -2241,6 +2466,7 @@ fn pathdiff_relative(base: &Path, target: &Path) -> String {
     if s.is_empty() { ".".into() } else { s }
 }
 
+/// Keeps otherwise-unused imports referenced; nothing calls this.
 #[allow(dead_code)]
 fn _unused(_: &VecDeque<Command>, _: Category, _: AfterClose) {}
 
@@ -2248,6 +2474,7 @@ fn _unused(_: &VecDeque<Command>, _: Category, _: AfterClose) {}
 mod tests {
     use super::*;
 
+    /// Child, sibling and identical paths, plus TOML array quoting.
     #[test]
     fn relative_paths() {
         assert_eq!(pathdiff_relative(Path::new("/a/b"), Path::new("/a/b/c")), "c");

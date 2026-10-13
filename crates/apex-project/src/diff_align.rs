@@ -1,6 +1,13 @@
 //! Alignment for the side-by-side diff view: the two texts as alternating
 //! equal and changed blocks of lines, word-level differences inside changed
 //! blocks, and line mapping between the sides for synchronised scrolling.
+//!
+//! Pure functions over strings; no I/O. The diff view in `apex-ui` calls
+//! `blocks` once per pair of texts, `word_spans` per visible changed block,
+//! and `map_line` every frame to keep the two scroll positions in step.
+//! Line and character indices are 0-based; ranges are half-open. All
+//! diffing uses the patience algorithm from the `similar` crate, which gives
+//! more readable results than Myers on code with repeated lines.
 
 use std::ops::Range;
 
@@ -9,12 +16,20 @@ use similar::{Algorithm, ChangeTag, DiffTag, TextDiff};
 /// A run of lines: equal on both sides, or changed (either side may be empty).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
+    /// Line range on the left (old) side.
     pub left: Range<usize>,
+    /// Line range on the right (new) side.
     pub right: Range<usize>,
+    /// False for an equal run; true for a replacement, pure insertion
+    /// (`left` empty) or pure deletion (`right` empty).
     pub changed: bool,
 }
 
 /// Blocks covering both texts completely, in order.
+///
+/// Consecutive blocks are contiguous on each side (`b[i].left.end ==
+/// b[i+1].left.start`, same for `right`), so the result partitions both
+/// texts. Two identical texts yield a single unchanged block.
 pub fn blocks(left: &str, right: &str) -> Vec<Block> {
     let diff = TextDiff::configure().algorithm(Algorithm::Patience).diff_lines(left, right);
     let mut out: Vec<Block> = Vec::new();
@@ -40,13 +55,22 @@ pub fn changes(blocks: &[Block]) -> impl Iterator<Item = &Block> {
 
 /// Map a (fractional) line on one side to the other side: proportional
 /// inside a block, so both sides stay aligned at block boundaries.
+///
+/// `from_left` selects the direction. Fractional input lets the caller map
+/// a scroll offset rather than a whole line. An empty source range (e.g. a
+/// pure insertion seen from the left) maps to the start of its destination
+/// range.
 pub fn map_line(blocks: &[Block], line: f32, from_left: bool) -> f32 {
     for b in blocks {
         let (src, dst) = if from_left { (&b.left, &b.right) } else { (&b.right, &b.left) };
         if line < src.end as f32 {
+            // Blocks are contiguous and start at 0, so a line before this
+            // block's start can only be negative; break to the fallback
+            // below rather than extrapolating backwards.
             if line < src.start as f32 {
                 break;
             }
+            // `max(1)` guards the empty-range case so we never divide by zero.
             let span = (src.end - src.start).max(1) as f32;
             let t = ((line - src.start as f32) / span).clamp(0.0, 1.0);
             return dst.start as f32 + t * (dst.end - dst.start) as f32;
@@ -60,6 +84,12 @@ pub fn map_line(blocks: &[Block], line: f32, from_left: bool) -> f32 {
 /// Character ranges (relative to each block's text) that differ by word
 /// inside a changed block with lines on both sides. Large blocks are left
 /// line-level only.
+///
+/// Offsets are in `char`s, not bytes, counted from the start of each block's
+/// text. Adjacent differing tokens are merged into one range. Whitespace-only
+/// insertions and deletions are not highlighted. Blocks over 64 KiB combined
+/// return empty vectors because token diffing large blocks is too slow for a
+/// per-frame view.
 pub fn word_spans(left_block: &str, right_block: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
     if left_block.is_empty() || right_block.is_empty() || left_block.len() + right_block.len() > 64 * 1024 {
         return (Vec::new(), Vec::new());
@@ -67,7 +97,9 @@ pub fn word_spans(left_block: &str, right_block: &str) -> (Vec<Range<usize>>, Ve
     let (lt, rt) = (tokens(left_block), tokens(right_block));
     let diff = TextDiff::configure().algorithm(Algorithm::Patience).diff_slices(&lt, &rt);
     let (mut l, mut r) = (Vec::new(), Vec::new());
+    // Running char offsets on each side.
     let (mut lc, mut rc) = (0usize, 0usize);
+    // Extend the previous range when the new one starts where it ended.
     let push = |v: &mut Vec<Range<usize>>, a: usize, b: usize| match v.last_mut() {
         Some(last) if last.end == a => last.end = b,
         _ => v.push(a..b),
@@ -81,6 +113,8 @@ pub fn word_spans(left_block: &str, right_block: &str) -> (Vec<Range<usize>>, Ve
                 rc += n;
             }
             ChangeTag::Delete => {
+                // Offsets advance even for blank tokens; only the highlight
+                // is skipped.
                 if !blank {
                     push(&mut l, lc, lc + n);
                 }
@@ -98,7 +132,11 @@ pub fn word_spans(left_block: &str, right_block: &str) -> (Vec<Range<usize>>, Ve
 }
 
 /// Identifier runs, whitespace runs and single other characters.
+///
+/// Splitting punctuation into single-character tokens means `foo(bar)` and
+/// `foo(baz)` differ only in the identifier, not the whole call.
 fn tokens(s: &str) -> Vec<&str> {
+    // 0 = identifier char, 1 = whitespace, 2 = anything else.
     let class = |c: char| {
         if c.is_alphanumeric() || c == '_' {
             0
@@ -113,6 +151,8 @@ fn tokens(s: &str) -> Vec<&str> {
     let mut prev: Option<u8> = None;
     for (i, c) in s.char_indices() {
         let k = class(c);
+        // Start a new token on a class change, and after every punctuation
+        // character (class 2 never forms runs).
         if let Some(p) = prev
             && (p != k || k == 2)
         {
@@ -131,6 +171,8 @@ fn tokens(s: &str) -> Vec<&str> {
 mod tests {
     use super::*;
 
+    /// Blocks partition both sides with no gaps, and pure insertions produce
+    /// an empty left range.
     #[test]
     fn blocks_cover_both_sides() {
         let l = "a\nb\nc\nd\ne\n";
@@ -156,6 +198,8 @@ mod tests {
         assert_eq!(blocks("", "new\n"), vec![Block { left: 0..0, right: 0..1, changed: true }]);
     }
 
+    /// Line mapping is exact at block boundaries, proportional inside blocks
+    /// and offset-preserving past the end.
     #[test]
     fn line_mapping() {
         let b = blocks("a\nb\nc\nd\ne\n", "a\nB\nc\nd\nx\ny\ne\n");
@@ -168,6 +212,8 @@ mod tests {
         assert_eq!(map_line(&b, 9.0, true), 11.0);
     }
 
+    /// Word spans are char offsets, skip whitespace-only changes and are
+    /// empty when one side is empty.
     #[test]
     fn word_level_spans() {
         let (l, r) = word_spans("let x = old_value;\n", "let x = new_value;\n");

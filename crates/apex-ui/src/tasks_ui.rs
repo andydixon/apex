@@ -1,5 +1,19 @@
 //! Build tasks in the application: task discovery, running, the output and
 //! problems panels, and workspace trust.
+//!
+//! The process handling lives in `apex_project::tasks`; this module owns the
+//! app-side state (`TasksUi`, held as `app.tasks`) and the UI. Data flow:
+//! `tasks_refresh` (every frame, cheap when roots are unchanged) builds the
+//! task list from detection, `<config>/tasks.toml` and the project file;
+//! `run_task` saves all files, spawns the process and switches the bottom
+//! panel to Output; `tasks_poll` (from `poll_background`) drains the task's
+//! event channel into `output` and `problems`; `show_output_panel` and
+//! `show_problems_panel` are drawn by `show_bottom_panel` in `workspace_ui.rs`.
+//!
+//! Project-defined tasks run arbitrary programs, so they are gated on the
+//! `TrustStore`: the first attempt opens `Dialog::Trust`, which re-issues the
+//! command once trust is granted. The problems list merges task output with
+//! language-server diagnostics through `all_problems`.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -12,6 +26,8 @@ use crate::app::{ApexApp, Dialog};
 use crate::command::Command;
 use crate::palette::{PaletteItem, PaletteMode, Payload};
 
+/// Which tab of the bottom panel is showing. Owned by `ApexApp::panel_tab`;
+/// lives here because most tabs belong to tasks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelTab {
     #[default]
@@ -21,18 +37,30 @@ pub enum PanelTab {
     Git,
 }
 
+/// Task state kept on the app.
 #[derive(Default)]
 pub struct TasksUi {
+    /// The current task list, rebuilt by `tasks_refresh`.
     pub defs: Vec<TaskDef>,
+    /// Index into `defs` of the task Build runs by default.
     pub selected: Option<usize>,
+    /// The process in flight; dropping it kills the process.
     pub running: Option<RunningTask>,
+    /// Output lines shown in the panel, capped at `MAX_OUTPUT_LINES`.
     pub output: VecDeque<String>,
+    /// Problems parsed from the current/last run's output by its matcher.
     pub problems: Vec<Problem>,
+    /// `(task name, exit code, elapsed, timed out, killed)` of the last finished run.
     pub last_exit: Option<(String, Option<i32>, Duration, bool, bool)>,
+    /// Position in `all_problems()` for Next/Previous Problem; also highlights the row.
     pub problem_index: Option<usize>,
+    /// One-frame request to keep the output scrolled to the end.
     pub scroll_to_bottom: bool,
+    /// Tasks from the project file, appended to `defs` on refresh.
     pub project_tasks: Vec<TaskDef>,
+    /// Index of the task last started, for Build Rerun.
     pub last_run: Option<usize>,
+    /// Roots `defs` was detected for; refresh is skipped while they match.
     detected_for: Vec<PathBuf>,
 }
 
@@ -40,14 +68,18 @@ pub struct TasksUi {
 #[derive(Default)]
 pub struct TrustStore {
     trusted: HashSet<PathBuf>,
+    /// Whether `trusted` has been read from disk yet (loaded lazily).
     loaded: bool,
 }
 
 impl TrustStore {
+    /// `<data dir>/trusted.json`.
     fn path() -> PathBuf {
         apex_project::paths::data_dir().join("trusted.json")
     }
 
+    /// Read the list from disk once; a missing or unreadable file means nothing
+    /// is trusted.
     fn load(&mut self) {
         if self.loaded {
             return;
@@ -60,6 +92,7 @@ impl TrustStore {
         }
     }
 
+    /// Write the list atomically to a private directory; errors are ignored.
     fn save(&self) {
         let p = Self::path();
         let _ = p.parent().map(apex_project::paths::ensure_private_dir);
@@ -68,11 +101,13 @@ impl TrustStore {
         }
     }
 
+    /// Whether `root` or any ancestor of it has been trusted.
     pub fn is_trusted(&mut self, root: &Path) -> bool {
         self.load();
         self.trusted.iter().any(|t| root.starts_with(t))
     }
 
+    /// Trust `root` and persist the list.
     pub fn trust(&mut self, root: &Path) {
         self.load();
         self.trusted.insert(root.to_path_buf());
@@ -82,6 +117,11 @@ impl TrustStore {
 
 impl ApexApp {
     /// Rebuild the task list from detection, user tasks and (trusted) project tasks.
+    ///
+    /// Called every frame; returns early while the roots are unchanged and the
+    /// list is non-empty. `set_project_tasks` clears `detected_for` to force a
+    /// rebuild. Order: detected (Cargo, Make, …), then `<config>/tasks.toml`,
+    /// then project tasks.
     pub(crate) fn tasks_refresh(&mut self) {
         if self.tasks.detected_for == self.roots && !self.tasks.defs.is_empty() {
             return;
@@ -104,6 +144,7 @@ impl ApexApp {
         }
         defs.extend(self.tasks.project_tasks.iter().cloned());
         self.tasks.defs = defs;
+        // The selection may point past the end of a shorter list.
         if self.tasks.selected.is_some_and(|i| i >= self.tasks.defs.len()) {
             self.tasks.selected = None;
         }
@@ -114,6 +155,7 @@ impl ApexApp {
         self.tasks.project_tasks = tasks
             .into_iter()
             .map(|mut t| {
+                // Source is forced so trust checks cannot be bypassed from the file.
                 t.source = TaskSource::Project;
                 t
             })
@@ -121,9 +163,13 @@ impl ApexApp {
         self.tasks.detected_for.clear();
     }
 
+    /// Drain the running task's events into `output` and `problems`. Returns
+    /// true if the panel should repaint soon. On exit, records `last_exit`,
+    /// clears `running` and summarises the result in the status bar.
     pub(crate) fn tasks_poll(&mut self) -> bool {
         let Some(t) = &self.tasks.running else { return false };
         let mut got = false;
+        // Bounded per frame so a chatty build cannot stall the UI.
         for _ in 0..512 {
             match t.rx.try_recv() {
                 Ok(TaskEvent::Line(l)) => {
@@ -167,6 +213,10 @@ impl ApexApp {
         got || self.tasks.running.is_some()
     }
 
+    /// Start task `index` of `defs` in the first root (or the current file's
+    /// folder). Project tasks need trust first: shows `Dialog::Trust` with this
+    /// command as its continuation and returns. Otherwise cancels any running
+    /// task, saves all files, resets the output/problems and opens the Output tab.
     pub(crate) fn run_task(&mut self, index: usize, ctx: &egui::Context) {
         let Some(def) = self.tasks.defs.get(index).cloned() else { return };
         let root = self.roots.first().cloned().or_else(|| self.current_dir()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -202,6 +252,12 @@ impl ApexApp {
         }
     }
 
+    /// Handle task-related commands. Returns false if `cmd` is not one of them.
+    ///
+    /// `Build` takes an optional task index as `arg` (used by the trust dialog's
+    /// continuation), else the selected task, else the first, else opens the
+    /// picker. `BuildSelect` also offers a file-specific task (e.g. run this
+    /// script) appended to `defs` for the active document.
     pub(crate) fn tasks_command(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) -> bool {
         match cmd {
             Command::BuildSelect => {
@@ -224,12 +280,15 @@ impl ApexApp {
                         ),
                         shortcut: String::new(),
                         payload: Payload::Index(i),
+                        // Float the currently selected task to the top.
                         boost: (self.tasks.selected == Some(i)) as u32,
                     })
                     .collect();
                 if let Some(p) = self.active_ids().and_then(|(_, d)| self.docs.get(&d)).and_then(|d| d.path.clone())
                     && let Some(t) = tasks::task_for_file(&p)
                 {
+                    // Pushed onto `defs` so the palette index resolves; the next
+                    // refresh with changed roots drops it again.
                     self.tasks.defs.push(t.clone());
                     items.push(PaletteItem {
                         label: t.name.clone(),
@@ -265,6 +324,7 @@ impl ApexApp {
                     self.set_status("No task is running".into(), false);
                 }
             }
+            // Show* toggles: close the panel if that tab is already showing.
             Command::ShowOutput => {
                 self.panel_open = !(self.panel_open && self.panel_tab == PanelTab::Output);
                 self.panel_tab = PanelTab::Output;
@@ -280,6 +340,8 @@ impl ApexApp {
                     return true;
                 }
                 let n = all.len();
+                // Wrap around in both directions; start from the first/last when
+                // nothing is selected yet.
                 let i = match (self.tasks.problem_index, cmd) {
                     (None, Command::NextDiagnostic) => 0,
                     (None, _) => n - 1,
@@ -303,6 +365,9 @@ impl ApexApp {
     }
 
     /// Task problems plus language-server diagnostics, in file order.
+    ///
+    /// Sorted by file then line and de-duplicated on (file, line, message), so
+    /// a compiler error reported by both the build and the server shows once.
     pub(crate) fn all_problems(&self) -> Vec<Problem> {
         let mut v: Vec<Problem> = self.tasks.problems.clone();
         v.extend(self.lsp_problems());
@@ -311,6 +376,8 @@ impl ApexApp {
         v
     }
 
+    /// Open the problem's file as a permanent tab at its line/column (1-based),
+    /// focus the editor and show the message in the status bar.
     pub(crate) fn goto_problem(&mut self, p: &Problem, ctx: &egui::Context) {
         self.note_jump();
         if let Some(v) = self.open_path(&p.file) {
@@ -321,6 +388,9 @@ impl ApexApp {
         }
     }
 
+    /// Draw the Output tab: a toolbar (task name, timer, Cancel/Run, Select,
+    /// Clear, error/warning counts) and the virtualised output with clickable
+    /// `file:line:col` references. Clicking one opens the location.
     pub(crate) fn show_output_panel(&mut self, ui: &mut Ui) {
         let theme = self.theme.clone();
         let ui_font = self.settings.ui_font_size;
@@ -333,6 +403,8 @@ impl ApexApp {
             if let Some(r) = &self.tasks.running {
                 ui.spinner();
                 ui.label(egui::RichText::new(format!("{:.1}s", r.started.elapsed().as_secs_f32())).color(theme.ui.text_muted));
+                // Buttons queue commands for the app's next command pass rather
+                // than executing mid-draw (`r` borrows `self.tasks` here).
                 if ui.button("Cancel").clicked() {
                     self.queue.push_back((Command::BuildCancel, None));
                 }
@@ -362,10 +434,13 @@ impl ApexApp {
         let mut open: Option<(PathBuf, usize, usize)> = None;
         let root = self.roots.first().cloned().unwrap_or_default();
         let area = egui::ScrollArea::both().auto_shrink([false, false]).id_salt("apex-output").stick_to_bottom(self.tasks.scroll_to_bottom);
+        // Follow the output while the task runs; once it has finished the user
+        // can scroll freely (the flag is set again by the next poll with lines).
         self.tasks.scroll_to_bottom = self.tasks.running.is_some();
         area.show_rows(ui, row_h, n, |ui, range| {
             for i in range {
                 let line = &self.tasks.output[i];
+                // Heuristic colouring: "0 errors" summary lines are not errors.
                 let is_err = line.contains("error") && !line.contains("0 errors");
                 let colour = if line.starts_with('[') {
                     theme.ui.text_muted
@@ -386,6 +461,7 @@ impl ApexApp {
                     let resp = ui.add(egui::Label::new(egui::RichText::new(line).font(mono.clone()).color(colour).underline()).sense(egui::Sense::click()));
                     if resp.clicked() {
                         let p = PathBuf::from(file);
+                        // Relative paths in tool output are relative to the first root.
                         let p = if p.is_absolute() { p } else { root.join(p) };
                         open = Some((p, l, c));
                     }
@@ -395,6 +471,7 @@ impl ApexApp {
                 }
             }
         });
+        // Deferred until after the closure, which borrows `self.tasks.output`.
         if let Some((p, l, c)) = open {
             self.note_jump();
             if let Some(v) = self.open_path(&p) {
@@ -405,6 +482,9 @@ impl ApexApp {
         }
     }
 
+    /// Draw the Problems tab: one painted row per problem from `all_problems`
+    /// (E/W marker, location, message), highlighting `problem_index`. Clicking a
+    /// row jumps to it and makes it the current problem for Next/Previous.
     pub(crate) fn show_problems_panel(&mut self, ui: &mut Ui) {
         let theme = self.theme.clone();
         let ui_font = self.settings.ui_font_size;
@@ -433,6 +513,8 @@ impl ApexApp {
                     egui::FontId::proportional(ui_font),
                     theme.ui.accent,
                 );
+                // Estimate the location's width (0.55 em per char) instead of laying
+                // it out twice; the message starts after it.
                 let w = loc.len() as f32 * ui_font * 0.55 + 36.0;
                 ui.painter().text(
                     rect.min + egui::vec2(w, row_h / 2.0),
@@ -454,12 +536,16 @@ impl ApexApp {
     }
 }
 
+/// Shape of `<config>/tasks.toml`: a `[[tasks]]` array.
 #[derive(serde::Deserialize)]
 struct TaskFile {
     #[serde(default)]
     tasks: Vec<TaskDef>,
 }
 
+/// Regex for `path:line[:col]` references in tool output. The path is either
+/// a Windows drive path or a token containing a dot (so `error:` and times
+/// such as `12:30` are not mistaken for locations). Compiled once.
 fn location_regex() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"([A-Za-z]:[\\/][^:\s]+|[^\s:]+\.[A-Za-z0-9]+):(\d+)(?::(\d+))?").expect("valid regex"))

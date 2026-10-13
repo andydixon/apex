@@ -5,6 +5,19 @@
 //! together, changed lines and words are tinted, and a strip between them
 //! links each change, with buttons to revert it into the working copy or to
 //! stage/unstage it.
+//!
+//! How it fits: `ApexApp::diffs` maps the left (tab) view id to a
+//! `DiffState` that names the right view, the `DiffSource` and the caches.
+//! The workspace calls `show_diff` instead of `show_view` for such a tab;
+//! `show_diff` renders both sides with the normal editor widget, passing
+//! line and span tints computed by `apex_project::diff_align` and cached by
+//! the pair of document revisions. Scroll synchronisation maps the leading
+//! side's top line through the alignment blocks each frame. Staging from
+//! the strip reuses `git_stage_ranges` in `git_ops.rs`; reverting is an
+//! ordinary undoable edit on the right document.
+//!
+//! Gotcha: the right view belongs to no pane, so pane bookkeeping (closing
+//! the tab, focus) must handle it through `diff_tab_of` and `DiffState`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,20 +44,34 @@ pub enum DiffSource {
     Revision { workdir: PathBuf, path: PathBuf, head: bool },
 }
 
+/// Alignment and tints for one pair of document revisions.
 struct Computed {
+    /// Aligned blocks of both sides, changed and unchanged, in order.
     blocks: Vec<Block>,
+    /// Whole-line background tints of the left side, sorted by line.
     left_lines: Vec<(usize, Color32)>,
+    /// Whole-line background tints of the right side, sorted by line.
     right_lines: Vec<(usize, Color32)>,
+    /// Changed-word tints of the left side as char ranges.
     left_spans: Vec<(std::ops::Range<usize>, Color32)>,
+    /// Changed-word tints of the right side as char ranges.
     right_spans: Vec<(std::ops::Range<usize>, Color32)>,
 }
 
+/// Per-tab state of a side-by-side diff, keyed by the left view's id in
+/// `ApexApp::diffs`.
 pub struct DiffState {
+    /// The view showing the right side; it is in no pane.
     pub right_view: ViewId,
+    /// Which side has keyboard focus (the tab's view is the left side).
     pub right_focused: bool,
+    /// What is being compared, for refresh and the strip's buttons.
     pub source: DiffSource,
+    /// Header text over the left side.
     pub left_label: String,
+    /// Header text over the right side.
     pub right_label: String,
+    /// Cached alignment: (left revision, right revision, result).
     computed: Option<(u64, u64, Arc<Computed>)>,
     /// Scroll positions last frame, to tell which side the user scrolled.
     last: Option<(usize, f32, usize, f32)>,
@@ -67,9 +94,12 @@ fn unchanged_folds(blocks: &[Block], left: bool) -> Vec<(usize, usize)> {
         .filter(|(_, b)| !b.changed)
         .filter_map(|(i, b)| {
             let r = if left { &b.left } else { &b.right };
+            // The fold's first line stays visible, so it is the last context line
+            // (hence `- 1`); at the top of the file there is no change above to keep context for.
             let start = if r.start == 0 { 0 } else { r.start + CONTEXT - 1 };
             // The last block runs to the end of the file: no context needed after it.
             let end = if i + 1 == n { r.end.saturating_sub(1) } else { r.end.saturating_sub(CONTEXT) };
+            // Folding fewer than two lines gains nothing.
             (end > start + 2).then_some((start, end))
         })
         .collect()
@@ -80,6 +110,7 @@ fn visual_row(folds: &[(usize, usize)], line: usize) -> f32 {
     let mut hidden = 0usize;
     let mut l = line;
     for &(a, b) in folds {
+        // A hidden line is drawn at its fold's first line.
         if l > a && l < b {
             l = a;
         }
@@ -93,10 +124,13 @@ fn visual_row(folds: &[(usize, usize)], line: usize) -> f32 {
 /// Line tints and span tints for one side of a diff.
 pub type Tints<'a> = (&'a [(usize, Color32)], &'a [(std::ops::Range<usize>, Color32)]);
 
+/// `c` with its alpha replaced by `a`.
 fn tint(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
+/// Align the two texts and derive line and word tints. `del` and `add`
+/// are the theme's deleted/added colours.
 fn compute(left: &Document, right: &Document, del: Color32, add: Color32) -> Computed {
     let (lt, rt) = (left.text(), right.text());
     let blocks = diff_align::blocks(&lt, &rt);
@@ -105,6 +139,8 @@ fn compute(left: &Document, right: &Document, del: Color32, add: Color32) -> Com
     for b in diff_align::changes(&c.blocks) {
         c.left_lines.extend(b.left.clone().map(|l| (l, tint(del, 38))));
         c.right_lines.extend(b.right.clone().map(|l| (l, tint(add, 38))));
+        // Word diff only for modifications of modest size: pure insertions or
+        // deletions have nothing to pair, and huge blocks would be slow and noisy.
         if b.left.is_empty() || b.right.is_empty() || b.left.len() + b.right.len() > 400 {
             continue;
         }
@@ -125,6 +161,11 @@ fn compute(left: &Document, right: &Document, del: Color32, add: Color32) -> Com
 impl ApexApp {
     /// Open a side-by-side diff tab. `right` is an existing document (the
     /// editable side) or a text shown read-only.
+    ///
+    /// Creates the read-only left document in a new tab, a right view
+    /// outside any pane (and, for `Err`, a read-only right document), turns
+    /// wrapping off on both, registers the `DiffState`, focuses the tab and
+    /// jumps to the first change.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_side_by_side(
         &mut self,
@@ -136,6 +177,7 @@ impl ApexApp {
         right_label: &str,
         source: DiffSource,
     ) {
+        // The left side takes the right side's language so both highlight alike.
         let (right_doc, language) = match right {
             Ok(d) => (d, self.language_of(d).id.to_string()),
             Err((text, hint)) => {
@@ -158,6 +200,7 @@ impl ApexApp {
         let tab = self.add_document(left);
         let rev = self.docs.get(&right_doc).map(|d| d.revision()).unwrap_or(0);
         let mut rv = View::new(right_doc, rev);
+        // Wrapping would break the row-for-row alignment of the two sides.
         rv.word_wrap = Some(false);
         let right_view = rv.id;
         self.views.insert(right_view, rv);
@@ -185,6 +228,10 @@ impl ApexApp {
     }
 
     /// The document for `path` without leaving a new tab open.
+    ///
+    /// Reuses an open document; otherwise opens the file through the normal
+    /// path (so encoding, language and watchers are set up) and then removes
+    /// the tab and view it created, keeping only the document.
     pub(crate) fn doc_for_path(&mut self, path: &std::path::Path) -> Option<DocId> {
         let norm = crate::app::normalise_path(path);
         if let Some(d) = self.docs.iter().find(|(_, d)| d.path.as_ref() == Some(&norm)).map(|(id, _)| *id) {
@@ -199,6 +246,8 @@ impl ApexApp {
         Some(d)
     }
 
+    /// The alignment for a diff tab, recomputed when either document's
+    /// revision changed since the cached result.
     fn diff_computed(&mut self, tab: ViewId) -> Option<Arc<Computed>> {
         let ld = self.views.get(&tab)?.doc;
         let st = self.diffs.get(&tab)?;
@@ -215,6 +264,9 @@ impl ApexApp {
         Some(c)
     }
 
+    /// Paint a diff tab into `rect`: header, both editor views and the
+    /// connector strip; then apply strip actions, navigation, fold toggling
+    /// and scroll synchronisation.
     pub(crate) fn show_diff(&mut self, ui: &mut Ui, pane_id: PaneId, tab: ViewId, rect: Rect) {
         let Some(c) = self.diff_computed(tab) else { return };
         self.diff_apply_folds(tab, &c.blocks);
@@ -227,6 +279,7 @@ impl ApexApp {
         let font = crate::editor::font_for(&self.settings, self.font_zoom);
         let (lh, _) = crate::editor::metrics(ui.ctx(), &font, self.settings.line_height);
 
+        // Layout: header across the top, then left | strip | right.
         let header_h = 24.0;
         let strip_w = 44.0;
         let half = ((rect.width() - strip_w) / 2.0).max(50.0);
@@ -245,8 +298,10 @@ impl ApexApp {
         let rp = ui.painter_at(Rect::from_min_max(pos2(right_rect.min.x, header.min.y), pos2(header.max.x - 340.0, header.max.y)));
         rp.text(pos2(right_rect.min.x + 8.0, header.center().y), egui::Align2::LEFT_CENTER, &right_label, small.clone(), theme.ui.text_muted);
         let n = diff_align::changes(&c.blocks).count();
+        // Button results are applied after both views are drawn (they borrow `self`).
         let mut nav: Option<bool> = None;
         let mut unified = false;
+        // Right-to-left child UI so the buttons hug the right edge in reverse order.
         let mut hdr = ui.new_child(egui::UiBuilder::new().max_rect(header.shrink2(vec2(6.0, 2.0))).layout(egui::Layout::right_to_left(egui::Align::Center)));
         if hdr.small_button("Unified").on_hover_text("Open the same comparison as a unified diff").clicked() {
             unified = true;
@@ -270,6 +325,7 @@ impl ApexApp {
                 .size(self.settings.ui_font_size - 1.0),
         );
 
+        // Only the focused side of the active pane shows an active caret.
         let active = pane_id == self.active_pane;
         self.show_view(ui, pane_id, tab, left_rect, active && !right_focused, Some((&c.left_lines, &c.left_spans)), Some((tab, false)));
         self.show_view(ui, pane_id, right_view, right_rect, active && right_focused, Some((&c.right_lines, &c.right_spans)), Some((tab, true)));
@@ -282,6 +338,7 @@ impl ApexApp {
         let right_editable = self.views.get(&right_view).and_then(|v| self.docs.get(&v.doc)).is_some_and(|d| !d.read_only);
         let painter = ui.painter_at(strip);
         painter.rect_filled(strip, 0.0, theme.editor.gutter_background);
+        // Convert document lines to y positions, accounting for folds and each side's scroll.
         let lfolds = self.views.get(&tab).and_then(|v| self.docs.get(&v.doc).map(|d| v.folds(d))).unwrap_or_default();
         let rfolds = self.views.get(&right_view).and_then(|v| self.docs.get(&v.doc).map(|d| v.folds(d))).unwrap_or_default();
         let (ltop_row, rtop_row) = (visual_row(&lfolds, ltop as usize), visual_row(&rfolds, rtop as usize));
@@ -291,6 +348,7 @@ impl ApexApp {
         for (i, b) in c.blocks.iter().enumerate().filter(|(_, b)| b.changed) {
             let (l0, l1) = (yl(b.left.start), yl(b.left.end));
             let (r0, r1) = (yr(b.right.start), yr(b.right.end));
+            // Skip links entirely above or below the strip.
             if (l1 < strip.min.y && r1 < strip.min.y) || (l0 > strip.max.y && r0 > strip.max.y) {
                 continue;
             }
@@ -301,6 +359,8 @@ impl ApexApp {
             } else {
                 theme.editor.git_modified
             };
+            // A quadrilateral joining the block's extent on both sides; at least 1 px tall
+            // so a pure insertion/deletion still shows as a sliver.
             let pts = vec![pos2(strip.min.x, l0), pos2(strip.max.x, r0), pos2(strip.max.x, r1.max(r0 + 1.0)), pos2(strip.min.x, l1.max(l0 + 1.0))];
             painter.add(egui::Shape::convex_polygon(pts, tint(colour, 45), Stroke::new(1.0, tint(colour, 160))));
             // Buttons sit at the middle of the link.
@@ -322,6 +382,7 @@ impl ApexApp {
                 _ => {}
             }
         }
+        // Claim the strip so clicks on it do not fall through to whatever is behind.
         let _ = ui.interact(strip, ui.id().with(("diff-strip", tab.0)), Sense::hover());
         if let Some((i, revert)) = action
             && let Some(b) = c.blocks.get(i).cloned()
@@ -340,6 +401,7 @@ impl ApexApp {
         }
         if toggle_folds && let Some(st) = self.diffs.get_mut(&tab) {
             st.fold_unchanged = !st.fold_unchanged;
+            // Forces `diff_apply_folds` to redo the folds next frame.
             st.folded_for = None;
         }
         // Keep the sides aligned: whichever side moved this frame (scrolling,
@@ -364,6 +426,7 @@ impl ApexApp {
             let Some(doc) = self.docs.get(&d) else { continue };
             let folds = if fold { unchanged_folds(blocks, left) } else { Vec::new() };
             if let Some(view) = self.views.get_mut(&v) {
+                // Replace any folds the user made: the diff owns folding here.
                 view.fold_anchors.clear();
                 for (a, b) in folds {
                     view.fold(doc, a, b);
@@ -376,12 +439,14 @@ impl ApexApp {
         }
     }
 
+    /// `(left top line, left x scroll, right top line, right x scroll)`.
     fn diff_positions(&self, tab: ViewId) -> Option<(usize, f32, usize, f32)> {
         let st = self.diffs.get(&tab)?;
         let (l, r) = (self.views.get(&tab)?, self.views.get(&st.right_view)?);
         Some((l.top_line, l.scroll.x, r.top_line, r.scroll.x))
     }
 
+    /// Remember this frame's scroll positions for next frame's comparison.
     fn diff_record_scroll(&mut self, tab: ViewId) {
         let pos = self.diff_positions(tab);
         if let Some(st) = self.diffs.get_mut(&tab) {
@@ -389,6 +454,9 @@ impl ApexApp {
         }
     }
 
+    /// Make the side that did not move follow the one that did, mapping the
+    /// top line through the alignment. Returns `true` when a side moved (so
+    /// the caller repaints to show the follower in its new place).
     fn diff_sync_scroll(&mut self, tab: ViewId, blocks: &[Block]) -> bool {
         let (Some(now), Some(st)) = (self.diff_positions(tab), self.diffs.get(&tab)) else { return false };
         let right_view = st.right_view;
@@ -416,6 +484,9 @@ impl ApexApp {
     }
 
     /// Move to the next/previous change (on the focused side).
+    ///
+    /// With `first`, go to the first change regardless of the caret. Wraps
+    /// around at either end and centres the target line.
     pub(crate) fn diff_jump(&mut self, tab: ViewId, forward: bool, first: bool) {
         let Some(c) = self.diff_computed(tab) else { return };
         let Some(st) = self.diffs.get(&tab) else { return };
@@ -458,6 +529,7 @@ impl ApexApp {
             let end = if re < n { rope.line_to_char(re) } else { rope.len_chars() };
             // Inserting before the end of a file without a final newline.
             if end == rope.len_chars() && start == end && start > 0 && !replacement.is_empty() && rope.char(start - 1) != '\n' {
+                // Move the terminator from the end of the inserted text to its start.
                 replacement.insert(0, '\n');
                 replacement.pop();
             }
@@ -467,12 +539,16 @@ impl ApexApp {
         });
     }
 
+    /// Stage (working-tree diff) or unstage (staged diff) the right-side
+    /// lines of one block through `git_stage_ranges`. Requires a saved file
+    /// and a trusted workspace; `Plain` and `Revision` sources do nothing.
     fn diff_stage_block(&mut self, source: &DiffSource, b: &Block) {
         let (workdir, path, unstage) = match source {
             DiffSource::WorkingTree { workdir, path } => (workdir.clone(), path.clone(), false),
             DiffSource::Staged { workdir, path } => (workdir.clone(), path.clone(), true),
             _ => return,
         };
+        // Staging reads the file on disk, so the buffer must match it; unstaging reads the index.
         if !unstage && self.docs.values().any(|d| d.path.as_ref() == Some(&path) && d.is_dirty()) {
             self.set_status("Save the file before staging part of it".into(), false);
             return;
@@ -487,6 +563,7 @@ impl ApexApp {
         self.git_stage_ranges(workdir, rel, name, vec![b.right.clone()], untracked, "change", unstage);
     }
 
+    /// Open the same two texts as a unified diff in a read-only tab.
     fn diff_open_unified(&mut self, ctx: &egui::Context, tab: ViewId) {
         let Some(st) = self.diffs.get(&tab) else { return };
         let (ll, rl) = (st.left_label.clone(), st.right_label.clone());
@@ -499,6 +576,11 @@ impl ApexApp {
     }
 
     /// After git changes the index or HEAD, reload the bases of open diffs.
+    ///
+    /// The left document is replaced with the current index/HEAD version;
+    /// for a staged diff the read-only right document (the index) is too.
+    /// Documents are only touched when the text actually differs, and are
+    /// marked clean so the tab shows no unsaved marker.
     pub(crate) fn diff_refresh_bases(&mut self) {
         let tabs: Vec<(ViewId, DiffSource)> = self.diffs.iter().map(|(k, v)| (*k, v.source.clone())).collect();
         for (tab, source) in tabs {
@@ -537,6 +619,9 @@ impl ApexApp {
     // ----- opening from the commands ------------------------------------------
 
     /// Compare the active document (buffer) with saved/HEAD/index side by side.
+    ///
+    /// The saved version is read from disk (with a Windows-1252 fallback for
+    /// undecodable bytes); HEAD and index versions come through libgit2.
     pub(crate) fn diff_compare_active(&mut self, ctx: &egui::Context, cmd: Command) {
         let Some((_, d)) = self.active_ids() else { return };
         let Some(path) = self.docs.get(&d).and_then(|doc| doc.path.clone()) else {
@@ -572,6 +657,10 @@ impl ApexApp {
     }
 
     /// Unstaged (index → working copy) or staged (HEAD → index) changes of a file.
+    ///
+    /// For unstaged changes the right side is the real document (opened if
+    /// needed) so edits and the stage buttons work; a file deleted from the
+    /// working tree gets an empty read-only right side instead.
     pub(crate) fn diff_open_changes(&mut self, ctx: &egui::Context, workdir: PathBuf, path: PathBuf, staged: bool) {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let index = apex_project::git::file_at(&workdir, &path, false).ok().flatten().unwrap_or_default();
@@ -632,6 +721,7 @@ impl ApexApp {
 mod tests {
     use super::*;
 
+    /// Pins the fold boundaries around a single change and the row mapping through folds.
     #[test]
     fn folds_keep_context_and_rows_skip_hidden_lines() {
         let left: String = (0..40).map(|i| format!("{i}\n")).collect();

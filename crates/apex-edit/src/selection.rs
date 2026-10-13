@@ -1,4 +1,13 @@
 //! Cursor and selection representation.
+//!
+//! A view owns one [`SelectionSet`]; every editing command in
+//! [`ops`](crate::ops) reads it to build a transaction and then writes the
+//! post-edit set back. The set is kept normalised (sorted, non-overlapping,
+//! never empty) by [`SelectionSet::normalise`], which every mutator calls, so
+//! the rest of the crate may rely on those invariants without re-checking.
+//!
+//! All offsets are **char** offsets. `goal_col` is a **display column**, the
+//! one exception, because vertical motion must line up visually across tabs.
 
 use std::cmp::Ordering;
 
@@ -14,7 +23,9 @@ use crate::transaction::{Assoc, Transaction};
 /// follows the caret. When they are equal the selection is a plain cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selection {
+    /// Fixed end, where the selection was started.
     pub anchor: usize,
+    /// Moving end; the caret is drawn here.
     pub head: usize,
     /// Preferred display column for vertical motion (`None` = use current).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -22,34 +33,41 @@ pub struct Selection {
 }
 
 impl Selection {
+    /// A plain cursor at `pos`.
     pub const fn point(pos: usize) -> Self {
         Self { anchor: pos, head: pos, goal_col: None }
     }
 
+    /// A selection from `anchor` to `head` (either order).
     pub const fn new(anchor: usize, head: usize) -> Self {
         Self { anchor, head, goal_col: None }
     }
 
+    /// Lower of the two ends.
     #[inline]
     pub fn start(&self) -> usize {
         self.anchor.min(self.head)
     }
 
+    /// Higher of the two ends (exclusive).
     #[inline]
     pub fn end(&self) -> usize {
         self.anchor.max(self.head)
     }
 
+    /// `start()..end()`.
     #[inline]
     pub fn range(&self) -> std::ops::Range<usize> {
         self.start()..self.end()
     }
 
+    /// True for a plain cursor with no extent.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.anchor == self.head
     }
 
+    /// Extent in chars.
     #[inline]
     pub fn len(&self) -> usize {
         self.end() - self.start()
@@ -66,14 +84,17 @@ impl Selection {
         Self { anchor: self.head, head: self.head, goal_col: self.goal_col }
     }
 
+    /// Collapse to the lower end.
     pub fn collapse_to_start(self) -> Self {
         Self::point(self.start())
     }
 
+    /// Collapse to the upper end.
     pub fn collapse_to_end(self) -> Self {
         Self::point(self.end())
     }
 
+    /// Exchange anchor and head (the "flip selection direction" command).
     pub fn swap_ends(self) -> Self {
         Self { anchor: self.head, head: self.anchor, goal_col: None }
     }
@@ -83,15 +104,19 @@ impl Selection {
         if extend { Self { anchor: self.anchor, head, goal_col: None } } else { Self::point(head) }
     }
 
+    /// Set the preferred display column for the next vertical move.
     pub fn with_goal(mut self, goal: Option<usize>) -> Self {
         self.goal_col = goal;
         self
     }
 
+    /// True when `pos` lies within the extent (`start <= pos < end`); never true for a cursor.
     pub fn contains(&self, pos: usize) -> bool {
         self.start() <= pos && pos < self.end()
     }
 
+    /// True when the extents intersect. Two cursors overlap only if they
+    /// coincide; a cursor touching the edge of a range does not overlap it.
     pub fn overlaps(&self, other: &Selection) -> bool {
         if self.is_empty() && other.is_empty() {
             return self.head == other.head;
@@ -112,19 +137,26 @@ impl Selection {
 }
 
 /// An ordered, non-overlapping set of selections with one designated primary.
+///
+/// The primary is the one the view scrolls to and the one commands that only
+/// make sense for a single caret (e.g. "go to line") operate on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectionSet {
+    /// Sorted by start, pairwise non-overlapping, at least one element.
     sels: Vec<Selection>,
+    /// Index into `sels`; always in range.
     primary: usize,
 }
 
 impl Default for SelectionSet {
+    /// A single cursor at offset 0.
     fn default() -> Self {
         Self::single(Selection::point(0))
     }
 }
 
 impl SelectionSet {
+    /// A set containing just `sel`.
     pub fn single(sel: Selection) -> Self {
         Self { sels: vec![sel], primary: 0 }
     }
@@ -141,40 +173,49 @@ impl SelectionSet {
         s
     }
 
+    /// The primary selection (copied out; `Selection` is `Copy`).
     #[inline]
     pub fn primary(&self) -> Selection {
         self.sels[self.primary]
     }
 
+    /// Index of the primary within `as_slice()`.
     #[inline]
     pub fn primary_index(&self) -> usize {
         self.primary
     }
 
+    /// Make the selection at index `i` primary (clamped into range).
     pub fn set_primary_index(&mut self, i: usize) {
         self.primary = i.min(self.sels.len() - 1);
     }
 
+    /// Iterate selections in offset order.
     #[inline]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &Selection> + DoubleEndedIterator {
         self.sels.iter()
     }
 
+    /// The selections in offset order.
     #[inline]
     pub fn as_slice(&self) -> &[Selection] {
         &self.sels
     }
 
+    /// Number of selections (always at least 1).
     #[inline]
     pub fn len(&self) -> usize {
         self.sels.len()
     }
 
+    /// Always `false`: the set is never empty. Exists to satisfy the
+    /// `len`/`is_empty` lint pairing.
     #[inline]
     pub fn is_empty(&self) -> bool {
         false
     }
 
+    /// True when at least one selection has a non-zero extent.
     pub fn has_extent(&self) -> bool {
         self.sels.iter().any(|s| !s.is_empty())
     }
@@ -199,8 +240,8 @@ impl SelectionSet {
         self.normalise();
     }
 
-    /// Remove the most recently added (highest offset after primary) selection.
-    /// Returns false if only one selection remains.
+    /// Remove the primary selection; the next one (or the last) becomes primary.
+    /// Returns false, and does nothing, if only one selection remains.
     pub fn remove_primary(&mut self) -> bool {
         if self.sels.len() <= 1 {
             return false;
@@ -224,12 +265,15 @@ impl SelectionSet {
         self.normalise();
     }
 
-    /// Apply `f` to every selection, yielding possibly several per input.
+    /// Apply `f` to every selection, yielding possibly several per input
+    /// (e.g. "split selection into lines"). If `f` yields nothing for any
+    /// input the old primary is kept so the set never becomes empty.
     pub fn flat_transform(&mut self, mut f: impl FnMut(Selection) -> Vec<Selection>) {
         let mut out = Vec::with_capacity(self.sels.len());
         let mut primary = 0;
         for (i, s) in self.sels.iter().enumerate() {
             let produced = f(*s);
+            // The primary becomes the last selection produced from the old primary.
             if i == self.primary {
                 primary = out.len() + produced.len().saturating_sub(1);
             }
@@ -273,6 +317,8 @@ impl SelectionSet {
         for (orig_idx, sel) in indexed {
             let is_primary = orig_idx == self.primary;
             if let Some(last) = merged.last_mut() {
+                // A cursor strictly inside a range is swallowed by it; a
+                // cursor on a range's edge survives as a separate selection.
                 let overlap = last.overlaps(&sel) || (last.is_empty() && sel.contains(last.head)) || (sel.is_empty() && last.contains(sel.head));
                 if overlap {
                     let start = last.start().min(sel.start());
@@ -296,6 +342,9 @@ impl SelectionSet {
     }
 
     /// Index of the selection containing `pos`, if any.
+    ///
+    /// A cursor "contains" only its own offset; a range contains
+    /// `start..end` (end exclusive). Binary search over the sorted set.
     pub fn find_containing(&self, pos: usize) -> Option<usize> {
         self.sels
             .binary_search_by(|s| {
@@ -321,6 +370,7 @@ impl SelectionSet {
 mod tests {
     use super::*;
 
+    /// Overlapping ranges merge, duplicate cursors collapse, and the primary follows its selection.
     #[test]
     fn normalise_merges_and_dedupes() {
         let mut s =
@@ -336,6 +386,7 @@ mod tests {
         assert!(!s.remove_primary());
     }
 
+    /// A cursor matches only its own offset; a range excludes its end.
     #[test]
     fn find_containing() {
         let s = SelectionSet::from_vec(vec![Selection::point(2), Selection::new(5, 9)], 0);
@@ -345,6 +396,7 @@ mod tests {
         assert_eq!(s.find_containing(9), None);
     }
 
+    /// Out-of-range endpoints clamp to the rope length, keeping direction.
     #[test]
     fn clamps_to_rope() {
         let r = Rope::from_str("ab");

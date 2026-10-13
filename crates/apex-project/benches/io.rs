@@ -4,6 +4,13 @@
 //!   what the large-file mode opens; set APEX_BENCH_500MB=1 to add 500 MB)
 //! * a 1,000,000-line file
 //! * project-wide search over a generated 2,000-file tree (10 MB)
+//!
+//! All inputs are generated into a temporary directory at the start of each
+//! group and removed when the `TempDir` drops, so the benchmark needs no
+//! fixtures and leaves nothing behind. Sample sizes are small (10) because
+//! the large cases take seconds each. Throughput is reported in bytes for
+//! the size series and the search, and in elements (lines) for the
+//! million-line case.
 
 use std::path::PathBuf;
 
@@ -12,6 +19,8 @@ use apex_project::fileio;
 use apex_project::search::{SearchEvent, SearchRequest, start};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
+/// Create `dir/name` by repeating `line` until it is at least `bytes` long
+/// (so the result slightly exceeds `bytes`), and return its path.
 fn write_file(dir: &std::path::Path, name: &str, bytes: usize, line: &str) -> PathBuf {
     let p = dir.join(name);
     let mut s = String::with_capacity(bytes + line.len());
@@ -22,6 +31,9 @@ fn write_file(dir: &std::path::Path, name: &str, bytes: usize, line: &str) -> Pa
     p
 }
 
+/// `fileio::load` across file sizes plus the million-line case. Measures the
+/// read, encoding detection, UTF-8 decode and line-ending scan together, as
+/// the editor does when opening a tab.
 fn bench_load(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let line = "let value = compute(alpha, beta) + offset; // a fairly typical line of code\n";
@@ -51,6 +63,9 @@ fn bench_load(c: &mut Criterion) {
     g.finish();
 }
 
+/// Find in Files over 2,000 generated 5 KiB files in 40 directories: a
+/// literal that hits every file, a regex that hits every file, and a literal
+/// that hits none (pure walk + read + `is_match` cost).
 fn bench_search(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let line = "fn handler(request: Request) -> Response { let needle = 42; respond(request, needle) }\n";
@@ -76,6 +91,8 @@ fn bench_search(c: &mut Criterion) {
         max_results: 1_000_000,
         context_lines: 0,
     };
+    // Drive a search to completion and count matching lines, so the
+    // measurement includes draining the channel as the UI would.
     let run = |r: SearchRequest| {
         let h = start(r).expect("search");
         let mut matches = 0;

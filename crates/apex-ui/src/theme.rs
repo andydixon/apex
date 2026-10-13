@@ -3,21 +3,40 @@
 //! Themes are TOML documents (see `assets/themes/*.toml`). Built-in themes are
 //! embedded at compile time; user themes are loaded from the config directory
 //! and may override any built-in by name.
+//!
+//! A theme has three colour groups: `ui` (chrome: panels, tabs, menus),
+//! `editor` (the text area and its decorations) and `syntax` (a map from
+//! dotted scope names to [`SyntaxStyle`]). Parsing layers a file over a base:
+//! the built-in dark or light theme, which itself sits over [`Theme::minimal`],
+//! so every colour is always defined and a user theme may list only the keys
+//! it changes. `ApexApp` owns the loaded `Vec<Theme>` and the active one;
+//! [`Theme::apply_to_egui`] pushes the active theme into egui's `Visuals` so
+//! stock widgets match.
+//!
+//! Gotcha: the base themes are re-parsed from their TOML on every
+//! [`Theme::parse`] call; cheap enough, but not something to do per frame.
 
 use std::collections::HashMap;
 
 use egui::Color32;
 use serde::Deserialize;
 
+/// A fully resolved colour scheme. Cloned freely (a few hundred bytes plus
+/// the syntax map).
 #[derive(Debug, Clone)]
 pub struct Theme {
+    /// Display name, also the key the `theme` setting refers to.
     pub name: String,
+    /// Whether this is a dark scheme; picks the egui base visuals and the
+    /// fallback base when parsing.
     pub dark: bool,
     pub ui: UiColors,
     pub editor: EditorColors,
+    /// Scope name (e.g. `keyword.control`) → style; queried by prefix in `syntax_style`.
     syntax: HashMap<String, SyntaxStyle>,
 }
 
+/// How one syntax scope is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntaxStyle {
     pub fg: Color32,
@@ -26,6 +45,9 @@ pub struct SyntaxStyle {
     pub underline: bool,
 }
 
+/// Declares a `Copy` struct of `Color32` fields plus a `from_raw` constructor
+/// that reads each field by name from a string map, parsing `#rrggbb` /
+/// `#rrggbbaa` and falling back to the same field of `fallback` when absent.
 macro_rules! colour_struct {
     ($name:ident { $($field:ident),* $(,)? }) => {
         #[derive(Debug, Clone, Copy)]
@@ -39,6 +61,8 @@ macro_rules! colour_struct {
     };
 }
 
+// Colours of the application chrome (everything outside the text area).
+// Field names are the keys of the `[ui]` table in a theme file.
 colour_struct!(UiColors {
     background,
     surface,
@@ -65,6 +89,8 @@ colour_struct!(UiColors {
     scrollbar_hover,
 });
 
+// Colours of the editor widget. Field names are the keys of the `[editor]`
+// table in a theme file.
 colour_struct!(EditorColors {
     background,
     foreground,
@@ -94,14 +120,18 @@ colour_struct!(EditorColors {
     minimap_viewport,
 });
 
+/// Why a theme file was rejected.
 #[derive(Debug, thiserror::Error)]
 pub enum ThemeError {
     #[error("theme file is not valid TOML: {0}")]
     Toml(#[from] toml::de::Error),
+    /// A colour value that is not `#rrggbb` or `#rrggbbaa`.
     #[error("invalid colour {0:?}: expected #rrggbb or #rrggbbaa")]
     Colour(String),
 }
 
+/// A `[syntax]` entry as written: either a bare colour string or a table
+/// with `fg` and optional style flags.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum RawSyntax {
@@ -117,6 +147,8 @@ enum RawSyntax {
     },
 }
 
+/// The on-disk shape of a theme file. Colour tables are kept as strings so
+/// missing keys can fall back to the base theme in `from_raw`.
 #[derive(Deserialize)]
 struct RawTheme {
     name: String,
@@ -130,6 +162,8 @@ struct RawTheme {
     syntax: HashMap<String, RawSyntax>,
 }
 
+/// Parse `#rrggbb` or `#rrggbbaa` (alpha unmultiplied). Surrounding
+/// whitespace is ignored; anything else is a [`ThemeError::Colour`].
 pub fn parse_colour(s: &str) -> Result<Color32, ThemeError> {
     let hex = s.trim().strip_prefix('#').ok_or_else(|| ThemeError::Colour(s.into()))?;
     let v = u32::from_str_radix(hex, 16).map_err(|_| ThemeError::Colour(s.into()))?;
@@ -140,6 +174,8 @@ pub fn parse_colour(s: &str) -> Result<Color32, ThemeError> {
     }
 }
 
+/// Embedded theme sources in presentation order. Index 0 must be the dark
+/// base and index 1 the light base: `base_dark`/`base_light` rely on it.
 pub const BUILTIN_THEME_SOURCES: &[&str] = &[
     include_str!("../../../assets/themes/apex-dark.toml"),
     include_str!("../../../assets/themes/apex-light.toml"),
@@ -160,6 +196,9 @@ impl Theme {
         Self::parse_with_base(raw, &base)
     }
 
+    /// Resolve `raw` over `base`: syntax entries are added to a copy of the
+    /// base's map (so a user theme may restyle one scope), colour tables
+    /// fall back field by field.
     fn parse_with_base(raw: RawTheme, base: &Theme) -> Result<Theme, ThemeError> {
         let mut syntax = base.syntax.clone();
         for (k, v) in raw.syntax {
@@ -178,6 +217,8 @@ impl Theme {
         })
     }
 
+    /// The built-in dark theme resolved over `minimal`. Panics only if the
+    /// embedded file is broken, which the tests catch.
     fn base_dark() -> Theme {
         let raw: RawTheme = toml::from_str(BUILTIN_THEME_SOURCES[0]).expect("built-in dark theme is valid");
         let mut t = Theme::minimal(true);
@@ -185,6 +226,7 @@ impl Theme {
         t
     }
 
+    /// The built-in light theme resolved over `minimal`.
     fn base_light() -> Theme {
         let raw: RawTheme = toml::from_str(BUILTIN_THEME_SOURCES[1]).expect("built-in light theme is valid");
         let t = Theme::minimal(false);
@@ -257,9 +299,11 @@ impl Theme {
 
     /// All compiled-in themes, in presentation order.
     pub fn builtins() -> Vec<Theme> {
+        // A broken built-in is logged and skipped rather than taking the app down.
         BUILTIN_THEME_SOURCES.iter().filter_map(|s| Theme::parse(s).map_err(|e| tracing::error!("built-in theme failed to parse: {e}")).ok()).collect()
     }
 
+    /// The theme used when the configured one cannot be found.
     pub fn default_dark() -> Theme {
         Theme::base_dark()
     }
@@ -273,17 +317,24 @@ impl Theme {
                 return Some(*st);
             }
             {
+                // No more dots to strip: the scope is unknown.
                 let i = s.rfind('.')?;
                 s = &s[..i]
             }
         }
     }
 
+    /// Foreground for a scope, or the plain editor foreground when unstyled.
     pub fn syntax_colour(&self, scope: &str) -> Color32 {
         self.syntax_style(scope).map(|s| s.fg).unwrap_or(self.editor.foreground)
     }
 
     /// Push this theme into egui's style so built-in widgets match.
+    ///
+    /// Starts from egui's own dark/light visuals so anything not listed here
+    /// still has a sensible value, then overrides fills, strokes, rounding
+    /// and spacing for every style (`all_styles_mut`) so dialogs and menus
+    /// agree with the custom-painted editor.
     pub fn apply_to_egui(&self, ctx: &egui::Context) {
         let mut visuals = if self.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
         let ui = &self.ui;
@@ -300,6 +351,8 @@ impl Theme {
         visuals.error_fg_color = ui.error;
         visuals.selection.bg_fill = ui.selection;
         visuals.selection.stroke = egui::Stroke::new(1.0, ui.text);
+        // Widget states: noninteractive (labels, separators), inactive (idle
+        // buttons), hovered, active (pressed) and open (menus/combos).
         visuals.widgets.noninteractive.bg_fill = ui.surface;
         visuals.widgets.noninteractive.weak_bg_fill = ui.surface;
         visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, ui.border);
@@ -320,6 +373,7 @@ impl Theme {
         visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, ui.text);
         visuals.window_corner_radius = egui::CornerRadius::same(6);
         visuals.menu_corner_radius = egui::CornerRadius::same(6);
+        // Lighter shadow on light themes, where a heavy one looks dirty.
         visuals.window_shadow =
             egui::epaint::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(if self.dark { 120 } else { 50 }) };
         visuals.popup_shadow = visuals.window_shadow;
@@ -348,6 +402,7 @@ impl Theme {
 mod tests {
     use super::*;
 
+    /// Every embedded theme parses and scope prefix lookup works.
     #[test]
     fn builtin_themes_parse() {
         let themes = Theme::builtins();
@@ -359,6 +414,7 @@ mod tests {
         assert!(dark.syntax_style("comment").unwrap().italic);
     }
 
+    /// A theme listing one colour inherits the rest; bad colours and bad TOML are errors.
     #[test]
     fn partial_theme_inherits_base() {
         let t = Theme::parse("name = 'X'\ndark = true\n[editor]\nbackground = '#000000'\n").unwrap();

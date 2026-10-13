@@ -1,6 +1,20 @@
 //! Snippet insertion with tab-stop sessions, trigger expansion on Tab and
 //! the Insert Snippet palette. Built-in snippets live in `assets/snippets`;
 //! user snippets are TOML files in `<config>/snippets/`.
+//!
+//! Parsing and expansion are done by `apex_edit::snippet`; this module wires
+//! them to the app. `ApexApp` holds the loaded list in `app.snippets` (filled
+//! by `load_snippets` at start-up) and at most one `SnippetSession` in
+//! `app.snippet_session`. The app's per-frame input handling calls
+//! `snippet_key` (right after the completion popup's key handler) before the
+//! editor sees keys, so an active session owns Tab, Shift+Tab and Escape;
+//! `try_expand_trigger` runs from the `InsertTab` command. The LSP
+//! completion popup also offers snippets via `snippet_completions` and
+//! inserts them through `insert_snippet`.
+//!
+//! Stop positions are stored as absolute char ranges together with the document
+//! revision they were computed at, and re-mapped through intervening edits on
+//! every step; a session is dropped silently if its view goes away.
 
 use std::path::Path;
 
@@ -11,16 +25,24 @@ use crate::app::ApexApp;
 use crate::palette::{PaletteItem, PaletteMode, Payload};
 use crate::view::ViewId;
 
+/// An in-progress tab-stop walk after inserting a snippet.
 pub struct SnippetSession {
+    /// The view the snippet was inserted into; the session ends if focus moves.
     pub view: ViewId,
     pub doc: DocId,
     /// Stops in tab order as absolute char ranges.
     pub stops: Vec<(u32, Vec<(usize, usize)>)>,
+    /// Index into `stops` of the stop currently selected.
     pub current: usize,
+    /// Document revision at which `stops` were last mapped; see `snippet_step`.
     pub revision: u64,
 }
 
 impl ApexApp {
+    /// Build `self.snippets` from the built-in set plus every `*.toml` in
+    /// `<config>/snippets/`. A file named after a language scopes its snippets
+    /// to that language unless they declare their own scope; `global.toml` and
+    /// `all.toml` are unscoped. Malformed files are logged and skipped.
     pub(crate) fn load_snippets(&mut self) {
         let mut all = snippet::builtin_snippets();
         let dir = self.config_dir.join("snippets");
@@ -55,6 +77,8 @@ impl ApexApp {
         self.snippets.iter().filter(|s| s.scope.is_empty() || s.scope.iter().any(|l| l == lang)).collect()
     }
 
+    /// Gather the `$TM_*`-style variables a snippet body may reference, taken
+    /// from the view's primary selection and the document's path.
     fn snippet_variables(&self, view: ViewId, doc: DocId) -> Variables {
         let d = &self.docs[&doc];
         let v = &self.views[&view];
@@ -63,6 +87,7 @@ impl ApexApp {
         let line = rope.char_to_line(sel.head.min(rope.len_chars()));
         let (ws, we) = apex_buffer::motion::word_at(d.slice(), sel.head);
         let now = crate::app::local_datetime_string();
+        // local_datetime_string() is "YYYY-MM-DD HH:MM:SS"; split into the two parts.
         let (date, time) = now.split_once(' ').map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or_default();
         Variables {
             filename: d.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -82,6 +107,13 @@ impl ApexApp {
 
     /// Replace `replace` (or the primary selection) with the expanded snippet and
     /// start a tab-stop session.
+    ///
+    /// The body is expanded with the current line's indentation and the
+    /// document's line ending. With several carets and no explicit `replace`
+    /// range the text is inserted plainly at each caret and no session starts.
+    /// Otherwise the first stop (or the end of the text) becomes the selection,
+    /// and a session is created only if there is more than one stop or the
+    /// single stop is not `$0`. Closes any open completion popup.
     pub(crate) fn insert_snippet(&mut self, view: ViewId, body: &str, replace: Option<(usize, usize)>) {
         let Some(doc_id) = self.views.get(&view).map(|v| v.doc) else { return };
         let vars = self.snippet_variables(view, doc_id);
@@ -107,6 +139,7 @@ impl ApexApp {
             });
             return;
         }
+        // Stop ranges are relative to the expansion start; make them absolute.
         let first_sel: Vec<Selection> = match stops.first() {
             Some((_, ranges)) => ranges.iter().map(|(a, b)| Selection::new(start + a, start + b)).collect(),
             None => vec![Selection::point(start + text_len)],
@@ -120,6 +153,8 @@ impl ApexApp {
             return;
         }
         self.lsp.completion = None;
+        // A lone `$0` means "caret goes here", already handled by the selection
+        // above; only real tab stops need a session.
         if stops.len() > 1 || stops.first().is_some_and(|(i, _)| *i != 0) {
             let revision = self.docs[&doc_id].revision();
             let abs: Vec<(u32, Vec<(usize, usize)>)> =
@@ -129,15 +164,22 @@ impl ApexApp {
     }
 
     /// Move to the next/previous stop. Ends the session after the last stop.
+    ///
+    /// Before moving, every stop boundary is mapped through the edits made since
+    /// `session.revision` (typing into a placeholder shifts later stops). Going
+    /// back from the first stop keeps the session; going forward past the last
+    /// stop leaves the caret at `$0` if present and ends it.
     pub(crate) fn snippet_step(&mut self, back: bool) {
         let Some(mut session) = self.snippet_session.take() else { return };
         let Some(doc) = self.docs.get(&session.doc) else { return };
         // Remap stops through edits made since the last step.
+        // Flatten to one position list because `sync_positions` works on a slice.
         let mut flat: Vec<usize> = session.stops.iter().flat_map(|(_, r)| r.iter().flat_map(|(a, b)| [*a, *b])).collect();
         doc.sync_positions(&mut flat, session.revision);
         let mut k = 0;
         for (_, ranges) in &mut session.stops {
             for r in ranges.iter_mut() {
+                // `max` guards against a range whose end was mapped before its start.
                 *r = (flat[k], flat[k + 1].max(flat[k]));
                 k += 2;
             }
@@ -170,6 +212,10 @@ impl ApexApp {
     }
 
     /// Tab / Shift+Tab / Escape while a session is active.
+    ///
+    /// Returns true if a key was consumed. The session is dropped if its view is
+    /// no longer the active one. Does nothing while the completion popup is
+    /// open, since that owns Tab.
     pub(crate) fn snippet_key(&mut self, ctx: &egui::Context) -> bool {
         let Some(s) = &self.snippet_session else { return false };
         if self.active_view_id() != Some(s.view) || !self.views.contains_key(&s.view) {
@@ -179,6 +225,8 @@ impl ApexApp {
         if self.lsp.completion.is_some() {
             return false; // the completion popup owns Tab
         }
+        // consume_key removes the key from egui's input so the editor's own Tab
+        // handling does not also see it.
         let (tab, back, esc) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Tab),
@@ -198,6 +246,10 @@ impl ApexApp {
     }
 
     /// Expand a snippet whose trigger is the word before the caret (Tab).
+    ///
+    /// Only with a single empty selection whose head is at the end of a word.
+    /// Returns true if a snippet was inserted, so the caller can skip the
+    /// normal Tab action.
     pub(crate) fn try_expand_trigger(&mut self, view: ViewId) -> bool {
         let Some(doc_id) = self.views.get(&view).map(|v| v.doc) else { return false };
         let v = &self.views[&view];
@@ -206,6 +258,7 @@ impl ApexApp {
         }
         let head = v.sels.primary().head;
         let d = &self.docs[&doc_id];
+        // Look at the char before the caret so a caret at a word end finds that word.
         let (ws, we) = apex_buffer::motion::word_at(d.slice(), head.saturating_sub(1));
         if we != head || ws == we {
             return false;
@@ -222,9 +275,13 @@ impl ApexApp {
         }
     }
 
+    /// Show the Insert Snippet palette for the active document's language.
+    /// Accepted entries are handled by `snippet_palette_accept`.
     pub(crate) fn open_snippet_palette(&mut self) {
         let Some((_, d)) = self.active_ids() else { return };
         let lang = self.language_of(d).id.to_string();
+        // Indices into `self.snippets` are the palette payload, so filter with
+        // enumerate rather than through `snippets_for`.
         let list: Vec<(usize, &SnippetDef)> =
             self.snippets.iter().enumerate().filter(|(_, s)| s.scope.is_empty() || s.scope.iter().any(|l| l == &lang)).collect();
         if list.is_empty() {
@@ -244,6 +301,9 @@ impl ApexApp {
         self.palette.show_with(PaletteMode::Prompt("snippet".into()), items, "Insert snippet", "");
     }
 
+    /// Palette accept hook: inserts the chosen snippet at the selection when the
+    /// palette was opened by `open_snippet_palette`. Returns false otherwise so
+    /// the caller tries other handlers.
     pub(crate) fn snippet_palette_accept(&mut self, ctx: &egui::Context, mode: &PaletteMode, payload: &Payload) -> bool {
         if let (PaletteMode::Prompt(kind), Payload::Index(i)) = (mode, payload)
             && kind == "snippet"
@@ -257,6 +317,8 @@ impl ApexApp {
         false
     }
 
+    /// Snippets whose trigger starts with `prefix`, as `(trigger, description,
+    /// body)` for the completion popup. Empty for an empty prefix.
     pub(crate) fn snippet_completions(&self, lang: &str, prefix: &str) -> Vec<(String, String, String)> {
         if prefix.is_empty() {
             return Vec::new();
@@ -269,5 +331,6 @@ impl ApexApp {
     }
 }
 
+/// Keeps the `Path` import referenced; nothing calls this.
 #[allow(dead_code)]
 fn _path_unused(_: &Path) {}

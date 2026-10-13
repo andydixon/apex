@@ -1,6 +1,14 @@
 //! Git > Show Log: every commit reachable from branches and tags with a lane
 //! graph, a filter, and actions on a commit (show, branch here, check out,
 //! cherry-pick, revert, open on the remote).
+//!
+//! The log is read through libgit2 (`apex_project::git_repo::log`) on a
+//! plain thread, so it does not occupy the single git job slot; the result
+//! arrives on an `mpsc` channel polled by `show_git_log` each frame. Lane
+//! assignment (`LogRow::lane`, `top`, `bottom`) is done by `git_repo`; this
+//! module only draws the segments. Actions dispatch commands handled by
+//! `git_branches.rs` and `forge_ui.rs`, and `git_ops_poll` sets
+//! `reload_after_job` so the list refreshes once such a job has finished.
 
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
@@ -12,21 +20,32 @@ use crate::app::ApexApp;
 use crate::command::Command;
 use crate::workspace_ui::PromptKind;
 
+/// Maximum commits loaded; beyond this the header says "(most recent)".
 const LIMIT: usize = 5000;
 
+/// State of the Git Log window (`GitUi::log`). Reset whenever it is opened
+/// for a different repository.
 #[derive(Default)]
 pub struct LogWindow {
+    /// Whether the window is shown.
     pub open: bool,
+    /// Work tree the rows were loaded from.
     repo: PathBuf,
+    /// Loaded commits, newest first, with their lane graph.
     rows: Vec<LogRow>,
+    /// A load in progress on a worker thread.
     loading: Option<Receiver<Result<Vec<LogRow>, String>>>,
+    /// Error of the last failed load, shown under the header.
     error: Option<String>,
+    /// Text of the filter box.
     filter: String,
+    /// Index into `rows` of the highlighted commit.
     selected: Option<usize>,
     /// Reload once the action started from the log has run.
     pub(crate) reload_after_job: bool,
 }
 
+/// Colours of the graph lanes, cycled by lane index.
 const LANE_COLOURS: [Color32; 6] = [
     Color32::from_rgb(0x4e, 0x9a, 0xf0),
     Color32::from_rgb(0x5c, 0xc0, 0x6c),
@@ -37,6 +56,9 @@ const LANE_COLOURS: [Color32; 6] = [
 ];
 
 impl ApexApp {
+    /// Handle `GitLog`: open the window for the panel's repository (resetting
+    /// its state if the repository changed) and start loading. Returns
+    /// `false` for any other command.
     pub(crate) fn git_log_command(&mut self, cmd: Command) -> bool {
         if cmd != Command::GitLog {
             return false;
@@ -52,6 +74,9 @@ impl ApexApp {
         true
     }
 
+    /// Start loading the log on a named thread; the result is picked up by
+    /// `show_git_log`. The thread requests a repaint when done so the window
+    /// updates without user input.
     fn git_log_reload(&mut self) {
         let (tx, rx) = std::sync::mpsc::channel();
         let repo = self.git.log.repo.clone();
@@ -68,6 +93,10 @@ impl ApexApp {
         self.git.log.loading = Some(rx);
     }
 
+    /// Draw the window if open: header (repository, filter, Reload, count),
+    /// then the virtualised commit list with graph, id, ref badges, summary,
+    /// author and age. Keyboard: Up/Down select, Enter shows the commit,
+    /// Escape closes. Commands are queued at the end of the frame.
     pub(crate) fn show_git_log(&mut self, ctx: &egui::Context) {
         if !self.git.log.open {
             return;
@@ -88,6 +117,7 @@ impl ApexApp {
         let theme = self.theme.clone();
         let ui_font = self.settings.ui_font_size;
         let mut open = true;
+        // Deferred effects: the window closure borrows `self.git.log` mutably.
         let mut cmds: Vec<(Command, Option<String>)> = Vec::new();
         let mut reload = false;
         let mut prompt_branch: Option<String> = None;
@@ -125,6 +155,7 @@ impl ApexApp {
                 }
                 ui.separator();
                 let q = w.filter.trim().to_lowercase();
+                // Indices into `rows` that pass the filter (ids match by prefix only).
                 let visible: Vec<usize> = (0..w.rows.len())
                     .filter(|&i| {
                         q.is_empty() || {
@@ -138,11 +169,14 @@ impl ApexApp {
                     .collect();
                 // The graph only makes sense for the full, unfiltered list.
                 let graph = q.is_empty();
+                // Widest lane used by any segment, so the column fits the whole graph.
                 let lanes =
                     if graph { w.rows.iter().flat_map(|r| r.top.iter().chain(&r.bottom).map(|s| s.0.max(s.1))).max().map(|m| m + 1).unwrap_or(1) } else { 0 };
                 let lane_w = 12.0;
                 let graph_w = (lanes as f32 * lane_w + 6.0).min(220.0);
                 let row_h = ui_font + 10.0;
+                // Keyboard navigation only while the filter box does not own the keys
+                // and the pointer is over the window (so other windows keep theirs).
                 if !ui.ctx().memory(|m| m.has_focus(egui::Id::new("git-log-filter"))) && !visible.is_empty() && ui.ui_contains_pointer() {
                     let (up, down, enter) =
                         ui.input(|i| (i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown), i.key_pressed(egui::Key::Enter)));
@@ -166,6 +200,7 @@ impl ApexApp {
                         }
                         let p = ui.painter_at(rect);
                         if graph {
+                            // Centre x of a lane; segments run top→middle and middle→bottom of the row.
                             let gx = |lane: usize| rect.min.x + 6.0 + lane as f32 * lane_w + lane_w / 2.0;
                             let (top, mid, bot) = (rect.min.y, rect.center().y, rect.max.y);
                             for &(a, b) in &r.top {
@@ -175,6 +210,7 @@ impl ApexApp {
                                 p.line_segment([pos2(gx(a), mid), pos2(gx(b), bot)], Stroke::new(1.6, LANE_COLOURS[b % 6]));
                             }
                             let c = LANE_COLOURS[r.lane % 6];
+                            // Merge commits are hollow, ordinary commits filled.
                             if r.parents > 1 {
                                 p.circle(pos2(gx(r.lane), mid), 4.0, theme.editor.background, Stroke::new(2.0, c));
                             } else {
@@ -192,6 +228,7 @@ impl ApexApp {
                             theme.ui.text_muted,
                         );
                         x += 70.0;
+                        // Ref badges: tags in the warning colour, HEAD in the accent, branches in green.
                         for name in &r.refs {
                             let g = p.layout_no_wrap(name.clone(), small.clone(), theme.ui.text);
                             let bw = g.rect.width() + 10.0;
@@ -207,6 +244,7 @@ impl ApexApp {
                             p.galley(pos2(x + 5.0, rect.center().y - g.rect.height() / 2.0), g, theme.ui.text);
                             x += bw + 4.0;
                         }
+                        // The summary is clipped so it never runs under the author/age column.
                         let right_w = 260.0;
                         let summary_clip = Rect::from_min_max(pos2(x, rect.min.y), pos2((rect.max.x - right_w).max(x), rect.max.y));
                         ui.painter_at(summary_clip).text(pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, &r.summary, font.clone(), theme.ui.text);
@@ -239,6 +277,7 @@ impl ApexApp {
                                 ui.close();
                             }
                             ui.separator();
+                            // Needs a name first, so it goes through the prompt rather than a command.
                             if ui.button("Create Branch Here…").clicked() {
                                 prompt_branch = Some(id.clone());
                                 ui.close();
@@ -252,6 +291,7 @@ impl ApexApp {
                     }
                 });
             });
+        // Escape closes the window, unless something else (filter box, dialog, palette) wants it.
         let filter_focused = ctx.memory(|m| m.has_focus(egui::Id::new("git-log-filter")));
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !filter_focused && self.dialog.is_none() && !self.palette.open {
             open = false;
@@ -263,6 +303,7 @@ impl ApexApp {
             self.git_log_reload();
         }
         if let Some(id) = prompt_branch {
+            // The prompt re-runs GitCreateBranch with "name SEP commit".
             self.prompt("New branch name", "", PromptKind::GitArg(Command::GitCreateBranch, Some(id)));
         }
         self.queue.extend(cmds);

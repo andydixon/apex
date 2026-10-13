@@ -1,10 +1,17 @@
 //! Offset conversions on a 1 MB mixed-width text. Run: `cargo bench -p apex-buffer`.
+//!
+//! The sample mixes ASCII, tabs, Latin-1, CJK and an emoji so that every
+//! conversion path (byte/char/UTF-16/display column/grapheme) is exercised on
+//! realistic data rather than pure ASCII. Each benchmark folds its results
+//! with XOR so the optimiser cannot discard the work.
 
 use apex_buffer::Rope;
 use apex_buffer::motion::{next_grapheme_boundary, next_word_start, prev_grapheme_boundary};
 use apex_buffer::position::{byte_to_char, char_col_to_display_col, char_to_byte, char_to_utf16_position, display_col_to_char_col};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
+/// Build roughly 1 MiB of text by repeating one line that contains a tab,
+/// accented Latin letters, CJK and an emoji.
 fn sample_text() -> String {
     let line = "fn main() {\tlet naïve = \"héllo wörld\"; // 日本語のコメント 😀 end\n";
     let mut s = String::with_capacity(1 << 20);
@@ -14,6 +21,9 @@ fn sample_text() -> String {
     s
 }
 
+/// Register the `offsets` group: 10,000 pseudo-random char positions
+/// (stride 7919, a prime, so they spread across the whole rope) converted
+/// through each offset space.
 fn bench(c: &mut Criterion) {
     let text = sample_text();
     let rope = Rope::from_str(&text);

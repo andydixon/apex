@@ -3,6 +3,20 @@
 //! confirmation of destructive operations. All of them need a trusted
 //! workspace, because `git` runs the repository's hooks and configured
 //! programs.
+//!
+//! Data flow: a command handler builds a closure that receives a
+//! `JobCtx` and calls `c.git(...)`; `git_run` queues it and
+//! `git_start_next` hands it to `apex_project::git_cli::start_job`, which
+//! runs the user's `git` binary on a worker thread. The frame loop calls
+//! `git_ops_poll` every frame to drain `JobEvent`s into the GIT bottom-panel
+//! log, the progress text, the askpass dialog and the status bar. When a job
+//! finishes the status caches are marked dirty so the sidebar and gutter
+//! catch up.
+//!
+//! Invariants: at most one job runs at a time (`running`), the rest wait in
+//! `queued`; `confirmed` is only ever true for the duration of a re-execute
+//! from `Dialog::Confirm`, which is how `git_confirm` tells "first call,
+//! ask" from "second call, go ahead".
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -14,19 +28,29 @@ use egui::Ui;
 use crate::app::{ApexApp, Dialog};
 use crate::command::Command;
 
+/// A queued job body: runs on the worker thread with a `JobCtx` and returns
+/// the status-bar message (`Ok`, may be empty) or the error text.
 type JobBody = Box<dyn FnOnce(&JobCtx) -> Result<String, String> + Send>;
 
+/// Maximum lines kept in the Git output log; older lines are dropped.
 const MAX_LOG: usize = 5000;
 
+/// State of the job queue and the Git output log, stored in `GitUi::ops`.
 #[derive(Default)]
 pub struct GitOps {
+    /// The job currently running on a worker thread, if any.
     pub(crate) running: Option<GitJob>,
+    /// Jobs waiting for `running` to finish: (label, work tree, body).
     queued: VecDeque<(String, PathBuf, JobBody)>,
+    /// Lines shown in the GIT bottom-panel tab, oldest first.
     pub(crate) log: VecDeque<String>,
+    /// Latest progress line of the running job (`Receiving objects: 45%`).
     pub(crate) progress: Option<String>,
+    /// Set when a line was appended, so the log scrolls to the bottom once.
     scroll_log: bool,
     /// Set while re-running a command the user has just confirmed.
     pub(crate) confirmed: bool,
+    /// When the last automatic fetch was started (rate limit).
     last_auto_fetch: Option<std::time::Instant>,
 }
 
@@ -63,11 +87,15 @@ pub(crate) fn rel_path(workdir: &Path, path: &Path) -> Option<String> {
 
 impl ApexApp {
     /// Queue a job; it starts when the previous one has finished.
+    ///
+    /// `label` names the job in the log, status bar and panel; `body` runs on
+    /// a worker thread and must do all its git calls through the `JobCtx`.
     pub(crate) fn git_run(&mut self, label: &str, workdir: PathBuf, body: impl FnOnce(&JobCtx) -> Result<String, String> + Send + 'static) {
         self.git.ops.queued.push_back((label.to_string(), workdir, Box::new(body)));
         self.git_start_next();
     }
 
+    /// Start the next queued job unless one is already running.
     fn git_start_next(&mut self) {
         if self.git.ops.running.is_some() {
             return;
@@ -78,6 +106,12 @@ impl ApexApp {
     }
 
     /// Drain job output; returns true while anything is happening.
+    ///
+    /// Called once per frame. Log and progress events update the panel;
+    /// a credential prompt opens `Dialog::Askpass`; `Finished` reports the
+    /// result in the status bar, marks the status caches dirty, asks the log
+    /// window to reload, refreshes the PR status after a push, and starts the
+    /// next queued job.
     pub(crate) fn git_ops_poll(&mut self) -> bool {
         let Some(job) = &self.git.ops.running else { return false };
         let mut finished = None;
@@ -110,6 +144,7 @@ impl ApexApp {
             self.git.ops.progress = None;
             let ok = r.is_ok();
             match r {
+                // An empty message means "nothing to say" (auto-fetch, text-producing jobs).
                 Ok(msg) if msg.is_empty() => {}
                 Ok(msg) => self.set_status(msg, false),
                 Err(e) => {
@@ -118,6 +153,7 @@ impl ApexApp {
                     self.set_status(format!("{label} failed: {e}{hint}"), true);
                 }
             }
+            // Whatever the job did, the index/HEAD may have changed: refresh status, bases, hunks.
             self.git_mark_dirty();
             if self.git.log.open {
                 self.git.log.reload_after_job = true;
@@ -136,6 +172,9 @@ impl ApexApp {
 
     /// Repository and (optional) file a command applies to: the path in
     /// `arg`, else the active document, else the first folder.
+    ///
+    /// Sets a status-bar message and returns `None` when no repository can
+    /// be found at all.
     pub(crate) fn git_target(&mut self, arg: Option<&str>) -> Option<(PathBuf, Option<PathBuf>)> {
         let file = match arg {
             Some(a) if !a.is_empty() => Some(PathBuf::from(a)),
@@ -154,6 +193,9 @@ impl ApexApp {
     }
 
     /// Ask to trust `workdir` before running `git` there; re-runs the command.
+    ///
+    /// Returns `true` when already trusted. Otherwise opens `Dialog::Trust`
+    /// carrying `(cmd, arg)`, which the dialog executes again on "Trust".
     fn git_trusted(&mut self, workdir: &Path, cmd: Command, arg: &Option<String>) -> bool {
         if self.trust.is_trusted(workdir) {
             return true;
@@ -163,6 +205,10 @@ impl ApexApp {
     }
 
     /// Ask before a destructive command; true once the user has agreed.
+    ///
+    /// First call: opens `Dialog::Confirm` and returns `false`. When the user
+    /// accepts, the dialog sets `confirmed` and re-executes `(cmd, arg)`, so
+    /// the second call consumes the flag and returns `true`.
     pub(crate) fn git_confirm(&mut self, title: &str, body: String, button: &str, cmd: Command, arg: &Option<String>) -> bool {
         if std::mem::take(&mut self.git.ops.confirmed) {
             return true;
@@ -171,14 +217,22 @@ impl ApexApp {
         false
     }
 
+    /// The cached status entry for `file` in `workdir`, if git reports it as changed.
     pub(crate) fn git_entry_for(&self, workdir: &Path, file: &Path) -> Option<apex_project::git::StatusEntry> {
         self.git.repos.get(workdir)?.status.entries.iter().find(|e| e.path == file).cloned()
     }
 
+    /// Handle the output panel, cancel, remote and staging commands.
+    ///
+    /// Returns `false` for commands this module does not own. Staging
+    /// commands resolve their target with `git_target`, require trust, and
+    /// queue a job; `GitDiscardFile` asks first (or delegates untracked files
+    /// to the explorer's delete confirmation).
     pub(crate) fn git_ops_command(&mut self, cmd: Command, arg: Option<String>) -> bool {
         match cmd {
             Command::GitShowOutput => {
                 use crate::tasks_ui::PanelTab;
+                // Toggle: close the panel if it already shows the Git tab, else show that tab.
                 self.panel_open = !(self.panel_open && self.panel_tab == PanelTab::Git);
                 self.panel_tab = PanelTab::Git;
                 return true;
@@ -188,6 +242,7 @@ impl ApexApp {
                     Some(j) => j.cancel(),
                     None => self.set_status("No Git command is running".into(), false),
                 }
+                // Cancelling also drops what was waiting behind the running job.
                 self.git.ops.queued.clear();
                 return true;
             }
@@ -218,6 +273,7 @@ impl ApexApp {
         let name = file.as_deref().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         match cmd {
             Command::GitStageFile => {
+                // `-A` so a deleted file is staged as a deletion too.
                 self.git_run("Stage", workdir, move |c| c.git(&["add", "-A", "--", &rel], None).map(|_| format!("Staged {name}")));
             }
             Command::GitUnstageFile => {
@@ -231,6 +287,7 @@ impl ApexApp {
             Command::GitStageAll => self.git_run("Stage all", workdir, |c| c.git(&["add", "-A"], None).map(|_| "Staged all changes".into())),
             Command::GitUnstageAll => {
                 self.git_run("Unstage all", workdir, |c| {
+                    // Same unborn-HEAD fallback as the single-file case.
                     c.git(&["reset", "-q"], None).or_else(|_| c.git(&["rm", "-r", "-q", "--cached", "."], None)).map(|_| "Unstaged all changes".into())
                 });
             }
@@ -255,6 +312,7 @@ impl ApexApp {
             }
             Command::GitStageHunk | Command::GitStageLines => {
                 let Some((v, d)) = self.active_ids() else { return true };
+                // The patch is built from the file on disk, so the buffer must match it.
                 if self.docs.get(&d).is_some_and(|doc| doc.is_dirty()) {
                     self.set_status("Save the file before staging part of it".into(), false);
                     return true;
@@ -264,6 +322,8 @@ impl ApexApp {
                     return true;
                 }
                 let ranges: Vec<std::ops::Range<usize>> = if cmd == Command::GitStageHunk {
+                    // Hunks must be against the index (not HEAD) to be stageable, whatever
+                    // the gutter is currently comparing with; restore the setting after.
                     let saved = self.git.compare_head;
                     self.git.compare_head = false;
                     let h = self.git_hunk_at_caret(v, d);
@@ -305,6 +365,13 @@ impl ApexApp {
 
     /// Stage (or, with `unstage`, unstage) the changes touching zero-based
     /// lines `ranges` of the working file (unstage: of the index version).
+    ///
+    /// Runs as a job: `git diff` (or `diff --cached`) produces a patch,
+    /// `git_cli::select_new_lines` keeps only the hunks that touch `ranges`,
+    /// and `git apply --cached` (with `--reverse` for unstage) applies it to
+    /// the index. An untracked file is first added with intent (`add -N`) so
+    /// it has an index entry to diff against. `what` names the selection in
+    /// the resulting message ("change", "selected lines").
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn git_stage_ranges(
         &mut self,
@@ -321,6 +388,7 @@ impl ApexApp {
             if untracked && !unstage {
                 c.git(&["add", "-N", "--", &rel], None)?;
             }
+            // Fixed prefixes and no external diff/textconv so the output is a patch git can apply.
             let mut diff_args = vec!["diff", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "-U3"];
             if unstage {
                 diff_args.push("--cached");
@@ -342,6 +410,11 @@ impl ApexApp {
     }
 
     /// Fetch, pull, push, force push and sync for the panel's repository.
+    ///
+    /// Pull honours the `git_pull_mode` setting (ff-only, rebase or merge).
+    /// A push from a branch without an upstream becomes a "publish"
+    /// (`push --set-upstream`) after confirmation; force push uses
+    /// `--force-with-lease` and always asks first.
     fn git_remote_command(&mut self, cmd: Command, arg: Option<String>) {
         let Some(workdir) = self.git_panel_repo().or_else(|| self.git_target(None).map(|t| t.0)) else { return };
         if !self.git_trusted(&workdir, cmd, &arg) {
@@ -379,6 +452,7 @@ impl ApexApp {
                     });
                     return;
                 }
+                // Sync is pull-then-push in one job, so a failed pull stops the push.
                 self.git_run(if sync { "Sync" } else { "Push" }, workdir, move |c| {
                     if sync {
                         c.git(&pull_args, None)?;
@@ -405,6 +479,10 @@ impl ApexApp {
     }
 
     /// Background fetch every `git_auto_fetch_minutes` (trusted repositories only).
+    ///
+    /// Called every frame; does nothing while a job runs or is queued, before
+    /// the interval has passed, for untrusted repositories, or when there is
+    /// no remote. The job is quiet and reports nothing on success.
     pub(crate) fn git_auto_fetch(&mut self) {
         let minutes = self.settings.git_auto_fetch_minutes;
         if minutes == 0 || self.git.ops.running.is_some() || !self.git.ops.queued.is_empty() {
@@ -413,6 +491,7 @@ impl ApexApp {
         if self.git.ops.last_auto_fetch.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(minutes * 60)) {
             return;
         }
+        // Stamp before the checks below so an untrusted repository is not re-checked every frame.
         self.git.ops.last_auto_fetch = Some(std::time::Instant::now());
         let Some(workdir) = self.git_panel_repo() else { return };
         if !self.trust.is_trusted(&workdir) || first_remote(&workdir).is_none() {
@@ -422,6 +501,9 @@ impl ApexApp {
     }
 
     /// Bottom panel "GIT" tab: the command log.
+    ///
+    /// Shows a spinner, label, progress and Cancel while a job runs, a Clear
+    /// button, and the log lines coloured by kind (command, error, warning).
     pub(crate) fn show_git_output_panel(&mut self, ui: &mut Ui) {
         let theme = self.theme.clone();
         let ui_font = self.settings.ui_font_size;
@@ -445,6 +527,8 @@ impl ApexApp {
         ui.separator();
         let mono = egui::FontId::monospace(ui_font);
         let row_h = ui_font + 5.0;
+        // Stick to the bottom only on frames where a line was appended, so the
+        // user can scroll back through the log while a job is still running.
         let stick = std::mem::take(&mut self.git.ops.scroll_log);
         egui::ScrollArea::both().auto_shrink([false, false]).id_salt("apex-git-log").stick_to_bottom(stick).show_rows(
             ui,
@@ -453,6 +537,7 @@ impl ApexApp {
             |ui, range| {
                 for i in range {
                     let line = &self.git.ops.log[i];
+                    // `$ ` prefixes the commands the job ran (see git_cli).
                     let colour = if line.starts_with("$ ") {
                         theme.ui.accent
                     } else if line.starts_with("fatal:") || line.starts_with("error:") || line.ends_with("failed") || line.contains(" failed: ") {
@@ -482,6 +567,7 @@ impl ApexApp {
 mod tests {
     use super::*;
 
+    /// Pins which git/ssh error texts get an authentication hint.
     #[test]
     fn auth_hints() {
         assert!(auth_hint("git@github.com: Permission denied (publickey).").is_some());
@@ -489,6 +575,7 @@ mod tests {
         assert!(auth_hint("fatal: not a git repository").is_none());
     }
 
+    /// Pins the `/`-separated, `.`-for-root form that git pathspecs need.
     #[test]
     fn relative_paths_use_slashes() {
         let w = Path::new("/repo");

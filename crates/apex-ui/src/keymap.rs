@@ -3,6 +3,17 @@
 //! Bindings are written as `"ctrl+shift+p"`, `"cmd+s"`, `"primary+k primary+b"`
 //! (a two-step chord). `primary` means Ctrl on Linux/Windows and Cmd on macOS.
 //! Key names follow egui's `Key::from_name` plus single characters.
+//!
+//! Data flow: `assets/keymap-default.toml` (embedded) is parsed by
+//! [`Keymap::defaults`]; the user's `keymap.toml` is parsed the same way and
+//! layered on top with [`Keymap::merge`]. Each frame the app feeds unconsumed
+//! key events to [`Keymap::dispatch_event`] together with the list of active
+//! [`Context`]s, and executes the [`Command`] it returns. The key map holds the
+//! partially typed chord between frames, so it must be the same instance
+//! across frames and [`Keymap::cancel_pending`] is needed when focus moves.
+//!
+//! Invariant: at most one binding per (chord, context) pair; [`Keymap::add`]
+//! replaces an earlier one, which is how user bindings override defaults.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -30,22 +41,29 @@ pub enum Context {
 }
 
 /// A single key press with modifiers.
+///
+/// `cmd` is the macOS Command key (egui's `mac_cmd`), never the Ctrl key, so
+/// `primary` bindings parse to different presses on different platforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyPress {
     pub key: Key,
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
+    /// Command on macOS, Super/Win elsewhere.
     pub cmd: bool,
 }
 
 impl KeyPress {
+    /// Build a press from an egui key event's key and modifier state.
     pub fn from_egui(key: Key, m: Modifiers) -> Self {
         Self { key, ctrl: m.ctrl, alt: m.alt, shift: m.shift, cmd: m.mac_cmd }
     }
 }
 
 impl fmt::Display for KeyPress {
+    /// Human-readable form for menus and the shortcut viewer: macOS uses the
+    /// glyphs users see in native menus, other platforms the `Ctrl+` style.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mac = cfg!(target_os = "macos");
         if self.ctrl {
@@ -64,6 +82,8 @@ impl fmt::Display for KeyPress {
     }
 }
 
+/// Display name of a key; the named keys get friendlier labels than egui's
+/// `symbol_or_name` (which would give `ArrowUp`, `Escape`).
 fn key_label(k: Key) -> &'static str {
     match k {
         Key::ArrowUp => "Up",
@@ -85,6 +105,7 @@ fn key_label(k: Key) -> &'static str {
 pub struct Chord(pub Vec<KeyPress>);
 
 impl fmt::Display for Chord {
+    /// Presses separated by single spaces, matching the TOML syntax.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, k) in self.0.iter().enumerate() {
             if i > 0 {
@@ -96,16 +117,22 @@ impl fmt::Display for Chord {
     }
 }
 
+/// Why a binding string could not be parsed.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KeyParseError {
+    /// The part after the last `+` is not a key name egui knows.
     #[error("unknown key {0:?}")]
     UnknownKey(String),
+    /// A `+`-separated prefix is not one of the accepted modifier names.
     #[error("unknown modifier {0:?}")]
     UnknownModifier(String),
+    /// The binding string (or one chord step) is blank.
     #[error("empty key binding")]
     Empty,
 }
 
+/// Whether `k` is a bare modifier key (Shift, Ctrl, Alt, Super). These are
+/// never bound on their own and must not disturb a pending chord.
 pub fn is_modifier_key(k: Key) -> bool {
     matches!(k, Key::ShiftLeft | Key::ShiftRight | Key::ControlLeft | Key::ControlRight | Key::AltLeft | Key::AltRight | Key::SuperLeft | Key::SuperRight)
 }
@@ -122,6 +149,9 @@ pub fn parse_chord(s: &str) -> Result<Chord, KeyParseError> {
     Ok(Chord(presses))
 }
 
+/// Parse one press such as `"ctrl+shift+p"`: every `+`-separated part but the
+/// last is a modifier (case-insensitive, with the aliases listed below); the
+/// last is the key. `primary` resolves to Cmd on macOS and Ctrl elsewhere.
 pub fn parse_press(s: &str) -> Result<KeyPress, KeyParseError> {
     let mut kp = KeyPress { key: Key::Space, ctrl: false, alt: false, shift: false, cmd: false };
     let s = s.trim();
@@ -157,6 +187,9 @@ pub fn parse_press(s: &str) -> Result<KeyPress, KeyParseError> {
     Ok(kp)
 }
 
+/// Resolve a key name to an egui `Key`: friendly aliases first (`esc`,
+/// `pgup`, punctuation), then single letters/digits, then egui's own names
+/// with a capitalised first letter so `f5` and `F5` both work.
 fn parse_key(s: &str) -> Option<Key> {
     let lower = s.to_ascii_lowercase();
     let named = match lower.as_str() {
@@ -175,6 +208,7 @@ fn parse_key(s: &str) -> Option<Key> {
         "pageup" | "pgup" => Some(Key::PageUp),
         "pagedown" | "pgdn" => Some(Key::PageDown),
         "tab" => Some(Key::Tab),
+        // egui has no Plus key: `+` is Shift+`=` on most layouts, so it maps to Equals.
         "plus" | "+" | "=" | "equals" => Some(Key::Equals),
         "minus" | "-" => Some(Key::Minus),
         "comma" | "," => Some(Key::Comma),
@@ -193,6 +227,7 @@ fn parse_key(s: &str) -> Option<Key> {
     }
     if lower.len() == 1 {
         let c = lower.chars().next()?;
+        // egui names letters in upper case ("A") and digits by the digit itself.
         if c.is_ascii_lowercase() {
             return Key::from_name(&c.to_ascii_uppercase().to_string());
         }
@@ -206,10 +241,13 @@ fn parse_key(s: &str) -> Option<Key> {
     })
 }
 
+/// A parsed binding: the chord to press, the command it runs and the focus
+/// context it applies in.
 #[derive(Debug, Clone)]
 pub struct Binding {
     pub chord: Chord,
     pub command: Command,
+    /// Optional argument passed to the command (e.g. a layout name).
     pub arg: Option<String>,
     pub context: Context,
 }
@@ -217,9 +255,13 @@ pub struct Binding {
 /// The active key map plus pending chord state.
 #[derive(Debug, Default)]
 pub struct Keymap {
+    /// In insertion order; later entries win on lookup (searched in reverse).
     bindings: Vec<Binding>,
-    /// (first press, context) → true if some chord starts with this press.
+    /// First press of every multi-step chord. Maintained by `add` but not
+    /// consulted: `dispatch` scans `bindings` for prefixes so it can honour
+    /// the active contexts.
     prefixes: HashMap<KeyPress, ()>,
+    /// Presses typed so far of a multi-step chord; cleared on match or miss.
     pending: Vec<KeyPress>,
 }
 
@@ -234,9 +276,11 @@ pub enum Dispatch {
     Command(Command, Option<String>),
 }
 
+/// One `[[bindings]]` entry as written in the TOML file, before validation.
 #[derive(Deserialize)]
 struct RawBinding {
     keys: String,
+    /// Command id as in [`Command::id`].
     command: String,
     #[serde(default)]
     arg: Option<String>,
@@ -244,6 +288,7 @@ struct RawBinding {
     context: Context,
 }
 
+/// Top-level shape of a key map TOML file.
 #[derive(Deserialize)]
 struct RawKeymap {
     #[serde(default)]
@@ -257,9 +302,12 @@ struct RawKeymap {
     macos: Vec<RawBinding>,
 }
 
+/// The built-in key map, embedded so the binary needs no external file.
 pub const DEFAULT_KEYMAP_TOML: &str = include_str!("../../../assets/keymap-default.toml");
 
 impl Keymap {
+    /// The built-in key map. Parse errors in the embedded file are logged
+    /// rather than fatal; the test below asserts there are none.
     pub fn defaults() -> Keymap {
         let (km, errors) = Keymap::parse(DEFAULT_KEYMAP_TOML);
         for e in errors {
@@ -287,6 +335,7 @@ impl Keymap {
         } else {
             raw.linux
         };
+        // Platform entries come after the common ones so they override them.
         for rb in raw.bindings.into_iter().chain(platform) {
             let chord = match parse_chord(&rb.keys) {
                 Ok(c) => c,
@@ -311,6 +360,8 @@ impl Keymap {
         }
     }
 
+    /// Add one binding, replacing any existing one with the same chord and
+    /// context, and record its first press as a chord prefix if multi-step.
     pub fn add(&mut self, b: Binding) {
         // A later binding with the same chord and context replaces the earlier one.
         self.bindings.retain(|x| !(x.chord == b.chord && x.context == b.context));
@@ -320,6 +371,7 @@ impl Keymap {
         self.bindings.push(b);
     }
 
+    /// All bindings in insertion order.
     pub fn bindings(&self) -> &[Binding] {
         &self.bindings
     }
@@ -345,6 +397,8 @@ impl Keymap {
                 return Dispatch::Command(b.command, b.arg.clone());
             }
         }
+        // No exact match: keep waiting only if some longer chord in an active
+        // context starts with what has been typed so far.
         let is_prefix = self.bindings.iter().any(|b| active.contains(&b.context) && b.chord.0.len() > seq.len() && b.chord.0.starts_with(&seq));
         if is_prefix {
             return Dispatch::Pending;
@@ -366,10 +420,12 @@ impl Keymap {
         }
     }
 
+    /// Presses of the chord typed so far (empty when none is in progress).
     pub fn pending(&self) -> &[KeyPress] {
         &self.pending
     }
 
+    /// Abandon a partially typed chord (e.g. on Escape or focus change).
     pub fn cancel_pending(&mut self) {
         self.pending.clear();
     }
@@ -388,6 +444,7 @@ impl Keymap {
 mod tests {
     use super::*;
 
+    /// Modifier aliases, the `ctrl++` special case, function keys and digits.
     #[test]
     fn parses_presses_and_chords() {
         let p = parse_press("ctrl+shift+p").unwrap();
@@ -402,6 +459,7 @@ mod tests {
         assert!(matches!(parse_press("ctrl+nonsense"), Err(KeyParseError::UnknownKey(_))));
     }
 
+    /// The embedded default key map must parse cleanly and have no conflicts.
     #[test]
     fn default_keymap_loads_without_errors() {
         let (km, errors) = Keymap::parse(DEFAULT_KEYMAP_TOML);
@@ -410,6 +468,7 @@ mod tests {
         assert!(km.conflicts().is_empty(), "{:?}", km.conflicts());
     }
 
+    /// Chord steps survive a bare modifier press; contexts gate matches.
     #[test]
     fn dispatch_handles_chords_and_contexts() {
         let (mut km, _) = Keymap::parse(

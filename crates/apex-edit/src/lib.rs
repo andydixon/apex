@@ -17,6 +17,14 @@
 //!   expressed in *pre-edit* coordinates and applied last-to-first so that
 //!   earlier offsets stay valid.
 //! * [`Document::revision`] strictly increases with every applied transaction.
+//!
+//! # Layering
+//!
+//! Depends on `apex-buffer` for the rope and offset arithmetic and on nothing
+//! GUI-related. `apex-syntax` consumes [`Document`]'s pending byte edits;
+//! `apex-ui` owns the views (each view holds a [`SelectionSet`]) and calls
+//! [`ops`] to turn key presses into transactions, then [`Document::apply`]
+//! to commit them. Everything here is synchronous and single-threaded.
 
 pub mod brackets;
 pub mod document;

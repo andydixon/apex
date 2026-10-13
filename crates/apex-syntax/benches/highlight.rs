@@ -3,6 +3,10 @@
 //! * full parse + highlight of a 100 KB Rust file
 //! * incremental re-highlight after a one-character edit in the middle
 //! * a single 2 MB line (pathological for naive highlighters)
+//!
+//! The parse budget is set to ten seconds so every parse completes
+//! synchronously; what is measured is parser and query throughput, not the
+//! background hand-off.
 
 use std::time::Duration;
 
@@ -11,6 +15,8 @@ use apex_syntax::highlight::SyntaxState;
 use apex_syntax::language::lookup;
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
+/// One realistic Rust function, repeated (with unique names) to build the
+/// 100 KB source so the parser sees a normal mix of node kinds.
 const UNIT: &str = r#"
 /// Computes a thing from two inputs and an offset.
 pub fn compute(alpha: u32, beta: &str, offset: Option<usize>) -> Result<String, std::io::Error> {
@@ -28,6 +34,8 @@ pub fn compute(alpha: u32, beta: &str, offset: Option<usize>) -> Result<String, 
 }
 "#;
 
+/// Repeat [`UNIT`] until the source is at least `bytes` long, renaming the
+/// function each time so the file is valid Rust without duplicate items.
 fn rust_source(bytes: usize) -> String {
     let mut s = String::with_capacity(bytes + UNIT.len());
     let mut i = 0;
@@ -38,6 +46,8 @@ fn rust_source(bytes: usize) -> String {
     s
 }
 
+/// Request spans for every line, returning the total span count so the
+/// result is observable and the work cannot be optimised away.
 fn highlight_all(st: &mut SyntaxState, doc: &Document) -> usize {
     let mut spans = 0;
     for line in 0..doc.len_lines() {
@@ -46,6 +56,7 @@ fn highlight_all(st: &mut SyntaxState, doc: &Document) -> usize {
     spans
 }
 
+/// Register the `rust_100kb` and `single_2mb_line` groups.
 fn bench(c: &mut Criterion) {
     let lang = lookup("rust").expect("rust grammar");
     let src = rust_source(100 * 1024);
@@ -70,6 +81,8 @@ fn bench(c: &mut Criterion) {
         highlight_all(&mut st, &doc);
         let mid = doc.len_chars() / 2;
         let sels = SelectionSet::default();
+        // Alternate insert/delete so the document length stays bounded
+        // across iterations instead of growing by one byte each time.
         let mut toggle = false;
         b.iter(|| {
             let tx = if toggle { Transaction::single(Change::delete(mid, mid + 1)) } else { Transaction::single(Change::insert(mid, "x")) };

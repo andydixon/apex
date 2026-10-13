@@ -1,27 +1,51 @@
 //! Document symbols from tags queries (and Markdown headings).
+//!
+//! [`document_symbols`] drives the outline panel and the "go to symbol"
+//! picker. For most languages it runs the grammar's tags query (the same
+//! `tags.scm` GitHub uses for code navigation) over the root tree and keeps
+//! every `@definition.*` capture that has a `@name`. Markdown has no tags
+//! query, so its headings are walked directly instead.
+//!
+//! All ranges are **byte** offsets into the document; `line` is zero-based.
+//! Only the root layer is inspected, so symbols inside injected languages
+//! (a Rust fence in Markdown) are not reported.
 
 use apex_buffer::Rope;
 use tree_sitter::{Node, QueryCursor, StreamingIterator};
 
 use crate::highlight::SyntaxState;
 
+/// Coarse classification of a symbol, used for the outline icon and label.
+///
+/// Mapped from tags-query capture names by [`kind_of`]; several capture
+/// names fold into one kind (e.g. `trait` and `protocol` are `Interface`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     Function,
     Method,
+    /// Also used for Rust structs and enums, because the Rust tags query
+    /// reports them as `definition.class`.
     Class,
     Struct,
     Enum,
+    /// Interfaces, traits and protocols.
     Interface,
+    /// Modules, namespaces and packages.
     Module,
+    /// Type aliases and unions.
     Type,
+    /// Constants and macros.
     Constant,
+    /// Variables, fields and properties.
     Variable,
+    /// A Markdown heading; `depth` is derived from the heading level.
     Heading,
+    /// Any `definition.*` capture not listed above.
     Other,
 }
 
 impl SymbolKind {
+    /// Short lower-case label shown next to the symbol name in the outline.
     pub fn label(self) -> &'static str {
         match self {
             Self::Function => "fn",
@@ -40,10 +64,13 @@ impl SymbolKind {
     }
 }
 
+/// One entry in the document outline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
+    /// The identifier text (or heading title), at most 200 bytes.
     pub name: String,
     pub kind: SymbolKind,
+    /// Zero-based line on which the definition starts.
     pub line: usize,
     /// Byte range of the whole definition.
     pub range: (usize, usize),
@@ -53,6 +80,8 @@ pub struct Symbol {
     pub depth: u16,
 }
 
+/// Map a tags-query capture name such as `definition.function` to a kind.
+/// Returns `None` for captures that are not definitions (`name`, `reference.*`).
 fn kind_of(capture: &str) -> Option<SymbolKind> {
     let k = capture.strip_prefix("definition.")?;
     Some(match k {
@@ -71,6 +100,12 @@ fn kind_of(capture: &str) -> Option<SymbolKind> {
 }
 
 /// Extract symbols from the document. Bounded to `limit` entries.
+///
+/// Returns an empty list when there is no tree yet (background parse in
+/// progress) or the language has no tags query. The result is sorted by
+/// definition start, de-duplicated on the name token (a query may match the
+/// same definition under two patterns), and given a nesting `depth` based on
+/// range containment.
 pub fn document_symbols(state: &SyntaxState, rope: &Rope, limit: usize) -> Vec<Symbol> {
     let Some(tree) = state.root_tree() else { return Vec::new() };
     let mut out: Vec<Symbol> = Vec::new();
@@ -100,6 +135,8 @@ pub fn document_symbols(state: &SyntaxState, rope: &Rope, limit: usize) -> Vec<S
         }
         let (Some((kind, node)), Some(name)) = (def, name_node) else { continue };
         let text = rope.byte_slice(name.byte_range()).to_string();
+        // A huge "name" means the query captured a whole expression (seen
+        // with some JS patterns); it would wreck the outline layout.
         if text.is_empty() || text.len() > 200 {
             continue;
         }
@@ -118,6 +155,8 @@ pub fn document_symbols(state: &SyntaxState, rope: &Rope, limit: usize) -> Vec<S
     out.sort_by_key(|s| s.range.0);
     out.dedup_by(|a, b| a.name_range == b.name_range);
     // Depth from containment.
+    // Symbols are sorted by start, so the stack holds the ranges of every
+    // enclosing definition once the ones that ended before `s` are popped.
     let mut stack: Vec<(usize, usize)> = Vec::new();
     for s in &mut out {
         while stack.last().is_some_and(|&(_, end)| end <= s.range.0) {
@@ -129,6 +168,12 @@ pub fn document_symbols(state: &SyntaxState, rope: &Rope, limit: usize) -> Vec<S
     out
 }
 
+/// Recursively gather Markdown headings as [`SymbolKind::Heading`] symbols.
+///
+/// The block grammar nests content in `section` nodes, one per heading, so
+/// recursion only descends into sections. Depth is the heading level minus
+/// one (`#` is 0). Setext headings (underlined with `=` or `-`) have no `#`
+/// and land at depth 0.
 fn collect_headings(node: Node, rope: &Rope, out: &mut Vec<Symbol>, limit: usize) {
     if out.len() >= limit {
         return;
@@ -137,6 +182,8 @@ fn collect_headings(node: Node, rope: &Rope, out: &mut Vec<Symbol>, limit: usize
         "atx_heading" | "setext_heading" => {
             let text = rope.byte_slice(node.byte_range()).to_string();
             let level = text.chars().take_while(|c| *c == '#').count().max(1);
+            // Strip `#` markers, take the first line only (setext headings
+            // include their underline), then drop that underline's chars.
             let title = text.trim_start_matches('#').trim().lines().next().unwrap_or("").trim_end_matches(['=', '-']).trim().to_string();
             if !title.is_empty() {
                 out.push(Symbol {
@@ -166,6 +213,7 @@ mod tests {
     use apex_edit::Document;
     use std::time::Duration;
 
+    /// Pins the kinds the Rust tags query yields and that nesting follows `mod` blocks.
     #[test]
     fn rust_symbols() {
         let src = "struct S;\nimpl S {\n    fn m(&self) {}\n}\nfn free() {}\nenum E { A }\n";
@@ -186,6 +234,7 @@ mod tests {
         assert_eq!(inner.depth, 1);
     }
 
+    /// Heading level maps to outline depth.
     #[test]
     fn markdown_headings() {
         let mut doc = Document::from_text("# One\n\ntext\n\n## Two\n\n### Three\n");

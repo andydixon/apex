@@ -39,6 +39,7 @@ pub(crate) enum FileDialogKind {
     },
 }
 
+/// Which native dialog to show (one or many files, a folder, or a save name).
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Mode {
     PickFiles,
@@ -50,7 +51,9 @@ pub(crate) enum Mode {
 /// Dialog parameters, independent of the backend.
 pub struct FileDialogSpec {
     pub(crate) title: String,
+    /// Folder the dialog opens in; the backend's default when `None`.
     pub(crate) directory: Option<PathBuf>,
+    /// Pre-filled name for `SaveFile` (also appended to the in-app prompt).
     pub(crate) file_name: Option<String>,
     /// `(name, extensions)`; honoured by rfd, ignored by the macOS panel.
     pub(crate) filter: Option<(String, Vec<String>)>,
@@ -58,34 +61,43 @@ pub struct FileDialogSpec {
 }
 
 impl FileDialogSpec {
+    /// A multi-select open dialog.
     pub fn open_files(title: &str) -> Self {
         Self::new(title, Mode::PickFiles)
     }
+    /// A single-file open dialog.
     pub fn open_file(title: &str) -> Self {
         Self::new(title, Mode::PickFile)
     }
+    /// A folder picker.
     pub fn open_folder(title: &str) -> Self {
         Self::new(title, Mode::PickFolder)
     }
+    /// A save dialog.
     pub fn save_file(title: &str) -> Self {
         Self::new(title, Mode::SaveFile)
     }
+    /// Bare spec with no directory, name or filter.
     fn new(title: &str, mode: Mode) -> Self {
         Self { title: title.to_string(), directory: None, file_name: None, filter: None, mode }
     }
+    /// Builder: set the starting folder.
     pub fn directory(mut self, dir: Option<PathBuf>) -> Self {
         self.directory = dir;
         self
     }
+    /// Builder: set the pre-filled file name.
     pub fn file_name(mut self, name: impl Into<String>) -> Self {
         self.file_name = Some(name.into());
         self
     }
+    /// Builder: add an extension filter (`extensions` without leading dots).
     pub fn filter(mut self, name: &str, extensions: &[&str]) -> Self {
         self.filter = Some((name.to_string(), extensions.iter().map(|e| e.to_string()).collect()));
         self
     }
 
+    /// Translate the spec into an rfd builder (non-macOS backends).
     #[cfg(not(target_os = "macos"))]
     fn sync_dialog(&self) -> rfd::FileDialog {
         let mut d = rfd::FileDialog::new().set_title(&self.title);
@@ -114,12 +126,18 @@ impl FileDialogSpec {
     }
 }
 
+/// A native dialog that has been shown and not yet answered. At most one is
+/// held in `ApexApp::file_dialog`.
 pub struct PendingFileDialog {
+    /// What to do with the paths once they arrive.
     kind: FileDialogKind,
+    /// Delivers the chosen paths (empty = cancelled) exactly once.
     rx: Receiver<Vec<PathBuf>>,
 }
 
 impl PendingFileDialog {
+    /// Show the dialog on the platform's mechanism (see the module doc) and
+    /// return the handle to poll. Never blocks the caller.
     fn start(spec: FileDialogSpec, kind: FileDialogKind, ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
         #[cfg(target_os = "macos")]
@@ -142,6 +160,8 @@ impl PendingFileDialog {
         match self.rx.try_recv() {
             Ok(v) => Some(v),
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            // The sender went away without answering (thread panicked or the
+            // panel failed): treat as cancelled so the slot is freed.
             Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Vec::new()),
         }
     }
@@ -167,6 +187,10 @@ impl ApexApp {
     }
 
     /// The in-app alternative: a path prompt with Tab completion.
+    ///
+    /// The initial text is the spec's directory (else the first root, else the
+    /// home folder) with a trailing separator, plus the spec's file name. The
+    /// answer is validated and delivered by `prompt_accepted` in `workspace_ui.rs`.
     pub(crate) fn prompt_for_path(&mut self, spec: &FileDialogSpec, kind: FileDialogKind) {
         let mut initial = spec
             .directory
@@ -192,11 +216,14 @@ impl ApexApp {
     pub(crate) fn poll_file_dialog(&mut self, ctx: &egui::Context) {
         let Some(pending) = &mut self.file_dialog else { return };
         let Some(paths) = pending.poll() else { return };
+        // Take the slot before acting: the handler may open another dialog.
         let Some(PendingFileDialog { kind, .. }) = self.file_dialog.take() else { return };
         self.file_dialog_result(kind, paths);
         ctx.request_repaint();
     }
 
+    /// Act on the chosen paths according to `kind`. An empty `paths` (cancel)
+    /// does nothing. Shared by the native dialogs and the in-app path prompt.
     pub(crate) fn file_dialog_result(&mut self, kind: FileDialogKind, paths: Vec<PathBuf>) {
         match kind {
             FileDialogKind::OpenFiles => {
@@ -220,6 +247,8 @@ impl ApexApp {
                 }
             }
             FileDialogKind::SaveAs { vid, then } => {
+                // Only continue the close sequence if the save succeeded; a failed
+                // save leaves the dirty tab open.
                 if let Some(p) = paths.first()
                     && self.save_view_to(vid, normalise_path(p))
                     && then.is_some()
@@ -251,12 +280,19 @@ impl ApexApp {
 
 /// Tab completion for a typed path: the completed text and the candidates
 /// (names, with a trailing separator for folders) when it is ambiguous.
+///
+/// `~` expands to the home folder. Matching is case-insensitive on the last
+/// path component; dot-files are offered only when the prefix starts with a
+/// dot. With `folders_only`, files are neither offered nor completed. One
+/// candidate completes fully; several complete to their longest common prefix.
 pub(crate) fn complete_path(text: &str, folders_only: bool) -> (String, Vec<String>) {
     let sep = std::path::MAIN_SEPARATOR;
     let expanded = match text.strip_prefix('~') {
         Some(rest) => directories::UserDirs::new().map(|u| format!("{}{rest}", u.home_dir().display())).unwrap_or_else(|| text.to_string()),
         None => text.to_string(),
     };
+    // Split at the last separator: everything before it is the folder to list.
+    // No separator at all means there is nothing sensible to complete against.
     let (dir, prefix) = match expanded.rfind(['/', sep]) {
         Some(i) => (expanded[..=i].to_string(), expanded[i + 1..].to_string()),
         None => return (text.to_string(), Vec::new()),
@@ -294,6 +330,8 @@ pub(crate) fn complete_path(text: &str, folders_only: bool) -> (String, Vec<Stri
 mod tests {
     use super::*;
 
+    /// Common-prefix completion with candidates, single-match completion,
+    /// folders-only filtering and the no-separator passthrough.
     #[test]
     fn path_completion() {
         let d = tempfile::tempdir().unwrap();

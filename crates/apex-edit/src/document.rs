@@ -1,4 +1,18 @@
 //! The document: text, revision, history and file metadata.
+//!
+//! A [`Document`] is shared by every view that shows it (split panes) and is
+//! the single owner of the rope. Views keep their own [`SelectionSet`] and
+//! the revision they last saw; when they next touch the document they call
+//! [`Document::sync_selections`] to replay the transactions they missed from
+//! the bounded `recent` ring.
+//!
+//! All text changes go through [`Document::apply`] (user edits, recorded in
+//! history) or `apply_raw` (undo/redo/reload). Both bump `revision`, remap
+//! bookmarks and marks, and queue [`ByteEdit`]s that the syntax layer drains
+//! with [`Document::take_pending_byte_edits`]. File I/O, encoding and
+//! line-ending conversion are the application's job; the document only
+//! records the metadata (`encoding`, `line_ending`, `file_identity`) that the
+//! saver needs.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -14,12 +28,17 @@ use crate::selection::SelectionSet;
 use crate::transaction::{Assoc, Transaction};
 
 /// Process-unique document identifier.
+///
+/// Used as the key in the application's document table and in session
+/// state; never reused within a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DocId(pub u64);
 
+/// Counter behind [`DocId::next`]; starts at 1 so 0 can mean "none".
 static NEXT_DOC_ID: AtomicU64 = AtomicU64::new(1);
 
 impl DocId {
+    /// Allocate a fresh id (thread-safe).
     pub fn next() -> Self {
         Self(NEXT_DOC_ID.fetch_add(1, Ordering::Relaxed))
     }
@@ -39,6 +58,7 @@ pub enum EditKind {
 }
 
 impl EditKind {
+    /// Whether consecutive edits of this kind may share one undo entry.
     pub fn coalesces(self) -> bool {
         !matches!(self, Self::Other)
     }
@@ -48,11 +68,17 @@ impl EditKind {
 /// `InputEdit` without the dependency). Points are (row, byte column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteEdit {
+    /// Byte offset where the replaced range begins (same before and after).
     pub start_byte: usize,
+    /// Exclusive end of the removed bytes, in pre-edit coordinates.
     pub old_end_byte: usize,
+    /// Exclusive end of the inserted bytes, in post-edit coordinates.
     pub new_end_byte: usize,
+    /// (row, byte column) of `start_byte`.
     pub start_point: (usize, usize),
+    /// (row, byte column) of `old_end_byte` in the pre-edit text.
     pub old_end_point: (usize, usize),
+    /// (row, byte column) of `new_end_byte` in the post-edit text.
     pub new_end_point: (usize, usize),
 }
 
@@ -60,20 +86,26 @@ pub struct ByteEdit {
 /// external modification before overwriting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileIdentity {
+    /// mtime, if the filesystem reports one.
     pub modified: Option<std::time::SystemTime>,
+    /// Size in bytes.
     pub len: u64,
+    /// Inode number, so a file replaced by rename is noticed even with equal mtime and size.
     #[cfg(unix)]
     pub inode: u64,
+    /// Device number, paired with `inode`.
     #[cfg(unix)]
     pub dev: u64,
 }
 
 impl FileIdentity {
+    /// Stat `path` and capture its identity.
     pub fn of(path: &Path) -> std::io::Result<Self> {
         let md = std::fs::metadata(path)?;
         Ok(Self::from_metadata(&md))
     }
 
+    /// Build from metadata already fetched (avoids a second stat after a write).
     pub fn from_metadata(md: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
@@ -93,8 +125,11 @@ impl FileIdentity {
 #[derive(Debug)]
 pub struct Document {
     pub id: DocId,
+    /// The text. Only `apply_raw` mutates it.
     rope: Rope,
+    /// Incremented on every applied transaction (including undo/redo); starts at 1.
     revision: u64,
+    /// `revision` at the last save or load; `is_dirty` compares against it.
     saved_revision: u64,
     history: History,
     /// Recently applied transactions `(revision_after, tx)` so that views can
@@ -102,17 +137,28 @@ pub struct Document {
     recent: VecDeque<(u64, Arc<Transaction>)>,
     /// Byte edits not yet consumed by the syntax layer, in application order.
     pending_byte_edits: Vec<ByteEdit>,
+    /// On-disk location; `None` for untitled and scratch buffers.
     pub path: Option<PathBuf>,
+    /// Encoding to write with (and the one the file was read with).
     pub encoding: Encoding,
+    /// Terminator to write with; detected from the text on load.
     pub line_ending: LineEnding,
+    /// The loaded text had more than one terminator style (status-bar warning).
     pub mixed_line_endings: bool,
+    /// Decoding substituted U+FFFD somewhere; saving would be lossy.
     pub had_decode_errors: bool,
+    /// Rejects `apply` (file not writable, or a diff/history view).
     pub read_only: bool,
+    /// Over [`LARGE_FILE_BYTES`] or has a line over [`HUGE_LINE_BYTES`]:
+    /// highlighting and other per-line features are disabled.
     pub large_file: bool,
+    /// Identity at last read/write, for external-modification checks.
     pub file_identity: Option<FileIdentity>,
     /// Language identifier override (`None` = detect from path/content).
     pub language_override: Option<String>,
+    /// Indentation style used by editing commands (tabs/spaces, widths).
     pub indent: IndentSettings,
+    /// `detect_indent_once` has run; prevents re-detection on every view open.
     pub indent_detected: bool,
     /// Bookmarked char offsets, kept in sync with edits.
     bookmarks: Vec<usize>,
@@ -125,12 +171,18 @@ pub struct Document {
 }
 
 impl Document {
+    /// A new untitled, empty document.
     pub fn empty() -> Self {
         Self::from_text(String::new())
     }
 
+    /// Build from already-decoded text: detects the line-ending style from
+    /// the first MiB and decides large-file mode. Encoding, path and the
+    /// rest of the metadata are left at defaults for the loader to fill in.
     pub fn from_text(text: impl AsRef<str>) -> Self {
         let text = text.as_ref();
+        // Sample only the first MiB: opening a huge file must stay fast and
+        // the dominant style is almost always visible early.
         let stats = apex_buffer::line_ending::scan(text, 1 << 20);
         let line_ending = stats.dominant(LineEnding::native());
         let rope = Rope::from_str(text);
@@ -161,25 +213,30 @@ impl Document {
         }
     }
 
+    /// The text, read-only.
     #[inline]
     pub fn rope(&self) -> &Rope {
         &self.rope
     }
 
+    /// The whole text as a slice.
     #[inline]
     pub fn slice(&self) -> RopeSlice<'_> {
         self.rope.slice(..)
     }
 
+    /// Current revision; strictly increases with every applied transaction.
     #[inline]
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
+    /// True when the text differs from what was last saved or loaded.
     pub fn is_dirty(&self) -> bool {
         self.revision != self.saved_revision
     }
 
+    /// Record that the current revision is on disk.
     pub fn mark_saved(&mut self) {
         self.saved_revision = self.revision;
     }
@@ -190,22 +247,27 @@ impl Document {
         self.saved_revision = self.revision;
     }
 
+    /// Undo/redo history, read-only.
     pub fn history(&self) -> &History {
         &self.history
     }
 
+    /// Undo/redo history; used to mark group boundaries or clear it.
     pub fn history_mut(&mut self) -> &mut History {
         &mut self.history
     }
 
+    /// Length in chars.
     pub fn len_chars(&self) -> usize {
         self.rope.len_chars()
     }
 
+    /// Length in UTF-8 bytes.
     pub fn len_bytes(&self) -> usize {
         self.rope.len_bytes()
     }
 
+    /// Number of lines (a trailing newline yields a final empty line).
     pub fn len_lines(&self) -> usize {
         self.rope.len_lines()
     }
@@ -229,6 +291,7 @@ impl Document {
         std::mem::take(&mut self.pending_byte_edits)
     }
 
+    /// True when edits have happened since the syntax layer last drained them.
     pub fn has_pending_byte_edits(&self) -> bool {
         !self.pending_byte_edits.is_empty()
     }
@@ -296,6 +359,11 @@ impl Document {
     }
 
     /// Replace the entire text (e.g. reload from disk) as a single undoable step.
+    ///
+    /// Selections are mapped with `Before` association, so they collapse to
+    /// the start of the new text; callers typically restore positions by
+    /// line afterwards. Boundaries on both sides keep the reload from being
+    /// coalesced with typing.
     pub fn replace_all(&mut self, text: &str, sels: &SelectionSet) {
         let tx = Transaction::single(crate::transaction::Change::replace(0, self.rope.len_chars(), text));
         let mut after = sels.clone();
@@ -313,6 +381,8 @@ impl Document {
         if seen_revision == self.revision {
             return true;
         }
+        // The ring must still hold the transaction that produced
+        // `seen_revision + 1`, otherwise an unknown edit sits in the gap.
         let covered = self.recent.front().is_some_and(|(rev, _)| *rev <= seen_revision + 1);
         if covered {
             for (rev, tx) in &self.recent {
@@ -346,10 +416,13 @@ impl Document {
         }
     }
 
+    /// Bookmark char offsets, sorted ascending.
     pub fn bookmarks(&self) -> &[usize] {
         &self.bookmarks
     }
 
+    /// Remove the bookmark on `line` if there is one, otherwise add one at
+    /// the start of the line.
     pub fn toggle_bookmark(&mut self, line: usize) {
         let line_start = self.rope.line_to_char(line.min(self.rope.len_lines().saturating_sub(1)));
         let line_end = apex_buffer::position::line_end_char(&self.rope, line);
@@ -361,24 +434,30 @@ impl Document {
         }
     }
 
+    /// Remove every bookmark.
     pub fn clear_bookmarks(&mut self) {
         self.bookmarks.clear();
     }
 
+    /// Lines carrying a bookmark, ascending and de-duplicated (two bookmarks
+    /// can land on one line after a deletion merges lines).
     pub fn bookmarked_lines(&self) -> Vec<usize> {
         let mut v: Vec<usize> = self.bookmarks.iter().map(|&b| self.rope.char_to_line(b.min(self.rope.len_chars()))).collect();
         v.dedup();
         v
     }
 
+    /// Set (or move) the named mark to char offset `pos`, clamped.
     pub fn set_mark(&mut self, name: impl Into<String>, pos: usize) {
         self.marks.insert(name.into(), pos.min(self.rope.len_chars()));
     }
 
+    /// Char offset of a named mark.
     pub fn mark(&self, name: &str) -> Option<usize> {
         self.marks.get(name).copied()
     }
 
+    /// All named marks, sorted by name.
     pub fn marks(&self) -> &BTreeMap<String, usize> {
         &self.marks
     }
@@ -393,6 +472,7 @@ impl Document {
         self.rope.slice(start..end).into()
     }
 
+    /// The whole text as an owned `String` (allocates; avoid on large files).
     pub fn text(&self) -> String {
         self.rope.to_string()
     }
@@ -407,6 +487,7 @@ impl Document {
         self.indent = default;
         if let Some(d) = crate::indent::detect_indent(&self.rope, 2000) {
             self.indent.style = d.style;
+            // A tab-indented file says nothing about the preferred width.
             if d.style == crate::indent::IndentStyle::Spaces {
                 self.indent.indent_width = d.indent_width;
             }
@@ -414,12 +495,15 @@ impl Document {
     }
 }
 
+/// Size of the `recent` transaction ring used to resync stale views.
 const RECENT_TX: usize = 256;
 /// Above this size the document opens in large-file mode.
 pub const LARGE_FILE_BYTES: usize = 64 * 1024 * 1024;
 /// Lines longer than this (bytes) trigger large-file mode too.
 pub const HUGE_LINE_BYTES: usize = 1 << 20;
 
+/// True when some line exceeds [`HUGE_LINE_BYTES`]. Cheap when the file is
+/// small or its average line length makes a huge line impossible.
 fn has_huge_line(rope: &Rope) -> bool {
     if rope.len_bytes() < HUGE_LINE_BYTES {
         return false;
@@ -438,6 +522,7 @@ mod tests {
     use crate::selection::Selection;
     use crate::transaction::Change;
 
+    /// Undo returns `sel_before`, redo returns `sel_after`, and redo past the end is `None`.
     #[test]
     fn apply_undo_redo_restores_text_and_selections() {
         let mut d = Document::from_text("hello");
@@ -455,6 +540,7 @@ mod tests {
         assert!(d.redo().is_none());
     }
 
+    /// Three typed chars form one undo entry; an `Other` edit forms its own.
     #[test]
     fn typing_coalesces_and_other_edits_do_not() {
         let mut d = Document::from_text("");
@@ -473,6 +559,7 @@ mod tests {
         assert_eq!(d.text(), "");
     }
 
+    /// A bookmark shifts down when a line is inserted above it.
     #[test]
     fn bookmarks_follow_edits() {
         let mut d = Document::from_text("a\nb\nc\n");
@@ -485,6 +572,7 @@ mod tests {
         assert!(d.bookmarked_lines().is_empty());
     }
 
+    /// A view that missed an edit gets its selection remapped through the ring.
     #[test]
     fn stale_selections_are_resynced() {
         let mut d = Document::from_text("abcdef");
@@ -496,6 +584,7 @@ mod tests {
         assert_eq!(other_view.primary(), Selection::new(5, 7));
     }
 
+    /// `apply` on a read-only document returns false and changes nothing.
     #[test]
     fn read_only_blocks_edits() {
         let mut d = Document::from_text("x");
