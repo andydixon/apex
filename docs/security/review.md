@@ -183,9 +183,11 @@ and open files in the editor — equivalent to what it could do by running
   text printed by the login shell (`.bashrc`, `ForceCommand`) cannot leak
   into file contents. `-T`, `RemoteCommand=none` and `ClearAllForwardings`
   stop the user's host config adding a terminal, a command or forwards.
-* On Unix, connections are multiplexed through a socket in the private
-  runtime directory (`ssh-%C`, quoted for paths with spaces, skipped if the
-  expanded path would exceed the socket length limit).
+* On Unix, connections are multiplexed through a socket (`ssh-%C`) in the
+  private runtime directory or, where that path is too long for a socket
+  (always on macOS), in `/tmp/apex-<uid>`. The folder must be a real
+  directory (not a symlink) owned by the user with mode `0700`; otherwise
+  multiplexing is skipped. The path is quoted for ssh.
 * **Credentials**: password and passphrase prompts use the same askpass
   helper and per-call loopback listener as git (random port, 256-bit
   token). Answers are kept for reuse in `apex_project::secret::Secret`:

@@ -70,17 +70,31 @@ fn rememberable(prompt: &str) -> bool {
 fn control_path() -> Option<String> {
     #[cfg(unix)]
     {
-        let dir = crate::paths::runtime_dir();
-        let socket = dir.join("ssh-%C");
-        // Unix socket paths are limited to 104 bytes on macOS, and ssh expands
-        // `%C` to 40 characters; skip multiplexing rather than fail.
-        let s = socket.display().to_string();
-        if s.len() + 38 < 104 && !s.contains('"') && crate::paths::ensure_private_dir(&dir).is_ok() {
-            // Quoted: ssh splits option values at spaces ("Application Support" on macOS).
-            return Some(format!("\"{s}\""));
-        }
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        // macOS's runtime directory ("~/Library/Application Support/…") is
+        // always too long for a socket, so a private folder in /tmp backs it up.
+        [crate::paths::runtime_dir(), PathBuf::from(format!("/tmp/apex-{uid}"))].into_iter().find_map(|d| socket_in(&d, uid))
     }
+    #[cfg(not(unix))]
     None
+}
+
+/// `dir/ssh-%C`, quoted for ssh, if it fits and `dir` is ours and private.
+#[cfg(unix)]
+fn socket_in(dir: &std::path::Path, uid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let s = dir.join("ssh-%C").display().to_string();
+    // Socket paths are limited to 104 bytes on macOS; ssh expands `%C` to 40
+    // characters and adds a 17-character suffix while creating the socket.
+    if s.len() + 38 + 17 >= 104 || s.contains('"') {
+        return None;
+    }
+    crate::paths::ensure_private_dir(dir).ok()?;
+    // Not a symlink, and not someone else's folder (it may be in /tmp).
+    let m = std::fs::symlink_metadata(dir).ok()?;
+    // Quoted: ssh splits option values at spaces.
+    (m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0).then(|| format!("\"{s}\""))
 }
 
 /// Close the shared connection to `host`, if one is open, so nothing can
@@ -308,6 +322,21 @@ mod tests {
         assert_eq!(asked.load(Ordering::SeqCst), 2);
         interactive.credentials.forget("h");
         assert!(stamp(&silent, "h", path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_folder() {
+        let d = tempfile::tempdir().unwrap();
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        let ok = d.path().join("a b");
+        assert_eq!(socket_in(&ok, uid), Some(format!("\"{}/ssh-%C\"", ok.display())));
+        assert_eq!(socket_in(&ok, uid + 1), None, "someone else's folder");
+        assert_eq!(socket_in(&d.path().join("x".repeat(60)), uid), None, "too long");
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&ok, &link).unwrap();
+        assert_eq!(socket_in(&link, uid), None, "symlink");
     }
 
     #[test]
