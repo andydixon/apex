@@ -14,7 +14,7 @@
 //!   first call each one costs a round trip rather than a handshake.
 //! * A file's *stamp* is its `cksum` output: comparing stamps detects
 //!   changes made on the server without transferring the file.
-//! * Writes upload to a temporary file beside the target, check the byte
+//! * Writes upload to a private temporary file (`mktemp`), check the byte
 //!   count arrived intact, then copy it over the target (keeping its owner
 //!   and permissions). A dropped connection never truncates the original.
 
@@ -72,9 +72,12 @@ fn control_path() -> Option<String> {
     {
         let dir = crate::paths::runtime_dir();
         let socket = dir.join("ssh-%C");
-        // Unix socket paths are limited to ~104 bytes; skip multiplexing rather than fail.
-        if socket.as_os_str().len() < 90 && crate::paths::ensure_private_dir(&dir).is_ok() {
-            return Some(socket.display().to_string());
+        // Unix socket paths are limited to 104 bytes on macOS, and ssh expands
+        // `%C` to 40 characters; skip multiplexing rather than fail.
+        let s = socket.display().to_string();
+        if s.len() + 38 < 104 && !s.contains('"') && crate::paths::ensure_private_dir(&dir).is_ok() {
+            // Quoted: ssh splits option values at spaces ("Application Support" on macOS).
+            return Some(format!("\"{s}\""));
         }
     }
     None
@@ -115,6 +118,9 @@ fn run(auth: &Auth, host: &str, script: &str, stdin: Option<&[u8]>) -> Result<Ve
     cmd.args(["-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"]);
     // First contact records the host key; a changed key is still refused.
     cmd.args(["-o", "StrictHostKeyChecking=accept-new"]);
+    // A host's own setup in ~/.ssh/config must not get in the way: no
+    // terminal, no RemoteCommand, no port forwards (which can fail to bind).
+    cmd.args(["-T", "-o", "RemoteCommand=none", "-o", "ClearAllForwardings=yes"]);
     if let Some(path) = control_path() {
         cmd.args(["-o", "ControlMaster=auto", "-o", &format!("ControlPath={path}"), "-o", "ControlPersist=120"]);
     }
@@ -152,7 +158,8 @@ fn run(auth: &Auth, host: &str, script: &str, stdin: Option<&[u8]>) -> Result<Ve
         _ => cmd.args(["-o", "BatchMode=yes"]),
     };
     // The login shell may not be POSIX (fish), so the script runs under sh.
-    cmd.arg("--").arg(host).arg(format!("sh -c {}", q(script)));
+    // The marker separates our output from anything the login shell prints first.
+    cmd.arg("--").arg(host).arg(format!("sh -c {}", q(&format!("printf '\\036apex\\036\\n'; {script}"))));
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("could not run ssh: {e}"))?;
     if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
@@ -164,7 +171,8 @@ fn run(auth: &Auth, host: &str, script: &str, stdin: Option<&[u8]>) -> Result<Ve
     }
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
     if out.status.success() {
-        return Ok(out.stdout);
+        let at = out.stdout.windows(MARK.len()).position(|w| w == MARK).ok_or("unexpected reply from the server")?;
+        return Ok(out.stdout[at + MARK.len()..].to_vec());
     }
     let err = String::from_utf8_lossy(&out.stderr);
     if err.contains("Permission denied") {
@@ -172,6 +180,9 @@ fn run(auth: &Auth, host: &str, script: &str, stdin: Option<&[u8]>) -> Result<Ve
     }
     Err(err.lines().rev().map(str::trim).find(|l| !l.is_empty()).map(str::to_string).unwrap_or_else(|| format!("ssh exited with {}", out.status)))
 }
+
+/// Printed first by every script (see [`run`]).
+const MARK: &[u8] = b"\x1eapex\x1e\n";
 
 /// Split `out` into its first line (the stamp) and the rest.
 fn split_stamp(out: &[u8]) -> Result<(String, &[u8]), String> {
@@ -192,9 +203,11 @@ pub fn write(auth: &Auth, host: &str, path: &str, bytes: &[u8]) -> Result<String
     let p = q(path);
     let n = bytes.len();
     // `cat` sees end-of-input when the connection drops, so the size check
-    // is what stops a partial upload reaching the target.
-    let script =
-        format!("t={p}.apex-$$; trap 'rm -f \"$t\"' EXIT HUP INT TERM; cat > \"$t\" && [ $(($(wc -c < \"$t\"))) -eq {n} ] && cat \"$t\" > {p} && cksum < {p}");
+    // is what stops a partial upload reaching the target. mktemp's file is
+    // private (the target may be too) and needs no write access to the folder.
+    let script = format!(
+        "t=$(mktemp) || exit 1; trap 'rm -f \"$t\"' EXIT HUP INT TERM; cat > \"$t\" && [ $(($(wc -c < \"$t\"))) -eq {n} ] && cat \"$t\" > {p} && cksum < {p}"
+    );
     let out = run(auth, host, &script, Some(bytes))?;
     Ok(split_stamp(&out)?.0)
 }
@@ -230,7 +243,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let d = tempfile::tempdir().unwrap();
         let fake = d.path().join("ssh");
-        std::fs::write(&fake, "#!/bin/sh\nfor last; do :; done\nexec sh -c \"$last\"\n").unwrap();
+        // It greets like a chatty login shell; the marker keeps that out of the data.
+        std::fs::write(&fake, "#!/bin/sh\necho Welcome to prod\nfor last; do :; done\nexec sh -c \"$last\"\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         // SAFETY: only this test reads APEX_SSH.
         unsafe { std::env::set_var("APEX_SSH", &fake) };

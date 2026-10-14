@@ -175,11 +175,17 @@ and open files in the editor — equivalent to what it could do by running
   script that runs under `sh -c` on the server.
 * Host keys: `StrictHostKeyChecking=accept-new`. New hosts are recorded on
   first contact (trust on first use); a changed key is refused.
-* Writes go to `<file>.apex-<pid>` beside the target; the byte count is
-  checked before the content is copied over the target, so a dropped
-  connection cannot truncate it. A trap removes the temporary file.
+* Writes go to a `mktemp` file (owner-only, so a private target is never
+  briefly readable by others); the byte count is checked before the
+  content is copied over the target, so a dropped connection cannot
+  truncate it. A trap removes the temporary file.
+* Every script prints a marker first and only output after it is used, so
+  text printed by the login shell (`.bashrc`, `ForceCommand`) cannot leak
+  into file contents. `-T`, `RemoteCommand=none` and `ClearAllForwardings`
+  stop the user's host config adding a terminal, a command or forwards.
 * On Unix, connections are multiplexed through a socket in the private
-  runtime directory (`ssh-%C`, skipped if the path is too long).
+  runtime directory (`ssh-%C`, quoted for paths with spaces, skipped if the
+  expanded path would exceed the socket length limit).
 * **Credentials**: password and passphrase prompts use the same askpass
   helper and per-call loopback listener as git (random port, 256-bit
   token). Answers are kept for reuse in `apex_project::secret::Secret`:

@@ -339,6 +339,10 @@ fn askpass_program() -> Option<PathBuf> {
 pub(crate) fn askpass_env(cmd: &mut Command, port: u16, token: &str) -> bool {
     let Some(exe) = askpass_program() else { return false };
     cmd.env("GIT_ASKPASS", &exe).env("SSH_ASKPASS", &exe).env("SSH_ASKPASS_REQUIRE", "force").env(ASKPASS_PORT, port.to_string()).env(ASKPASS_TOKEN, token);
+    // OpenSSH before 8.4 ignores SSH_ASKPASS_REQUIRE and only asks the helper when DISPLAY is set.
+    if std::env::var_os("DISPLAY").is_none() {
+        cmd.env("DISPLAY", ":0");
+    }
     true
 }
 
