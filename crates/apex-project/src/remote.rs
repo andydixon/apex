@@ -327,7 +327,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn control_socket_folder() {
-        let d = tempfile::tempdir().unwrap();
+        // macOS's own temp folder is itself too long for a socket path.
+        let d = tempfile::tempdir_in("/tmp").unwrap();
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
         let ok = d.path().join("a b");
