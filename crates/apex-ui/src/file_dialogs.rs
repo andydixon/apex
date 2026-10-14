@@ -278,6 +278,10 @@ impl ApexApp {
     /// after a successful save (e.g. the next step of closing tabs).
     pub(crate) fn save_view_as_then(&mut self, vid: ViewId, then: Option<Dialog>) {
         let then = then.map(Box::new);
+        // A remote document is saved through the remote browser.
+        if self.is_remote_view(vid) {
+            return self.show_remote_browser(Some((vid, then)));
+        }
         let Some(view) = self.views.get(&vid) else { return };
         let Some(doc) = self.docs.get(&view.doc) else { return };
         let mut spec = FileDialogSpec::save_file("Save As");

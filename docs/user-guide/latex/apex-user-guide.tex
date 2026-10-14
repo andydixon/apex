@@ -215,6 +215,8 @@ Everything around the editor can be hidden from the \menu{View} menu
   folders onto the window to open them.
 \item \key{Ctrl+P} (Goto Anything) fuzzy-finds any file in the open folders.
 \item \menu{File > Open Recent} lists recent files and projects.
+\item \menu{File > Open Remote} edits a file on another machine over SSH
+  (section~\ref{sec:remote}).
 \item Large files (over \setting{large\_file\_mb}, 50 MB by default) open in a
   reduced mode without highlighting, minimap detail or word wrap so they stay
   responsive. Binary files open as a read-only hex preview.
@@ -525,6 +527,67 @@ Right-click an entry for new file, new folder, rename, duplicate, delete
 (to the system bin, with confirmation), copy path, reveal, find in folder.
 Files ignored by \texttt{.gitignore} and \setting{exclude\_patterns} are
 dimmed or hidden. Git status is shown next to changed files.
+
+\section{Remote files over SSH}\label{sec:remote}
+
+\menu{File > Open Remote} opens a browser for a server. Type a host
+(\texttt{user@server}, or an alias from \texttt{\textasciitilde/.ssh/config}),
+press \textbf{Connect}, and click a file. Click a folder to go into it,
+\textbf{Up} to go back. Apex runs your own \texttt{ssh}, so your keys,
+agent, \texttt{ProxyJump} and the rest of your SSH config just work. The
+server needs nothing but \texttt{sh}, \texttt{cat}, \texttt{ls} and
+\texttt{cksum}.
+
+\begin{itemize}
+\item The tab is called \texttt{name (host)}.
+\item \textbf{Save} writes back to the server. The file keeps its owner and
+  permissions, and a dropped connection never leaves it half-written.
+\item \textbf{Save As}, and \menu{File > Save to Remote} for any tab, pick
+  a place in the same browser. It asks before replacing a file.
+\item \textbf{Revert} takes the server's copy.
+\item Every 5 seconds Apex checks each remote file. No unsaved edits: it
+  reloads quietly. Unsaved edits: a note in the status bar; \textbf{Save}
+  overwrites theirs, \textbf{Revert} takes theirs.
+\end{itemize}
+
+\subsection*{When the connection drops}
+
+Nothing pops up. The tab title says \texttt{offline}. A save that fails
+keeps your changes in the editor (and in crash recovery) and finishes by
+itself when the server answers again, unless the file changed there in the
+meantime; then you choose. Remote tabs do not come back after a restart.
+
+\subsection*{Passwords and passphrases}
+
+Keys and the agent are tried first. If a password or passphrase is needed,
+a dialog asks, over the browser. Cancel or a wrong answer shows
+``Permission denied''; press \textbf{Connect} to try again.
+
+\begin{safenote}
+Apex remembers the password so it does not ask again and so background
+checks keep working. It is held \textbf{only in memory}, in pages locked so
+they are never swapped to disk (and kept out of crash dumps on Linux). It is
+never written to disk, the session, recovery or logs.
+
+It is kept \textbf{while a file from that server is open or the browser
+shows that server}. When the last one closes, the memory is overwritten with
+zeros, released, and the shared SSH connection is closed. Quitting wipes it
+too. A password the server rejects is forgotten at once. One-time codes are
+never kept.
+
+Background checks and automatic retries never ask; without a remembered
+password they just show \texttt{offline}.
+
+The text box you type into belongs to the GUI toolkit. Apex clears it when
+the dialog closes but cannot promise no stray copy was left while you typed.
+If that matters to you, use a key with an agent.
+\end{safenote}
+
+\begin{watchout}
+The first connection to a new server records its host key without asking.
+If a server's key later changes, Apex refuses to connect; check with the
+server's owner, then fix \texttt{\textasciitilde/.ssh/known\_hosts}.
+\end{watchout}
 
 \section{Project files}
 

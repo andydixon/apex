@@ -3,6 +3,23 @@
 All notable changes to Apex are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- **File > Open Remote…** and **Save to Remote…**: edit files on another
+  machine over SSH through an in-app server browser. Uses your `ssh` with
+  key or agent authentication. Clean tabs reload silently when the file
+  changes on the server; a save that fails keeps the edits, marks the tab
+  offline and finishes on its own once the server answers again.
+- SSH password and passphrase prompts for remote files. The answer is kept
+  in locked memory (never swapped or written to disk) only while a file from
+  that server is open or the browser shows it, then wiped and the shared
+  connection closed. Background checks never prompt.
+
+### Changed
+- Git credential answers now travel from the dialog to git in locked,
+  wiped-on-release memory instead of ordinary strings.
+
 ## [0.1.1] - 2026-10-13
 
 ### Added

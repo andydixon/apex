@@ -50,6 +50,8 @@ pub mod lsp_ui;
 pub mod macos_dialogs;
 /// The command/goto palette widget.
 pub mod palette;
+/// Editing files on other machines over SSH.
+pub mod remote_ui;
 /// `Settings`: the user's `settings.toml`, with defaults and validation.
 pub mod settings;
 /// The settings editor panel.

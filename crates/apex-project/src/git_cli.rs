@@ -42,7 +42,7 @@ pub fn available() -> bool {
 /// A `Command` for `program` (optionally in `workdir`) set up for unattended use:
 /// no terminal prompts, no pager, no colour, no auto-edited merge messages, and
 /// stdin closed. On Unix the child calls `setsid`; on Windows it gets no console.
-fn base_command(program: &Path, workdir: Option<&Path>) -> Command {
+pub(crate) fn base_command(program: &Path, workdir: Option<&Path>) -> Command {
     let mut c = Command::new(program);
     if let Some(w) = workdir {
         c.current_dir(w);
@@ -91,7 +91,7 @@ pub enum JobEvent {
     /// The job ended: a short success message, or the error.
     Finished(Result<String, String>),
     /// git or ssh asks for a credential (askpass); send `None` to cancel.
-    Prompt(String, Sender<Option<String>>),
+    Prompt(String, Sender<Option<crate::secret::Secret>>),
 }
 
 /// Handle to a running job; dropping it does not cancel.
@@ -179,16 +179,8 @@ impl JobCtx {
         // Credentials are only relayed, never stored: the helper passes each
         // answer straight back to git/ssh over the loopback socket.
         cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-        if let Some((port, token)) = &self.askpass
-            && let Some(exe) = askpass_program()
-        {
-            // git and ssh run Apex itself as the askpass helper, which relays
-            // the prompt to the editor (see `askpass_client`).
-            cmd.env("GIT_ASKPASS", &exe)
-                .env("SSH_ASKPASS", &exe)
-                .env("SSH_ASKPASS_REQUIRE", "force")
-                .env(ASKPASS_PORT, port.to_string())
-                .env(ASKPASS_TOKEN, token);
+        if let Some((port, token)) = &self.askpass {
+            askpass_env(&mut cmd, *port, token);
         }
         if stdin.is_some() {
             cmd.stdin(Stdio::piped());
@@ -341,14 +333,48 @@ fn askpass_program() -> Option<PathBuf> {
     std::env::var_os("APEX_ASKPASS_EXE").map(PathBuf::from).or_else(|| std::env::current_exe().ok())
 }
 
-/// A loopback listener for one job. Each connection sends `token\nprompt\n`
-/// and gets back `OK <answer>\n` or `CANCEL\n`. The prompt goes to the UI as
-/// [`JobEvent::Prompt`]; the listener stops when the job ends.
+/// Point `cmd`'s git and ssh at Apex itself as the askpass helper, which
+/// relays each prompt to the listener on `port` (see `askpass_client`).
+/// Returns false (nothing set) when the executable cannot be located.
+pub(crate) fn askpass_env(cmd: &mut Command, port: u16, token: &str) -> bool {
+    let Some(exe) = askpass_program() else { return false };
+    cmd.env("GIT_ASKPASS", &exe).env("SSH_ASKPASS", &exe).env("SSH_ASKPASS_REQUIRE", "force").env(ASKPASS_PORT, port.to_string()).env(ASKPASS_TOKEN, token);
+    true
+}
+
+/// A git job's askpass listener: each prompt goes to the UI as
+/// [`JobEvent::Prompt`] and waits (up to ten minutes) for the answer.
 fn askpass_server(tx: Sender<JobEvent>, cancel: Arc<AtomicBool>, done: Arc<AtomicBool>) -> Option<(u16, String)> {
+    let stop_cancel = cancel.clone();
+    askpass_listener(
+        move || done.load(Ordering::Relaxed) || stop_cancel.load(Ordering::Relaxed),
+        move |prompt| {
+            let (rtx, rrx) = crossbeam_channel::bounded(1);
+            let _ = tx.send(JobEvent::Prompt(prompt.to_string(), rtx));
+            // Wait for the user, but not forever, and not past cancellation.
+            let started = Instant::now();
+            loop {
+                match rrx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(a) => break a,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) if started.elapsed() < Duration::from_secs(600) && !cancel.load(Ordering::Relaxed) => {}
+                    Err(_) => break None,
+                }
+            }
+        },
+    )
+}
+
+/// A loopback listener answering askpass helpers until `stop` returns true.
+/// Each connection sends `token\nprompt\n` and gets back `OK <answer>\n`
+/// (from `ask`) or `CANCEL\n`. Returns the port and token to hand the helper.
+pub(crate) fn askpass_listener(
+    stop: impl Fn() -> bool + Send + 'static,
+    ask: impl Fn(&str) -> Option<crate::secret::Secret> + Send + 'static,
+) -> Option<(u16, String)> {
     // Security: bound to 127.0.0.1 only, on an ephemeral port, and every
-    // connection must present the job's random token before its prompt is
-    // shown. Answers go back over the socket and are not kept anywhere.
-    // Returns `None` (no relaying) if the listener cannot be set up.
+    // connection must present the random token before its prompt is
+    // handled. Answers are written straight from their `Secret` to the
+    // socket. Returns `None` (no relaying) if the listener cannot be set up.
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok()?;
     // Non-blocking accept so the loop can notice the job ending.
     listener.set_nonblocking(true).ok()?;
@@ -359,7 +385,7 @@ fn askpass_server(tx: Sender<JobEvent>, cancel: Arc<AtomicBool>, done: Arc<Atomi
     std::thread::Builder::new()
         .name("apex-askpass".into())
         .spawn(move || {
-            while !done.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+            while !stop() {
                 let Ok((stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(30));
                     continue;
@@ -375,24 +401,16 @@ fn askpass_server(tx: Sender<JobEvent>, cancel: Arc<AtomicBool>, done: Arc<Atomi
                 if reader.read_line(&mut tok).is_err() || !crate::token::tokens_equal(tok.trim_end(), &expected) || reader.read_line(&mut prompt).is_err() {
                     continue;
                 }
-                let (rtx, rrx) = crossbeam_channel::bounded(1);
-                let _ = tx.send(JobEvent::Prompt(prompt.trim_end().to_string(), rtx));
-                // Wait for the user, but not forever, and not past cancellation.
-                let started = Instant::now();
-                let answer = loop {
-                    match rrx.recv_timeout(Duration::from_millis(200)) {
-                        Ok(a) => break a,
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout)
-                            if started.elapsed() < Duration::from_secs(600) && !cancel.load(Ordering::Relaxed) => {}
-                        Err(_) => break None,
+                let mut out = &stream;
+                let _ = match ask(prompt.trim_end()) {
+                    Some(answer) => {
+                        // Stop at a line break so an answer cannot inject extra protocol lines.
+                        let a = answer.expose();
+                        let a = &a[..a.iter().position(|&b| b == b'\n' || b == b'\r').unwrap_or(a.len())];
+                        out.write_all(b"OK ").and_then(|_| out.write_all(a)).and_then(|_| out.write_all(b"\n"))
                     }
+                    None => out.write_all(b"CANCEL\n"),
                 };
-                let reply = match answer {
-                    // Strip line breaks so an answer cannot inject extra protocol lines.
-                    Some(a) => format!("OK {}\n", a.replace(['\n', '\r'], "")),
-                    None => "CANCEL\n".to_string(),
-                };
-                let _ = (&stream).write_all(reply.as_bytes());
             }
         })
         .ok()?;
@@ -414,13 +432,15 @@ pub fn askpass_client(prompt: &str) -> i32 {
     if BufReader::new(&stream).read_line(&mut line).is_err() {
         return 1;
     }
-    match line.trim_end_matches(['\n', '\r']).strip_prefix("OK ") {
+    let code = match line.trim_end_matches(['\n', '\r']).strip_prefix("OK ") {
         Some(answer) => {
             println!("{answer}");
             0
         }
         None => 1,
-    }
+    };
+    crate::secret::wipe_string(&mut line);
+    code
 }
 
 // ----- partial patches ---------------------------------------------------------
@@ -746,7 +766,7 @@ mod tests {
                 JobEvent::Prompt(p, reply) => {
                     let answer = if p.starts_with("Username") { "ada" } else { "s3cret" };
                     prompts.push(p);
-                    reply.send(Some(answer.into())).unwrap();
+                    reply.send(Some(crate::secret::Secret::new(answer.as_bytes()))).unwrap();
                 }
                 JobEvent::Finished(r) => break r,
                 _ => {}
