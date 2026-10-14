@@ -14,13 +14,15 @@
 //! compared with the one last seen: clean buffers reload silently.
 //!
 //! Open and Save As use an in-app browser (`Dialog::RemoteBrowser`) that
-//! lists folders on the server.
+//! lists folders on the server. Its Open Folder button adds the folder to
+//! the REMOTE section at the top of the sidebar (`show_remote_folders`), a
+//! tree listed over ssh as folders are expanded.
 //!
 //! Password and passphrase prompts from ssh appear as `Dialog::Askpass`
 //! (over the browser, which comes back afterwards), but only for something
 //! the user just did: background checks and automatic retries never ask. The
 //! answer is kept in `RemoteState::credentials` (locked memory) for as long
-//! as a file from that server is open or the browser shows it, then wiped
+//! as a file or folder from that server is open or the browser shows it, then wiped
 //! and the shared connection closed.
 
 use std::collections::HashMap;
@@ -82,6 +84,12 @@ enum Reply {
     Listed {
         result: Result<(String, Vec<String>), String>,
     },
+    /// A folder in the sidebar's REMOTE section was listed.
+    FolderListed {
+        host: String,
+        dir: String,
+        result: Result<(String, Vec<String>), String>,
+    },
     /// ssh wants a password for something the user started; the worker waits on `reply`.
     Prompt {
         host: String,
@@ -102,6 +110,64 @@ pub struct RemoteState {
     credentials: Credentials,
     /// Transfers started and not yet answered.
     inflight: usize,
+    /// Folders shown in the sidebar's REMOTE section: host and tree.
+    folders: Vec<(String, Node)>,
+}
+
+/// A file or folder in a remote folder tree.
+pub(crate) struct Node {
+    name: String,
+    path: String,
+    dir: bool,
+    open: bool,
+    loading: bool,
+    /// Listed entries; `None` until the folder is first opened.
+    kids: Option<Vec<Node>>,
+    error: Option<String>,
+}
+
+impl Node {
+    fn new(name: &str, path: String, dir: bool) -> Self {
+        Self { name: name.to_string(), path, dir, open: false, loading: false, kids: None, error: None }
+    }
+
+    fn find_mut(&mut self, path: &str) -> Option<&mut Node> {
+        if self.path == path {
+            return Some(self);
+        }
+        self.kids.as_mut()?.iter_mut().find_map(|k| k.find_mut(path))
+    }
+
+    /// Replace the children with `entries` (folders end in `/`), keeping the
+    /// state of those that were already there.
+    fn set_kids(&mut self, entries: &[String]) {
+        let mut old: HashMap<String, Node> = self.kids.take().unwrap_or_default().into_iter().map(|n| (n.path.clone(), n)).collect();
+        let kids = entries
+            .iter()
+            .map(|e| {
+                let (name, dir) = e.strip_suffix('/').map_or((e.as_str(), false), |d| (d, true));
+                let path = join(&self.path, name);
+                old.remove(&path).filter(|n| n.dir == dir).unwrap_or_else(|| Node::new(name, path, dir))
+            })
+            .collect();
+        self.kids = Some(kids);
+    }
+
+    /// Paths of open folders whose contents are shown (for Refresh).
+    fn open_dirs(&self, out: &mut Vec<String>) {
+        if self.open && self.kids.is_some() {
+            out.push(self.path.clone());
+            self.kids.iter().flatten().for_each(|k| k.open_dirs(out));
+        }
+    }
+}
+
+/// What a click in the REMOTE section asks for.
+enum FolderAct {
+    List(String),
+    Open(String),
+    Refresh,
+    Close,
 }
 
 impl Default for RemoteState {
@@ -116,6 +182,7 @@ impl Default for RemoteState {
             last_check: None,
             credentials: Credentials::default(),
             inflight: 0,
+            folders: Vec::new(),
         }
     }
 }
@@ -332,7 +399,8 @@ impl ApexApp {
             _ => None,
         };
         for host in self.remote.credentials.hosts() {
-            if browsing.as_deref() != Some(host.as_str()) && !self.remote.docs.values().any(|r| r.host == host) {
+            let used = self.remote.docs.values().any(|r| r.host == host) || self.remote.folders.iter().any(|(h, _)| *h == host);
+            if browsing.as_deref() != Some(host.as_str()) && !used {
                 self.remote.credentials.forget(&host);
                 std::thread::spawn(move || apex_project::remote::disconnect(&host));
             }
@@ -473,6 +541,24 @@ impl ApexApp {
                 }
                 self.remote_retitle(doc);
             }
+            Reply::FolderListed { host, dir, result } => {
+                for (_, root) in self.remote.folders.iter_mut().filter(|(h, _)| *h == host) {
+                    let Some(n) = root.find_mut(&dir) else { continue };
+                    n.loading = false;
+                    match &result {
+                        Ok((abs, entries)) => {
+                            // A folder typed as `~/x` or left empty becomes absolute here.
+                            if n.path != *abs {
+                                n.path = abs.clone();
+                                n.kids = None;
+                            }
+                            n.set_kids(entries);
+                            n.error = None;
+                        }
+                        Err(e) => n.error = Some(e.clone()),
+                    }
+                }
+            }
             Reply::Listed { result } => {
                 let Some(Dialog::RemoteBrowser(b)) = &mut self.dialog else { return };
                 b.loading = false;
@@ -487,11 +573,83 @@ impl ApexApp {
         }
     }
 
+    /// Add `host:dir` to the sidebar's REMOTE section and list it.
+    pub(crate) fn remote_open_folder(&mut self, host: &str, dir: &str) {
+        self.settings.sidebar = true;
+        if self.remote.folders.iter().any(|(h, n)| h == host && n.path == dir) {
+            return;
+        }
+        let name = if dir.is_empty() { "~" } else { file_name(dir.trim_end_matches('/')) };
+        let mut root = Node::new(if name.is_empty() { "/" } else { name }, dir.to_string(), true);
+        (root.open, root.loading) = (true, true);
+        self.remote.folders.push((host.to_string(), root));
+        self.remote_list_folder(host, dir);
+    }
+
+    fn remote_list_folder(&mut self, host: &str, dir: &str) {
+        let (host, dir) = (host.to_string(), dir.to_string());
+        self.remote_spawn(true, move |a| {
+            let result = apex_project::remote::list(a, &host, &dir);
+            Reply::FolderListed { host, dir, result }
+        });
+    }
+
+    /// Whether the sidebar has remote folders to show.
+    pub(crate) fn has_remote_folders(&self) -> bool {
+        !self.remote.folders.is_empty()
+    }
+
+    /// The sidebar's REMOTE section: one tree per folder opened from the
+    /// remote browser. Clicking a file opens it; a root's context menu
+    /// refreshes or closes it.
+    pub(crate) fn show_remote_folders(&mut self, ui: &mut egui::Ui, max_height: f32, fill: bool) {
+        let theme = self.theme.clone();
+        let font = self.settings.ui_font_size;
+        let active = self.active_ids().and_then(|(_, d)| self.remote.docs.get(&d)).map(|r| (r.host.clone(), r.path.clone()));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("REMOTE").size(font - 2.0).color(theme.ui.text_muted).strong());
+        });
+        let mut acts = Vec::new();
+        let mut folders = std::mem::take(&mut self.remote.folders);
+        egui::ScrollArea::both().id_salt("remote-folders").max_height(max_height).auto_shrink([false, !fill]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
+            for (i, (host, root)) in folders.iter_mut().enumerate() {
+                let active = active.as_ref().filter(|(h, _)| h == host).map(|(_, p)| p.as_str());
+                let mut out = Vec::new();
+                draw_node(ui, root, 0, host, &theme, font, active, &mut out);
+                acts.extend(out.into_iter().map(|a| (i, a)));
+            }
+        });
+        self.remote.folders = folders;
+        for (i, act) in acts {
+            let host = self.remote.folders[i].0.clone();
+            match act {
+                FolderAct::List(dir) => self.remote_list_folder(&host, &dir),
+                FolderAct::Open(path) => self.remote_open(&host, &path),
+                FolderAct::Refresh => {
+                    let mut dirs = Vec::new();
+                    self.remote.folders[i].1.open_dirs(&mut dirs);
+                    for d in dirs {
+                        self.remote_list_folder(&host, &d);
+                    }
+                }
+                FolderAct::Close => {
+                    self.remote.folders.remove(i);
+                    // Indices after this one have shifted; the rest wait for the next frame.
+                    return;
+                }
+            }
+        }
+    }
+
     /// Draw the remote browser (`Dialog::RemoteBrowser`).
     pub(crate) fn show_remote_browser_dialog(&mut self, ctx: &egui::Context, mut b: Browser) {
         enum Act {
             List(String),
             Open(String),
+            OpenFolder,
             Save(String),
             Close,
         }
@@ -569,6 +727,14 @@ impl ApexApp {
                 if ui.button("Cancel").clicked() {
                     act = Some(Act::Close);
                 }
+                if b.save.is_none() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let ok = !b.host.trim().is_empty() && !b.loading;
+                        if ui.add_enabled(ok, egui::Button::new("Open Folder")).on_hover_text("Show this folder in the sidebar").clicked() {
+                            act = Some(Act::OpenFolder);
+                        }
+                    });
+                }
             });
             if b.confirm_replace {
                 ui.label(format!("{} already exists. Click Replace to overwrite it.", b.name));
@@ -587,6 +753,10 @@ impl ApexApp {
             Some(Act::Open(path)) => {
                 self.dialog = None;
                 return self.remote_open(&host, &path);
+            }
+            Some(Act::OpenFolder) => {
+                self.dialog = None;
+                return self.remote_open_folder(&host, b.dir.trim());
             }
             Some(Act::Save(path)) => {
                 self.dialog = None;
@@ -615,6 +785,81 @@ impl ApexApp {
     }
 }
 
+/// One row of a remote folder tree and, if open, its children.
+#[allow(clippy::too_many_arguments)]
+fn draw_node(
+    ui: &mut egui::Ui,
+    n: &mut Node,
+    depth: usize,
+    host: &str,
+    theme: &crate::theme::Theme,
+    font: f32,
+    active: Option<&str>,
+    out: &mut Vec<FolderAct>,
+) {
+    use egui::{pos2, vec2};
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(200.0), font + 8.0), egui::Sense::click());
+    if active == Some(n.path.as_str()) || resp.hovered() {
+        ui.painter().rect_filled(rect, 0.0, theme.ui.hover);
+    }
+    let x = rect.min.x + 8.0 + depth as f32 * 14.0;
+    if n.dir {
+        let c = pos2(x + 4.0, rect.center().y);
+        let pts = if n.open {
+            vec![c + vec2(-4.0, -2.0), c + vec2(4.0, -2.0), c + vec2(0.0, 3.0)]
+        } else {
+            vec![c + vec2(-2.0, -4.0), c + vec2(3.0, 0.0), c + vec2(-2.0, 4.0)]
+        };
+        ui.painter().add(egui::Shape::convex_polygon(pts, theme.ui.text_muted, egui::Stroke::NONE));
+    }
+    let (label, colour, size) =
+        if depth == 0 { (format!("{} ({host})", n.name.to_uppercase()), theme.ui.text_muted, font - 1.0) } else { (n.name.clone(), theme.ui.text, font) };
+    ui.painter().text(pos2(x + 14.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(size), colour);
+    let resp = if depth == 0 { resp.on_hover_text(format!("{host}:{}", n.path)) } else { resp };
+    if resp.clicked() {
+        if !n.dir {
+            out.push(FolderAct::Open(n.path.clone()));
+        } else {
+            n.open = !n.open;
+            if n.open && n.kids.is_none() && !n.loading {
+                n.loading = true;
+                out.push(FolderAct::List(n.path.clone()));
+            }
+        }
+    }
+    if depth == 0 {
+        resp.context_menu(|ui| {
+            if ui.button("Refresh").clicked() {
+                out.push(FolderAct::Refresh);
+                ui.close();
+            }
+            if ui.button("Close Remote Folder").clicked() {
+                out.push(FolderAct::Close);
+                ui.close();
+            }
+        });
+    }
+    if !(n.dir && n.open) {
+        return;
+    }
+    let pad = 8.0 + (depth + 1) as f32 * 14.0 + 14.0;
+    if n.loading && n.kids.is_none() {
+        ui.horizontal(|ui| {
+            ui.add_space(pad);
+            ui.spinner();
+        });
+    }
+    if let Some(e) = &n.error {
+        ui.horizontal(|ui| {
+            ui.add_space(pad);
+            ui.label(egui::RichText::new(e).color(theme.ui.error).size(font - 2.0));
+        });
+    }
+    for k in n.kids.iter_mut().flatten() {
+        draw_node(ui, k, depth + 1, host, theme, font, active, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,5 +872,20 @@ mod tests {
         assert_eq!(parent("/etc"), "/");
         assert_eq!(parent("/"), "/");
         assert_eq!(file_name("/etc/hosts"), "hosts");
+    }
+
+    #[test]
+    fn folder_refresh_keeps_state() {
+        let mut root = Node::new("srv", "/srv".into(), true);
+        root.set_kids(&["www/".into(), "a.txt".into()]);
+        let www = root.find_mut("/srv/www").unwrap();
+        (www.open, www.kids) = (true, Some(Vec::new()));
+        root.open = true;
+        root.set_kids(&["www/".into(), "b.txt".into()]);
+        let names: Vec<_> = root.kids.iter().flatten().map(|k| (k.path.as_str(), k.dir)).collect();
+        assert_eq!(names, [("/srv/www", true), ("/srv/b.txt", false)]);
+        let mut open = Vec::new();
+        root.open_dirs(&mut open);
+        assert_eq!(open, ["/srv", "/srv/www"], "the open subfolder survives a refresh");
     }
 }

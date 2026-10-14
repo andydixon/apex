@@ -194,7 +194,7 @@ and open files in the editor — equivalent to what it could do by running
   page-aligned allocations of their own, locked with `mlock`/`VirtualLock`
   (best effort), `MADV_DONTDUMP` on Linux, overwritten with volatile writes
   before release. They are keyed by host and prompt, held only while a file
-  from that host is open or the browser shows it, then wiped, and the
+  or folder from that host is open or the browser shows it, then wiped, and the
   host's control master is told to exit. Only user-initiated operations
   may prompt; background checks answer from memory or fail. A rejected
   answer ("Permission denied") is forgotten. Prompts that do not mention a

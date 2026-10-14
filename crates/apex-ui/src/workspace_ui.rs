@@ -299,6 +299,16 @@ impl ApexApp {
         {
             self.sidebar.reveal(p);
         }
+        if self.has_remote_folders() {
+            // Remote folders on top; with no local folder they take the whole panel.
+            let local = !self.roots.is_empty();
+            let h = ui.available_height();
+            self.show_remote_folders(ui, if local { h * 0.4 } else { h }, !local);
+            if !local {
+                return;
+            }
+            ui.separator();
+        }
         let actions = if self.git_panel_visible() {
             // Folders above, Source Control below, split by a draggable handle.
             let full = ui.available_rect_before_wrap();

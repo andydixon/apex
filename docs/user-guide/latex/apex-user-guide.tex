@@ -535,8 +535,15 @@ dimmed or hidden. Git status is shown next to changed files.
 press \textbf{Connect}, and click a file. Click a folder to go into it,
 \textbf{Up} to go back. Apex runs your own \texttt{ssh}, so your keys,
 agent, \texttt{ProxyJump} and the rest of your SSH config just work. The
-server needs nothing but \texttt{sh}, \texttt{cat}, \texttt{ls} and
-\texttt{cksum}.
+server needs nothing but \texttt{sh}, \texttt{cat}, \texttt{ls},
+\texttt{cksum} and \texttt{mktemp}.
+
+\textbf{Open Folder}, bottom right of the browser, puts the current folder
+in a \textbf{REMOTE} section at the top of the sidebar instead. Click a
+folder to expand it and a file to open it. Right-click the top row to
+\textbf{Refresh} it or \textbf{Close Remote Folder}. It is a file tree
+only: no Find in Files, git, rename or delete, and it is not restored after
+a restart.
 
 \begin{itemize}
 \item The tab is called \texttt{name (host)}.
@@ -569,8 +576,8 @@ checks keep working. It is held \textbf{only in memory}, in pages locked so
 they are never swapped to disk (and kept out of crash dumps on Linux). It is
 never written to disk, the session, recovery or logs.
 
-It is kept \textbf{while a file from that server is open or the browser
-shows that server}. When the last one closes, the memory is overwritten with
+It is kept \textbf{while a file or folder from that server is open or the
+browser shows that server}. When the last one closes, the memory is overwritten with
 zeros, released, and the shared SSH connection is closed. Quitting wipes it
 too. A password the server rejects is forgotten at once. One-time codes are
 never kept.

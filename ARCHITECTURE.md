@@ -168,7 +168,7 @@ repaint when something arrives:
 | Git status and hunks | `git::start_status` | debounced; results tagged with the repo path |
 | `git`/`gh` commands | `git_cli::start_job`: one job at a time, queued | cancel kills the process group; output streamed to the GIT tab |
 | Askpass prompts | per-job loopback listener (`git_cli::askpass_listener`, shared by git jobs and remote calls) | token per job; closed with the job; 10-minute answer timeout |
-| Remote file transfers and change checks | a thread per `remote` call (`remote_ui`) | `ConnectTimeout`/`ServerAlive*`; replies for closed tabs ignored; passwords wiped when no tab or browser uses the host |
+| Remote file transfers and change checks | a thread per `remote` call (`remote_ui`) | `ConnectTimeout`/`ServerAlive*`; replies for closed tabs ignored; passwords wiped when no tab, sidebar folder or browser uses the host |
 | Blame | `git::start_blame` per document | recomputed 0.7 s after edits; stale results ignored by revision |
 | Log, history editor load | worker thread / job | replaced on reload |
 | Build tasks | `tasks::run` (process groups) | cancel kills the group; timeout |

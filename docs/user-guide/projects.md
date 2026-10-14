@@ -20,9 +20,18 @@ ignored by `.gitignore` and `exclude_patterns` are shown dimmed or hidden
 **File > Open Remote…** opens a browser for a server: enter a host
 (`user@server` or an alias from `~/.ssh/config`), press Connect, and pick a
 file. Apex runs your own `ssh`, so keys, the agent, `ProxyJump` and the rest
-of your SSH config apply. The server needs only `sh`, `cat`, `ls` and
-`cksum`. The first connection to a new server records its host key; a
+of your SSH config apply. The server needs only `sh`, `cat`, `ls`,
+`cksum` and `mktemp`. The first connection to a new server records its host key; a
 changed key is refused.
+
+**Open Folder** (bottom right of the browser) shows the current folder in
+a **REMOTE** section at the top of the sidebar instead. Click a folder to
+expand it (it is listed over SSH the first time) and a file to open it.
+Right-click the folder's top row to **Refresh** it (new and removed files
+on the server) or **Close Remote Folder**. With no local folder open, the
+remote folders fill the sidebar. Remote folders are a file tree only: no
+Find in Files, git, rename or delete, and they are not restored when Apex
+restarts.
 
 ### Passwords and passphrases
 
@@ -37,8 +46,8 @@ checks and automatic retries described below keep working on their own:
 * It lives only in memory, in pages locked so the system never writes them
   to swap (and, on Linux, left out of crash dumps). It is never written to
   disk, the session, recovery snapshots or logs.
-* It is kept while a file from that server is open or the browser is showing
-  that server. When the last one closes, the memory is overwritten with
+* It is kept while a file or folder from that server is open or the
+  browser is showing that server. When the last one closes, the memory is overwritten with
   zeros and released, and the shared SSH connection to the server is closed
   so nothing can reuse the login. Quitting Apex wipes it too.
 * Only Open, Save, Save As, Revert and browsing can ask. The background

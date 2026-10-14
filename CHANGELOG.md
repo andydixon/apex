@@ -11,9 +11,11 @@ All notable changes to Apex are recorded here. The format follows
   key or agent authentication. Clean tabs reload silently when the file
   changes on the server; a save that fails keeps the edits, marks the tab
   offline and finishes on its own once the server answers again.
+  **Open Folder** in the browser shows a server folder as a tree in the
+  sidebar's REMOTE section.
 - SSH password and passphrase prompts for remote files. The answer is kept
-  in locked memory (never swapped or written to disk) only while a file from
-  that server is open or the browser shows it, then wiped and the shared
+  in locked memory (never swapped or written to disk) only while a file or
+  folder from that server is open or the browser shows it, then wiped and the shared
   connection closed. Background checks never prompt.
 
 ### Changed

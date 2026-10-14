@@ -47,7 +47,8 @@ packaging, benchmarks, fuzzing, documentation).
 | Project files (folders, `[settings]`, `[[tasks]]`) | V | program-naming keys blocked from project settings (tested) |
 | Open Remote / Save to Remote over SSH: in-app server browser, silent change checks, offline tabs with automatic retry | V | `remote::scripts_round_trip_through_sh`; end-to-end with a stand-in `ssh` under Xvfb (open, reload, offline save, retry, save as) |
 | SSH password/passphrase prompts for remote files, kept in locked memory while the server is in use, wiped after | V | `remote` test (cached, silent, rejected-forgotten), `secret` test; end-to-end with Apex as the real askpass helper |
-| Remote tabs restored after restart; remote folders in the sidebar | – | |
+| Remote folders in the sidebar (Open Folder in the browser): lazy tree, refresh, close | V | `remote_ui::folder_refresh_keeps_state`; end-to-end against a real `sshd` under Xvfb (open folder, expand, open file, refresh, close) |
+| Remote tabs and folders restored after restart; Find in Files / git in remote folders | – | |
 
 ## Editor interface (`apex-ui`)
 
