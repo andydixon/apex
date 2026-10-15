@@ -4,6 +4,7 @@ Thank you for considering a contribution.
 
 ## Ground rules
 
+* Speed and responsiveness are very important.
 * Data integrity beats everything else. Any change touching saving, loading,
   undo or selections needs tests, and a regression test for every fixed
   data-loss defect.
