@@ -75,3 +75,13 @@ directory; a second invocation hands over its paths and exits. Set
 
 **Help > About** shows the exact paths; `APEX_CONFIG_DIR` and
 `APEX_DATA_DIR` override them.
+
+## Updates
+
+**Help > Check for Updates…** asks GitHub for the latest Apex release. If
+it is newer than yours, it shows the new version, its release date and a
+link to the release notes; **Download** opens this platform's installer
+(the `.dmg` on macOS, the setup program on Windows, the `.tar.gz` on Linux)
+in your browser. If you installed with Homebrew or from repo.dixon.cx,
+update through that instead. Apex never checks on its own; the check uses
+your system's `curl` and sends nothing but the request itself.

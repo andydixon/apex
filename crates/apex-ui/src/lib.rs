@@ -68,6 +68,8 @@ pub mod symbol_index;
 pub mod tasks_ui;
 /// Colour themes: built-ins, user TOML themes and egui style application.
 pub mod theme;
+/// Help > Check for Updates.
+pub mod update_ui;
 /// `View`: one tab's selections, scroll, folds and layout cache over a document.
 pub mod view;
 /// Vim emulation state machine.

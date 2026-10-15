@@ -128,6 +128,8 @@ pub(crate) enum Dialog {
     Confirm { title: String, body: String, button: String, then: (Command, Option<String>) },
     /// Browse a server over SSH to open a file or save one there.
     RemoteBrowser(Box<crate::remote_ui::Browser>),
+    /// Help > Check for Updates, while checking and with the answer.
+    Update(crate::update_ui::UpdateCheck),
 }
 
 /// What `request_close` does once every requested view has been dealt with.
@@ -2122,6 +2124,7 @@ impl ApexApp {
                 self.open_path(&p);
             }
             Command::About => self.dialog = Some(Dialog::About),
+            Command::CheckForUpdates => self.check_for_updates(),
             // Counts the selections if there are any, else the whole document.
             Command::WordCount => {
                 if let Some((v, d)) = active {
@@ -3051,6 +3054,7 @@ impl ApexApp {
                 }
             });
             ui.menu_button("Help", |ui| {
+                item(ui, &mut q, Command::CheckForUpdates);
                 item(ui, &mut q, Command::About);
             });
         });
@@ -3603,6 +3607,10 @@ impl ApexApp {
             self.show_remote_browser_dialog(ctx, *b);
             return;
         }
+        if let Dialog::Update(check) = dialog {
+            self.show_update_dialog(ctx, check);
+            return;
+        }
         if matches!(dialog, Dialog::CreatePr { .. }) {
             self.show_create_pr_dialog(ctx, dialog);
             return;
@@ -3828,7 +3836,8 @@ impl ApexApp {
             | Dialog::Confirm { .. }
             | Dialog::Askpass { .. }
             | Dialog::CreatePr { .. }
-            | Dialog::RemoteBrowser(_) => {}
+            | Dialog::RemoteBrowser(_)
+            | Dialog::Update(_) => {}
             Dialog::Issues(issues) => {
                 let r = egui::Modal::new(egui::Id::new("issues")).show(ctx, |ui| {
                     ui.set_width(520.0);
