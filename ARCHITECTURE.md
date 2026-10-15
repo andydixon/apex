@@ -229,7 +229,10 @@ is compared with what was loaded; a mismatch refuses the save and the UI
 offers Overwrite / Save As / Cancel.
 
 Binary detection (NUL byte in the first 8 KiB, unless the bytes look like
-UTF-16) opens a read-only hexadecimal preview instead of decoding.
+UTF-16) opens the file in the hex editor (`hex_ui`) instead of decoding: the
+bytes live in `ApexApp::hex` and the tab's `Document` is an empty read-only
+placeholder carrying the path and dirty flag. `fileio::save_bytes` writes
+them back with the same identity check and atomic replace.
 
 ## Platform integration
 

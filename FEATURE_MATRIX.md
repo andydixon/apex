@@ -37,7 +37,7 @@ packaging, benchmarks, fuzzing, documentation).
 | Drag-and-drop to open | I | |
 | Encodings: UTF-8, UTF-8 BOM, UTF-16 LE/BE, legacy set; detect, reload with, save with, lossy warning | V | |
 | Line endings: detect, preserve, convert, mixed flag | V | |
-| Binary detection and read-only hex preview | V | |
+| Binary files in a hex editor: overwrite in hex or text columns, continuous hex typing, 32/16/8 bytes per row, undo, exact save, find as hex or text | V | `hex_ui` tests (typing, undo through appends, paste, read-only, motion, find); end-to-end under Xvfb (type, Tab, find, save and byte compare, resize, undo) |
 | Atomic save (temp + fsync + rename), permission/ownership preservation, symlink write-through | V | |
 | External modification detection, reload/keep, save conflict dialog | I | checked on focus and every 2 s |
 | Deleted-on-disk handling, read-only files | I | |

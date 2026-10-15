@@ -39,6 +39,8 @@ pub mod git_ops;
 pub mod git_panel;
 /// Repository status cache, gutter marks and branch label.
 pub mod git_ui;
+/// The hex editor binary files open in.
+pub mod hex_ui;
 /// Interactive history editing (rebase) window.
 pub mod history_ui;
 /// Key bindings: parsing, contexts and chord dispatch.

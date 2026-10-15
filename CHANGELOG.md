@@ -5,6 +5,13 @@ All notable changes to Apex are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Hex editor for binary files: edit the hex or text column (Tab switches),
+  type hex digits continuously without moving the caret by hand, 32, 16 or
+  8 bytes per row to fit the pane, arrow-key navigation and selection,
+  undo/redo, copy as hex or text, and Save writes the bytes back exactly.
+  Find matches hex (`de ad be ef` or `deadbeef`) as well as text.
+
 ## [0.2.0] - 2026-10-15
 
 ### Added

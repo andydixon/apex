@@ -76,9 +76,9 @@ pub struct LoadedFile {
     pub mixed_line_endings: bool,
     /// On-disk identity at load time, for change detection before saving.
     pub identity: FileIdentity,
-    /// True when the file is not writable by us, or is binary.
+    /// True when the file is not writable by us.
     pub read_only: bool,
-    /// The raw bytes when the file was detected as binary (for the hex preview).
+    /// The raw bytes when the file was detected as binary (for the hex editor).
     pub binary: Option<Vec<u8>>,
 }
 
@@ -122,7 +122,7 @@ pub fn load(path: &Path, forced_encoding: Option<Encoding>, fallback: Encoding) 
             line_ending: LineEnding::native(),
             mixed_line_endings: false,
             identity,
-            read_only: true,
+            read_only,
             binary: Some(bytes),
         });
     }
@@ -197,13 +197,26 @@ pub fn save(path: &Path, text: &str, opts: &SaveOptions) -> Result<(FileIdentity
     }
     let normalised = apex_buffer::line_ending::normalise(text, opts.line_ending);
     let (bytes, lossy) = apex_buffer::encode(&normalised, opts.encoding);
-    if opts.in_place {
-        write_in_place(&target, &bytes)?;
-    } else {
-        save_atomic(&target, &bytes)?;
+    Ok((save_bytes(path, &bytes, &SaveOptions { force: true, ..opts.clone() })?, lossy))
+}
+
+/// Write `bytes` as they are (binary files), with the same identity check,
+/// symlink resolution and atomic replace as [`save`]. Encoding and line
+/// ending options are ignored.
+pub fn save_bytes(path: &Path, bytes: &[u8], opts: &SaveOptions) -> Result<FileIdentity, FileError> {
+    let target = resolve_symlink(path);
+    if !opts.force
+        && let (Some(expected), Ok(md)) = (opts.expected, fs::metadata(&target))
+        && !same_identity(&expected, &FileIdentity::from_metadata(&md))
+    {
+        return Err(FileError::ChangedOnDisk);
     }
-    let md = fs::metadata(&target)?;
-    Ok((FileIdentity::from_metadata(&md), lossy))
+    if opts.in_place {
+        write_in_place(&target, bytes)?;
+    } else {
+        save_atomic(&target, bytes)?;
+    }
+    Ok(FileIdentity::from_metadata(&fs::metadata(&target)?))
 }
 
 /// Compare identities ignoring sub-second timestamp noise on filesystems that
@@ -443,6 +456,7 @@ mod tests {
         fs::write(&p, b"\x00\x01\x02abc").unwrap();
         let l = load(&p, None, Encoding::Utf8).unwrap();
         assert!(l.binary.is_some());
-        assert!(l.read_only);
+        // Binary files report their real permission (the hex editor can write them).
+        assert!(!l.read_only);
     }
 }

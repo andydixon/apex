@@ -10,7 +10,9 @@
 * If decoding replaced invalid sequences with U+FFFD, the document is flagged
   and the status bar warns that saving will not restore the original bytes.
 * A NUL byte in the first 8 KiB (that is not part of UTF-16) marks the file as
-  binary; it opens as a read-only hexadecimal preview and cannot be saved over.
+  binary; it opens in the hex editor, which saves the edited bytes verbatim
+  through the same checked, atomic path (`fileio::save_bytes`). Hex edits
+  are not journalled for crash recovery.
 
 ## Saving
 

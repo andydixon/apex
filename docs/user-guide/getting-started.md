@@ -43,7 +43,8 @@ leaves all three.
 * **File > Open Recent** lists recent files and projects.
 * Large files (over `large_file_mb`, 50 MB by default) open in a
   reduced-feature mode: no syntax highlighting, minimap detail or word wrap,
-  so they stay responsive. Binary files open in a read-only hex preview.
+  so they stay responsive. Binary files open in the
+  [hex editor](editing.md#hex-editor).
 
 ## The command line
 

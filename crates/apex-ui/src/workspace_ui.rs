@@ -267,6 +267,7 @@ impl ApexApp {
         }
         self.tasks_refresh();
         self.remote_poll();
+        self.hex.retain(|d, _| self.docs.contains_key(d));
         // Recovery snapshots at the configured interval, never faster than 1 s.
         if self.last_recovery.elapsed() >= Duration::from_millis(self.settings.recovery_interval_ms.max(1000)) {
             self.last_recovery = Instant::now();
@@ -1526,6 +1527,10 @@ impl ApexApp {
         }
         let ids: Vec<DocId> = self.docs.keys().copied().collect();
         for d in ids {
+            // Hex editors keep bytes the text snapshot cannot hold.
+            if self.hex.contains_key(&d) {
+                continue;
+            }
             let doc = &self.docs[&d];
             let (rid, last_rev) = self.recovery_ids.get(&d).cloned().unwrap_or_else(|| (format!("{:x}-{:x}", apex_project::session::now_unix(), d.0), 0));
             if !doc.is_dirty() {

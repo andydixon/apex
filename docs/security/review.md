@@ -26,8 +26,10 @@ somewhere unexpected.
   `large_file_mb` open in large-file mode with highlighting, minimap detail,
   word wrap and spell checking off. A 500 MB file is still one allocation;
   there is no memory-mapped or streamed mode (known limitation).
-* Binary detection (NUL bytes / UTF-16 heuristics) sends binaries to a
-  read-only hex preview; saving a hex preview is refused.
+* Binary detection (NUL bytes / UTF-16 heuristics) sends binaries to the
+  hex editor, which writes raw bytes with the same identity check and
+  atomic replace as text (`fileio::save_bytes`); its placeholder document
+  is read-only, so text commands cannot alter it.
 * Every offset conversion is total (`apex-buffer` fuzz target `offsets`),
   and every edit goes through `Transaction::clamped` so out-of-range
   positions from any source cannot index past the rope.

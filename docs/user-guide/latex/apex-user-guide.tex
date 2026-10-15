@@ -219,7 +219,7 @@ Everything around the editor can be hidden from the \menu{View} menu
   (section~\ref{sec:remote}).
 \item Large files (over \setting{large\_file\_mb}, 50 MB by default) open in a
   reduced mode without highlighting, minimap detail or word wrap so they stay
-  responsive. Binary files open as a read-only hex preview.
+  responsive. Binary files open in the hex editor (section~\ref{sec:hex}).
 \end{itemize}
 
 \begin{tryit}
@@ -380,6 +380,35 @@ code. Right-click a word for suggestions, \menu{Add to dictionary} or
 \menu{Ignore}. Dictionaries are Hunspell \texttt{.dic} word lists found in
 the system locations or \texttt{<config>/dictionaries/<lang>.dic}; the
 status bar says when none is found.
+
+\section{The hex editor}\label{sec:hex}
+
+Binary files open in a hex editor: offsets on the left, the bytes in hex in
+the middle, the same bytes as text on the right (\texttt{.} for anything
+unprintable). Rows hold 32, 16 or 8 bytes, whichever fits.
+
+\begin{itemize}
+\item Click a byte in either column to put the caret there; \key{Tab}
+  switches columns. The status bar shows the offset and the column.
+\item In the hex column just keep typing digits: two digits replace a byte
+  and the caret moves on by itself. In the text column each character
+  replaces bytes with its own. Typing past the end appends; nothing is
+  inserted or deleted, so offsets never shift.
+\item Arrows move by byte and by row, \key{Home}/\key{End} along the row,
+  \key{Ctrl+Home}/\key{Ctrl+End} to either end of the file, \key{Shift}
+  or a drag selects.
+\item Copy gives hex (\texttt{de ad be ef}) from the hex column, text
+  from the text column. Undo, Redo and Save work as usual, and Save writes
+  the bytes back exactly.
+\item \key{Ctrl+F} finds your search as text and, when it is hex digits,
+  as bytes: \texttt{de ad be ef} and \texttt{deadbeef} find the same four
+  bytes. Replace is not available here.
+\end{itemize}
+
+\begin{watchout}
+Hex edits are not covered by crash recovery: save as you go. To read a
+binary file as text instead, use \menu{Reload with Encoding}.
+\end{watchout}
 
 % ===========================================================================
 \chapter{Navigation}

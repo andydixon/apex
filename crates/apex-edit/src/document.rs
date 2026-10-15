@@ -241,6 +241,13 @@ impl Document {
         self.saved_revision = self.revision;
     }
 
+    /// Mark the document changed or unchanged without editing its text, for
+    /// buffers whose contents live elsewhere (the hex editor).
+    pub fn set_dirty(&mut self, dirty: bool) {
+        // Revisions start at 1, so 0 never matches.
+        self.saved_revision = if dirty { 0 } else { self.revision };
+    }
+
     /// Mark the document as pristine at its current revision (used when the
     /// text was replaced wholesale by a reload).
     pub fn mark_clean(&mut self) {
