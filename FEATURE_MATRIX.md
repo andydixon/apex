@@ -162,6 +162,7 @@ packaging, benchmarks, fuzzing, documentation).
 | Single instance: second invocation hands over paths; `--new-window`; `--reuse-window` | V | IPC unit test + Xvfb script |
 | `--wait` until the tab closes | V | |
 | `--diff old new` | V | |
+| Help ▸ Check for Updates: latest GitHub release, date, release page link, platform download | V | `updates` tests (parsing, platform asset, links outside the project dropped, version order); Xvfb against live GitHub and a stand-in `curl` |
 | macOS "Open With" / Dock / `open -a` via Apple Events | P | handler compiles for `aarch64-apple-darwin`; not yet exercised on macOS hardware |
 | Windows "Open with Apex" context menu, associations, PATH (installer) | P | Inno Setup script written; installer not yet built on Windows by the authors |
 | Multiple OS windows | P | File ▸ New Window (Ctrl+Shift+N) and `--new-window` start a second instance that shares settings, themes, key maps and snippets through the configuration directory; tabs, panes and sessions are per window. Closing one never affects another. Not one process with shared in-memory documents (documented limitation) |

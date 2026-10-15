@@ -35,4 +35,5 @@ pub mod spell;
 pub mod tasks;
 pub mod token;
 pub mod tree;
+pub mod updates;
 pub mod watch;
