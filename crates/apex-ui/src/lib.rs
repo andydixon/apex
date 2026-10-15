@@ -39,6 +39,8 @@ pub mod git_ops;
 pub mod git_panel;
 /// Repository status cache, gutter marks and branch label.
 pub mod git_ui;
+/// The hex editor binary files open in.
+pub mod hex_ui;
 /// Interactive history editing (rebase) window.
 pub mod history_ui;
 /// Key bindings: parsing, contexts and chord dispatch.
@@ -68,6 +70,8 @@ pub mod symbol_index;
 pub mod tasks_ui;
 /// Colour themes: built-ins, user TOML themes and egui style application.
 pub mod theme;
+/// Help > Check for Updates.
+pub mod update_ui;
 /// `View`: one tab's selections, scroll, folds and layout cache over a document.
 pub mod view;
 /// Vim emulation state machine.

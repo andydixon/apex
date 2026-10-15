@@ -460,6 +460,7 @@ commands! {
     OpenProjectSettings => "project.settings", "Open Project Settings", Project; // opens the project file for editing
 
     // Help
+    CheckForUpdates => "help.check_updates", "Check for Updates…", Help;
     About => "help.about", "About Apex", Help;
     OpenUserGuide => "help.guide", "User Guide", Help;
     ShowKeyboardCheatSheet => "help.cheatsheet", "Keyboard Cheat Sheet", Help;    // same handler as KeyboardShortcuts

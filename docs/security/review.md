@@ -7,9 +7,9 @@ be missing. It complements `SECURITY.md` (reporting, threat model) and
 
 ## What Apex is and is not
 
-Apex is a local, offline editor. It never opens a network connection,
-reads no credentials, has no accounts, telemetry or update checks, and
-embeds no scripting runtime. The only ways for data to enter the process
+Apex is a local editor. It opens no network connection of its own accord
+(git, ssh and the update check below run only when the user asks), has no
+accounts or telemetry, and embeds no scripting runtime. The only ways for data to enter the process
 are: files the user opens (and their directory listings), configuration
 files in the user's own directories, language-server processes the user
 has installed, build tasks the user runs, the clipboard, and the loopback
@@ -26,8 +26,10 @@ somewhere unexpected.
   `large_file_mb` open in large-file mode with highlighting, minimap detail,
   word wrap and spell checking off. A 500 MB file is still one allocation;
   there is no memory-mapped or streamed mode (known limitation).
-* Binary detection (NUL bytes / UTF-16 heuristics) sends binaries to a
-  read-only hex preview; saving a hex preview is refused.
+* Binary detection (NUL bytes / UTF-16 heuristics) sends binaries to the
+  hex editor, which writes raw bytes with the same identity check and
+  atomic replace as text (`fileio::save_bytes`); its placeholder document
+  is read-only, so text commands cannot alter it.
 * Every offset conversion is total (`apex-buffer` fuzz target `offsets`),
   and every edit goes through `Transaction::clamped` so out-of-range
   positions from any source cannot index past the rope.
@@ -205,6 +207,18 @@ and open files in the editor — equivalent to what it could do by running
 * The dialog's text buffer is reserved up front (no reallocation copies),
   wiped when the dialog closes, and the field's undo state is dropped. egui
   may still have made transient copies while drawing; see the limitations.
+
+## 7b. Update check
+
+* Only on **Help > Check for Updates**; never automatic. Runs the system
+  `curl` (`APEX_CURL` overrides) with argv, no shell, a 15 s limit and a
+  fixed URL (`api.github.com/repos/andydixon/apex/releases/latest`). The
+  request carries a `User-Agent` of `Apex/<version>` and nothing else.
+* The JSON reply is untrusted: a malformed one is an error, and the release
+  page and download links are used only if they start with
+  `https://github.com/andydixon/apex/`; anything else is dropped (tested).
+  Links open in the browser through the same `https://`-only opener as
+  other links. Nothing is downloaded or run by Apex itself.
 
 ## 8. Dependencies and build
 

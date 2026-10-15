@@ -89,3 +89,34 @@ misspelled words in prose files and in comments and strings of code.
 Right-click a word for suggestions, **Add to dictionary** or **Ignore**.
 Dictionaries are Hunspell `.dic` word lists found in the system locations or
 `<config>/dictionaries/<lang>.dic`; the status bar says when none is found.
+
+## Hex editor
+
+Binary files open in a hex editor: the offset on the left, the bytes in
+hex in the middle, and the same bytes as text on the right (`.` for
+anything that is not printable ASCII). Each row shows 32, 16 or 8 bytes,
+whichever fits the pane.
+
+* Click a byte in either column to put the caret there. **Tab** switches
+  between the hex and text columns; the status bar shows the offset and
+  which column you are typing into.
+* In the hex column, type hex digits continuously: two digits replace a
+  byte and the caret moves on to the next one by itself. In the text
+  column, each character typed replaces bytes with its own (UTF-8).
+  Typing past the last byte appends; nothing is ever inserted in the
+  middle or deleted, so offsets stay put.
+* Arrows move by byte and by row; `Home`/`End` go to the start or end of
+  the row, `Ctrl+Home`/`Ctrl+End` to the start or end of the file, and
+  `Page Up`/`Page Down` by a screenful. Hold `Shift` (or drag) to select.
+* Copy gives the selection as hex (`de ad be ef`) from the hex column, or
+  as text from the text column. Paste into the hex column accepts hex
+  digits; into the text column, text.
+* Undo and Redo work as usual; Save writes the bytes back exactly (with
+  the same changed-on-disk check and atomic replace as any file).
+* **Find** (`Ctrl+F`) matches your search both as text and, when it is hex
+  digits, as bytes: `de ad be ef` and `deadbeef` both find those four
+  bytes, and an odd final digit matches the next byte's first digit.
+  Replace is not available here.
+* To read a binary file as text after all, use **Reload with Encoding**.
+
+Edits in the hex editor are not part of crash recovery.

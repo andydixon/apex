@@ -43,7 +43,8 @@ leaves all three.
 * **File > Open Recent** lists recent files and projects.
 * Large files (over `large_file_mb`, 50 MB by default) open in a
   reduced-feature mode: no syntax highlighting, minimap detail or word wrap,
-  so they stay responsive. Binary files open in a read-only hex preview.
+  so they stay responsive. Binary files open in the
+  [hex editor](editing.md#hex-editor).
 
 ## The command line
 
@@ -75,3 +76,13 @@ directory; a second invocation hands over its paths and exits. Set
 
 **Help > About** shows the exact paths; `APEX_CONFIG_DIR` and
 `APEX_DATA_DIR` override them.
+
+## Updates
+
+**Help > Check for Updates…** asks GitHub for the latest Apex release. If
+it is newer than yours, it shows the new version, its release date and a
+link to the release notes; **Download** opens this platform's installer
+(the `.dmg` on macOS, the setup program on Windows, the `.tar.gz` on Linux)
+in your browser. If you installed with Homebrew or from repo.dixon.cx,
+update through that instead. Apex never checks on its own; the check uses
+your system's `curl` and sends nothing but the request itself.

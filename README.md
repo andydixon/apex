@@ -38,7 +38,8 @@ Everything works offline.
   views of one file, sessions and crash recovery, project files.
 * **Files**: encodings (UTF-8/16, Windows-125x, ISO-8859, CJK) and line
   endings detected, converted and preserved; atomic saves that never
-  overwrite a file another program changed; large-file mode; hex preview.
+  overwrite a file another program changed; large-file mode; hex editor
+  for binary files.
 * **Git**: gutter marks, a Source Control panel (stage files, hunks or
   lines, commit, amend), side-by-side diffs with per-change stage/revert,
   blame, branches, log graph, stash, merge-conflict resolution,

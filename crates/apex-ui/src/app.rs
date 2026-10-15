@@ -128,6 +128,8 @@ pub(crate) enum Dialog {
     Confirm { title: String, body: String, button: String, then: (Command, Option<String>) },
     /// Browse a server over SSH to open a file or save one there.
     RemoteBrowser(Box<crate::remote_ui::Browser>),
+    /// Help > Check for Updates, while checking and with the answer.
+    Update(crate::update_ui::UpdateCheck),
 }
 
 /// What `request_close` does once every requested view has been dealt with.
@@ -145,7 +147,7 @@ pub(crate) enum AfterClose {
 #[derive(Debug, Default)]
 pub(crate) struct FindState {
     /// The bar is visible (as a bottom panel).
-    open: bool,
+    pub(crate) open: bool,
     /// The second row with the replacement field is visible.
     replace_open: bool,
     /// Search text; a regex when `options.regex` is set.
@@ -153,14 +155,15 @@ pub(crate) struct FindState {
     /// Replacement text; `$1`..`$9` expand to capture groups in regex mode.
     replacement: String,
     options: SearchOptions,
-    /// Char ranges of every match in the active document, in order (capped at 100 000).
-    matches: Vec<std::ops::Range<usize>>,
+    /// Char ranges of every match in the active document (byte ranges in a
+    /// hex view), in order (capped at 100 000).
+    pub(crate) matches: Vec<std::ops::Range<usize>>,
     /// Index into `matches` of the one the caret was last moved to, for the "n of m" label.
-    current: Option<usize>,
+    pub(crate) current: Option<usize>,
     /// Regex compile error to show instead of the match count.
     error: Option<String>,
-    /// Document revision the matches were computed for.
-    rev: Option<(DocId, u64, String, SearchOptions)>,
+    /// Document revision (hex: generation) the matches were computed for.
+    pub(crate) rev: Option<(DocId, u64, String, SearchOptions)>,
     /// Set by commands that open the bar so the needle field grabs focus next frame.
     focus_needle: bool,
     /// Recent needles, most recent first, at most 20.
@@ -322,6 +325,8 @@ pub struct ApexApp {
     pub(crate) egui_ctx: Option<egui::Context>,
     /// Documents opened over SSH and their transfers.
     pub(crate) remote: crate::remote_ui::RemoteState,
+    /// Hex editors of binary files, by the tab's placeholder document.
+    pub(crate) hex: HashMap<DocId, crate::hex_ui::HexDoc>,
     /// The credential being typed into `Dialog::Askpass`; wiped when it closes.
     pub(crate) askpass_text: String,
     /// Side-by-side diff tabs, keyed by the tab's (left) view.
@@ -433,6 +438,7 @@ impl ApexApp {
             file_dialog: None,
             egui_ctx: Some(cc.egui_ctx.clone()),
             remote: Default::default(),
+            hex: HashMap::new(),
             askpass_text: String::new(),
             diffs: HashMap::new(),
             inbox: args.inbox.clone(),
@@ -608,7 +614,7 @@ impl ApexApp {
     /// Directories become workspace roots instead and return `None`. A file
     /// that is already open is focused rather than loaded twice. A missing
     /// file opens as an empty buffer that will be created on save. Binary
-    /// files open as a read-only hex preview. Sets a status message for
+    /// files open in the hex editor (`hex_ui`). Sets a status message for
     /// decode errors or large files.
     pub fn open_path(&mut self, path: &Path) -> Option<ViewId> {
         let path = normalise_path(path);
@@ -642,11 +648,12 @@ impl ApexApp {
             }
         };
         let encoding = loaded.encoding;
-        // Binary files get a generated hex dump; the "hex" override also stops
-        // `save_view` from writing the dump back over the original.
+        // Binary files: the bytes go to the hex editor and the document is an
+        // empty read-only placeholder (no text commands can touch it).
+        let mut hex = None;
         let mut doc = if let Some(bytes) = loaded.binary {
-            let mut d = Document::from_text(hex_preview(&bytes));
-            d.read_only = true;
+            hex = Some(crate::hex_ui::HexDoc::new(bytes, loaded.read_only));
+            let mut d = Document::empty();
             d.language_override = Some("hex".into());
             d
         } else {
@@ -658,7 +665,10 @@ impl ApexApp {
         doc.mixed_line_endings = loaded.mixed_line_endings;
         doc.had_decode_errors = loaded.had_decode_errors;
         doc.file_identity = Some(loaded.identity);
-        doc.read_only |= loaded.read_only;
+        doc.read_only |= loaded.read_only || hex.is_some();
+        if let Some(h) = hex {
+            self.hex.insert(doc.id, h);
+        }
         // Guess tabs/spaces from the content once; afterwards the document's own
         // setting is authoritative.
         if self.settings.detect_indentation {
@@ -872,10 +882,27 @@ impl ApexApp {
             self.save_view_as_then(vid, None);
             return false;
         };
-        // The hex preview is a rendering of the file, not its contents.
-        if doc.read_only && doc.language_override.as_deref() == Some("hex") {
-            self.set_status("Binary previews are read-only".into(), true);
-            return false;
+        if let Some(h) = self.hex.get_mut(&did) {
+            let opts = SaveOptions { encoding: doc.encoding, line_ending: doc.line_ending, expected: doc.file_identity, force, in_place: false };
+            return match fileio::save_bytes(&path, &h.bytes, &opts) {
+                Ok(identity) => {
+                    h.mark_saved();
+                    let doc = self.docs.get_mut(&did).expect("doc exists");
+                    doc.file_identity = Some(identity);
+                    doc.mark_saved();
+                    self.git_mark_dirty();
+                    self.set_status(format!("Saved {}", path.display()), false);
+                    true
+                }
+                Err(FileError::ChangedOnDisk) => {
+                    self.dialog = Some(Dialog::SaveConflict { view: vid });
+                    false
+                }
+                Err(e) => {
+                    self.set_status(format!("Could not save {}: {e}", path.display()), true);
+                    false
+                }
+            };
         }
         if self.settings.trim_trailing_whitespace_on_save {
             self.run_edit(vid, ops::trim_trailing_whitespace);
@@ -940,8 +967,12 @@ impl ApexApp {
         let doc = self.docs.get_mut(&did).expect("doc exists");
         doc.path = Some(path.clone());
         doc.file_identity = None;
-        doc.read_only = false;
-        doc.language_override = None;
+        // A hex editor's placeholder stays read-only and marked as hex.
+        let hex = self.hex.contains_key(&did);
+        doc.read_only = hex;
+        if !hex {
+            doc.language_override = None;
+        }
         doc.untitled_index = None;
         self.push_recent(&path);
         self.save_view(vid, true)
@@ -1144,7 +1175,7 @@ impl ApexApp {
     /// `arg` is the optional string argument (a path, an encoding id, a
     /// line number, "force", ...) whose meaning depends on the command.
     pub(crate) fn execute(&mut self, ctx: &egui::Context, cmd: Command, arg: Option<String>) {
-        if self.vim_command(ctx, cmd) || self.settings_command(ctx, cmd) {
+        if self.hex_command(ctx, cmd) || self.vim_command(ctx, cmd) || self.settings_command(ctx, cmd) {
             return;
         }
         // Record before running so the macro replays in the same order.
@@ -2122,6 +2153,7 @@ impl ApexApp {
                 self.open_path(&p);
             }
             Command::About => self.dialog = Some(Dialog::About),
+            Command::CheckForUpdates => self.check_for_updates(),
             // Counts the selections if there are any, else the whole document.
             Command::WordCount => {
                 if let Some((v, d)) = active {
@@ -2326,7 +2358,12 @@ impl ApexApp {
         match fileio::load(&path, encoding, fallback) {
             Ok(l) if l.binary.is_none() => {
                 let sels = self.views[&vid].sels.clone();
+                // Reload with Encoding on a hex tab turns it into a text tab.
+                let was_hex = self.hex.remove(&did).is_some();
                 let doc = self.docs.get_mut(&did).expect("doc");
+                if was_hex {
+                    doc.language_override = None;
+                }
                 doc.replace_all(&l.text, &sels);
                 doc.encoding = l.encoding;
                 doc.line_ending = l.line_ending;
@@ -2341,7 +2378,17 @@ impl ApexApp {
                 self.forget_recovery(did);
                 self.set_status(format!("Reloaded {} as {}", path.display(), l.encoding), false);
             }
-            Ok(_) => self.set_status("File is binary; reopen it to view the preview".into(), true),
+            Ok(l) => match (self.hex.get_mut(&did), l.binary) {
+                (Some(h), Some(bytes)) => {
+                    h.reload(bytes);
+                    h.read_only = l.read_only;
+                    let doc = self.docs.get_mut(&did).expect("doc");
+                    doc.file_identity = Some(l.identity);
+                    doc.mark_clean();
+                    self.set_status(format!("Reloaded {}", path.display()), false);
+                }
+                _ => self.set_status("The file is now binary; close and reopen it to edit it as hex".into(), true),
+            },
             Err(e) => self.set_status(format!("Could not reload: {e}"), true),
         }
     }
@@ -2508,7 +2555,8 @@ impl ApexApp {
     pub(crate) fn update_matches(&mut self) {
         let Some((_, d)) = self.active_ids() else { return };
         let Some(doc) = self.docs.get(&d) else { return };
-        let key = (d, doc.revision(), self.find.needle.clone(), self.find.options);
+        let hex = self.hex.get(&d);
+        let key = (d, hex.map_or(doc.revision(), |h| h.generation), self.find.needle.clone(), self.find.options);
         if self.find.rev.as_ref() == Some(&key) {
             return;
         }
@@ -2517,6 +2565,10 @@ impl ApexApp {
         self.find.current = None;
         self.find.error = None;
         if self.find.needle.is_empty() {
+            return;
+        }
+        if let Some(h) = hex {
+            self.find.matches = crate::hex_ui::find_all(&h.bytes, &self.find.needle, self.find.options.case_sensitive, 100_000);
             return;
         }
         match Query::new(&self.find.needle, self.find.options) {
@@ -2539,7 +2591,10 @@ impl ApexApp {
             self.find.history.push_front(self.find.needle.clone());
             self.find.history.truncate(20);
         }
-        let head = self.views[&v].sels.primary();
+        let head = match self.active_hex() {
+            Some(h) => Selection::point(h.cursor()),
+            None => self.views[&v].sels.primary(),
+        };
         let wrap = self.settings.find_wrap;
         let ms: Vec<apex_edit::search::Match> = self.find.matches.iter().map(|r| apex_edit::search::Match { range: r.clone() }).collect();
         let idx = if forward {
@@ -2550,7 +2605,9 @@ impl ApexApp {
         if let Some(i) = idx {
             self.find.current = Some(i);
             let r = self.find.matches[i].clone();
-            if let Some(view) = self.views.get_mut(&v) {
+            if let Some(h) = self.active_hex() {
+                h.select(r);
+            } else if let Some(view) = self.views.get_mut(&v) {
                 view.set_selections(SelectionSet::single(Selection::new(r.start, r.end)));
             }
         }
@@ -3051,6 +3108,7 @@ impl ApexApp {
                 }
             });
             ui.menu_button("Help", |ui| {
+                item(ui, &mut q, Command::CheckForUpdates);
                 item(ui, &mut q, Command::About);
             });
         });
@@ -3290,29 +3348,37 @@ impl ApexApp {
         if let Some((v, d)) = self.active_ids() {
             let view = &self.views[&v];
             let doc = &self.docs[&d];
-            let (line, col) = view.primary_position(doc);
-            let display_col = apex_buffer::position::char_col_to_display_col(doc.rope().line(line), col, self.settings.tab_width);
-            left = format!("Line {}, Column {}", line + 1, display_col + 1);
-            let summary = editor::selection_summary(doc, &view.sels);
-            if !summary.is_empty() {
-                left.push_str("    ");
-                left.push_str(&summary);
-            }
-            if view.overwrite {
-                left.push_str("    OVR");
-            }
-            if let Some(v) = self.vim_status_label() {
-                left = format!("{v}    {left}");
-            }
-            if !self.keymap.pending().is_empty() {
-                left.push_str(&format!("    {} …", self.keymap.pending().iter().map(|k| k.to_string()).collect::<Vec<_>>().join(" ")));
-            }
-            right.push(doc.indent.label());
-            right.push(doc.encoding.label());
-            right.push(if doc.mixed_line_endings { format!("{} (mixed)", doc.line_ending.label()) } else { doc.line_ending.label().to_string() });
-            right.push(if doc.language_override.as_deref() == Some("hex") { "Hex".to_string() } else { self.language_of(d).name.to_string() });
-            if doc.read_only {
-                right.push("Read-only".into());
+            if let Some(h) = self.hex.get(&d) {
+                left = h.status();
+                right.push("Hex".into());
+                if h.read_only {
+                    right.push("Read-only".into());
+                }
+            } else {
+                let (line, col) = view.primary_position(doc);
+                let display_col = apex_buffer::position::char_col_to_display_col(doc.rope().line(line), col, self.settings.tab_width);
+                left = format!("Line {}, Column {}", line + 1, display_col + 1);
+                let summary = editor::selection_summary(doc, &view.sels);
+                if !summary.is_empty() {
+                    left.push_str("    ");
+                    left.push_str(&summary);
+                }
+                if view.overwrite {
+                    left.push_str("    OVR");
+                }
+                if let Some(v) = self.vim_status_label() {
+                    left = format!("{v}    {left}");
+                }
+                if !self.keymap.pending().is_empty() {
+                    left.push_str(&format!("    {} …", self.keymap.pending().iter().map(|k| k.to_string()).collect::<Vec<_>>().join(" ")));
+                }
+                right.push(doc.indent.label());
+                right.push(doc.encoding.label());
+                right.push(if doc.mixed_line_endings { format!("{} (mixed)", doc.line_ending.label()) } else { doc.line_ending.label().to_string() });
+                right.push(if doc.language_override.as_deref() == Some("hex") { "Hex".to_string() } else { self.language_of(d).name.to_string() });
+                if doc.read_only {
+                    right.push("Read-only".into());
+                }
             }
             if self.font_zoom != 0 {
                 right.push(format!("{}pt", self.settings.font_size + self.font_zoom as f32));
@@ -3496,12 +3562,17 @@ impl ApexApp {
                     self.update_matches();
                     // Incremental: select the first match after the caret without moving focus.
                     if let Some((v, _)) = self.active_ids() {
-                        let head = self.views[&v].sels.primary().start();
+                        let head = match self.active_hex() {
+                            Some(h) => h.cursor(),
+                            None => self.views[&v].sels.primary().start(),
+                        };
                         let first_after = self.find.matches.iter().position(|m| m.start >= head);
                         if let Some(i) = first_after.or(if self.find.matches.is_empty() { None } else { Some(0) }) {
                             self.find.current = Some(i);
                             let r = self.find.matches[i].clone();
-                            if let Some(view) = self.views.get_mut(&v) {
+                            if let Some(h) = self.active_hex() {
+                                h.select(r);
+                            } else if let Some(view) = self.views.get_mut(&v) {
                                 view.sels.set_single(Selection::new(r.start, r.end));
                                 view.want_cursor_visible = true;
                             }
@@ -3601,6 +3672,10 @@ impl ApexApp {
         }
         if let Dialog::RemoteBrowser(b) = dialog {
             self.show_remote_browser_dialog(ctx, *b);
+            return;
+        }
+        if let Dialog::Update(check) = dialog {
+            self.show_update_dialog(ctx, check);
             return;
         }
         if matches!(dialog, Dialog::CreatePr { .. }) {
@@ -3828,7 +3903,8 @@ impl ApexApp {
             | Dialog::Confirm { .. }
             | Dialog::Askpass { .. }
             | Dialog::CreatePr { .. }
-            | Dialog::RemoteBrowser(_) => {}
+            | Dialog::RemoteBrowser(_)
+            | Dialog::Update(_) => {}
             Dialog::Issues(issues) => {
                 let r = egui::Modal::new(egui::Id::new("issues")).show(ctx, |ui| {
                     ui.set_width(520.0);
@@ -3981,6 +4057,10 @@ impl ApexApp {
             return;
         }
         let focused = pane_id == self.active_pane;
+        if self.views.get(&vid).is_some_and(|v| self.hex.contains_key(&v.doc)) {
+            self.show_hex(&mut ui, pane_id, vid, inner, focused);
+            return;
+        }
         self.show_view(&mut ui, pane_id, vid, inner, focused, None, None);
     }
 
@@ -4375,8 +4455,10 @@ impl eframe::App for ApexApp {
             }
         }
         // Vim consumes raw keys itself, but never while a popup owns them.
+        let hex_active = self.active_ids().is_some_and(|(_, d)| self.hex.contains_key(&d));
         if self.settings.vim_mode
             && editor_focused
+            && !hex_active
             && !self.palette.open
             && self.dialog.is_none()
             && self.lsp.completion.is_none()
@@ -4583,38 +4665,6 @@ fn local_utc_offset_seconds() -> i64 {
     0
 }
 
-/// Render bytes as a classic hex dump (offset, 16 bytes in two groups,
-/// ASCII column) for the read-only binary preview. Stops after 1 MiB so
-/// a huge binary does not become a huge buffer.
-fn hex_preview(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 4);
-    out.push_str("Binary file (read-only hexadecimal preview)\n\n");
-    for (i, chunk) in bytes.chunks(16).enumerate().take(1 << 16) {
-        out.push_str(&format!("{:08x}  ", i * 16));
-        for (j, b) in chunk.iter().enumerate() {
-            out.push_str(&format!("{b:02x} "));
-            if j == 7 {
-                out.push(' ');
-            }
-        }
-        for _ in chunk.len()..16 {
-            out.push_str("   ");
-        }
-        if chunk.len() <= 8 {
-            out.push(' ');
-        }
-        out.push_str(" |");
-        for &b in chunk {
-            out.push(if (0x20..0x7f).contains(&b) { b as char } else { '.' });
-        }
-        out.push_str("|\n");
-    }
-    if bytes.len() > 16 << 16 {
-        out.push_str("… (preview truncated at 1 MiB)\n");
-    }
-    out
-}
-
 /// Open a web link in the default browser. Only `https:` links are opened.
 pub(crate) fn open_url(url: &str) -> bool {
     if !url.starts_with("https://") {
@@ -4689,13 +4739,5 @@ mod tests {
     pub(crate) fn civil_date() {
         assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
         assert_eq!(civil_from_unix(1_700_000_000), (2023, 11, 14, 22, 13, 20));
-    }
-
-    /// Pins the hex and ASCII columns of the preview format.
-    #[test]
-    pub(crate) fn hex_preview_shape() {
-        let p = hex_preview(b"ABC\x00\xff");
-        assert!(p.contains("41 42 43 00 ff"));
-        assert!(p.contains("|ABC..|"));
     }
 }
