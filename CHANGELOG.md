@@ -5,6 +5,8 @@ All notable changes to Apex are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-15
+
 ### Added
 - **File > Open Remote…** and **Save to Remote…**: edit files on another
   machine over SSH through an in-app server browser. Uses your `ssh` with
@@ -15,12 +17,15 @@ All notable changes to Apex are recorded here. The format follows
   sidebar's REMOTE section.
 - SSH password and passphrase prompts for remote files. The answer is kept
   in locked memory (never swapped or written to disk) only while a file or
-  folder from that server is open or the browser shows it, then wiped and the shared
-  connection closed. Background checks never prompt.
+  folder from that server is open or the browser shows it, then wiped and
+  the shared connection closed. Background checks never prompt.
 
 ### Changed
 - Git credential answers now travel from the dialog to git in locked,
   wiped-on-release memory instead of ordinary strings.
+
+### Fixed
+- Windows menus use colours inverse to the window so they stay readable.
 
 ## [0.1.1] - 2026-10-13
 

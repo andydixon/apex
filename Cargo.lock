@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "apex-app"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "apex-project",
  "apex-ui",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "apex-buffer"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "encoding_rs",
@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "apex-edit"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "apex-buffer",
  "criterion",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "apex-project"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "apex-buffer",
  "apex-edit",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "apex-syntax"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "apex-buffer",
  "apex-edit",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "apex-ui"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "apex-buffer",
  "apex-edit",
