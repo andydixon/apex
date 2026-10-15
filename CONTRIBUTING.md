@@ -4,9 +4,6 @@ Thank you for considering a contribution.
 
 ## Ground rules
 
-* Apex is a text editor, not an IDE, and has **no plugin system** by design.
-  Features are built in and configured declaratively (TOML). Proposals for a
-  scripting runtime or dynamically loaded extensions will be declined.
 * Data integrity beats everything else. Any change touching saving, loading,
   undo or selections needs tests, and a regression test for every fixed
   data-loss defect.
