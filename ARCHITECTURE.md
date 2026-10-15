@@ -15,7 +15,7 @@ all tested headlessly.
 | `apex-buffer`  | Rope text store (ropey), offset-space conversions, grapheme/word motion, line endings, encodings | ropey, unicode-*, encoding_rs |
 | `apex-edit`    | `Document` (text + revision + history + metadata), `Selection`/`SelectionSet`, `Transaction`, editing operations, in-document search, bracket matching, snippets | apex-buffer, regex |
 | `apex-syntax`  | Tree-sitter grammars, incremental highlighting with injections, folding, symbol extraction, declarative fallback syntaxes | apex-edit, tree-sitter |
-| `apex-project` | File I/O with atomic saves, platform paths, file index and watcher, Find in Files, git (`git` libgit2 reads, `git_cli` job runner/askpass/partial patches, `git_repo` branches/log graph/conflicts, `git_history` history rewriting, `diff_align` side-by-side alignment, `forge` remote links and `gh` JSON), sessions and recovery, build tasks, LSP client, spell dictionaries | apex-edit, ignore, notify, git2, similar, serde |
+| `apex-project` | File I/O with atomic saves, platform paths, file index and watcher, Find in Files, git (`git` libgit2 reads, `git_cli` job runner/askpass/partial patches, `git_repo` branches/log graph/conflicts, `git_history` history rewriting, `diff_align` side-by-side alignment, `forge` remote links and `gh` JSON), sessions and recovery, build tasks, LSP client, spell dictionaries, `remote` files over the user's `ssh`, `secret` locked wiped-on-drop credential memory | apex-edit, ignore, notify, git2, similar, serde |
 | `apex-ui`      | egui editor widget, panes/tabs, menus, find bar, palette, sidebar, settings editor, themes, key maps, Vim mode, git UI (`git_ui` gutter, `git_ops` jobs/staging, `git_panel` Source Control, `git_blame`, `diff_ui` side-by-side diff, `git_branches`, `git_log_ui`, `history_ui`, `forge_ui`), tasks/LSP/spell UI | all of the above, egui |
 | `apex-app`     | Binary: CLI parsing, logging, single-instance IPC, macOS Apple Events, window creation | apex-ui, eframe, clap, objc2 (macOS) |
 
@@ -167,7 +167,8 @@ repaint when something arrives:
 | Tree-sitter parse of large documents | `SyntaxState` background thread | per-frame budget in the foreground; generation id + edits-since-parse for the background result |
 | Git status and hunks | `git::start_status` | debounced; results tagged with the repo path |
 | `git`/`gh` commands | `git_cli::start_job`: one job at a time, queued | cancel kills the process group; output streamed to the GIT tab |
-| Askpass prompts | per-job loopback listener (`git_cli`) | token per job; closed with the job; 10-minute answer timeout |
+| Askpass prompts | per-job loopback listener (`git_cli::askpass_listener`, shared by git jobs and remote calls) | token per job; closed with the job; 10-minute answer timeout |
+| Remote file transfers and change checks | a thread per `remote` call (`remote_ui`) | `ConnectTimeout`/`ServerAlive*`; replies for closed tabs ignored; passwords wiped when no tab, sidebar folder or browser uses the host |
 | Blame | `git::start_blame` per document | recomputed 0.7 s after edits; stale results ignored by revision |
 | Log, history editor load | worker thread / job | replaced on reload |
 | Build tasks | `tasks::run` (process groups) | cancel kills the group; timeout |

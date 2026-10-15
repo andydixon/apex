@@ -93,10 +93,12 @@ commands! {
     OpenFile => "file.open", "Open File…", File;             // arg: path to open without a dialog (`:e path`)
     OpenFolder => "file.open_folder", "Open Folder…", File;
     OpenFolderByPath => "file.open_folder_path", "Open Folder by Path…", File; // in-app path prompt instead of the system dialog
+    OpenRemote => "file.open_remote", "Open Remote…", File;  // browse a server over SSH
     OpenRecent => "file.open_recent", "Open Recent…", File;
     ReopenClosed => "file.reopen_closed", "Reopen Closed File", File; // most recently closed tab
     Save => "file.save", "Save", File;                       // arg: path to save to (`:w path`), relative to the current dir
     SaveAs => "file.save_as", "Save As…", File;
+    SaveAsRemote => "file.save_as_remote", "Save to Remote…", File; // save the file on a server over SSH
     SaveAll => "file.save_all", "Save All", File;
     Revert => "file.revert", "Revert File", File;            // discard unsaved changes, reload from disk
     RenameFile => "file.rename", "Rename File…", File;

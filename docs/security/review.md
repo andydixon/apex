@@ -167,6 +167,45 @@ and open files in the editor — equivalent to what it could do by running
   `https://` links are passed to the system's opener; path segments are
   percent-encoded.
 
+## 7a. Remote files over SSH
+
+* Runs the user's `ssh` with argv (no local shell). The host is refused if
+  empty, containing whitespace or starting with `-` (option injection), and
+  is passed after `--`. Remote paths are single-quoted into a fixed POSIX
+  script that runs under `sh -c` on the server.
+* Host keys: `StrictHostKeyChecking=accept-new`. New hosts are recorded on
+  first contact (trust on first use); a changed key is refused.
+* Writes go to a `mktemp` file (owner-only, so a private target is never
+  briefly readable by others); the byte count is checked before the
+  content is copied over the target, so a dropped connection cannot
+  truncate it. A trap removes the temporary file.
+* Every script prints a marker first and only output after it is used, so
+  text printed by the login shell (`.bashrc`, `ForceCommand`) cannot leak
+  into file contents. `-T`, `RemoteCommand=none` and `ClearAllForwardings`
+  stop the user's host config adding a terminal, a command or forwards.
+* On Unix, connections are multiplexed through a socket (`ssh-%C`) in the
+  private runtime directory or, where that path is too long for a socket
+  (always on macOS), in `/tmp/apex-<uid>`. The folder must be a real
+  directory (not a symlink) owned by the user with mode `0700`; otherwise
+  multiplexing is skipped. The path is quoted for ssh.
+* **Credentials**: password and passphrase prompts use the same askpass
+  helper and per-call loopback listener as git (random port, 256-bit
+  token). Answers are kept for reuse in `apex_project::secret::Secret`:
+  page-aligned allocations of their own, locked with `mlock`/`VirtualLock`
+  (best effort), `MADV_DONTDUMP` on Linux, overwritten with volatile writes
+  before release. They are keyed by host and prompt, held only while a file
+  or folder from that host is open or the browser shows it, then wiped, and the
+  host's control master is told to exit. Only user-initiated operations
+  may prompt; background checks answer from memory or fail. A rejected
+  answer ("Permission denied") is forgotten. Prompts that do not mention a
+  password or passphrase (one-time codes) are never kept. `ssh` gets
+  `NumberOfPasswordPrompts=1`, so a wrong remembered answer is tried once.
+  The answer is written to the helper's socket directly from the locked
+  page; the helper process wipes its copy after printing it to ssh.
+* The dialog's text buffer is reserved up front (no reallocation copies),
+  wiped when the dialog closes, and the field's undo state is dropped. egui
+  may still have made transient copies while drawing; see the limitations.
+
 ## 8. Dependencies and build
 
 * All crates are from crates.io with permissive licences compatible with
@@ -201,6 +240,12 @@ and open files in the editor — equivalent to what it could do by running
    are refused.
 8. **Trusted repositories run hooks.** Trusting a folder lets its hooks
    run whenever Apex runs `git` there, exactly as on the command line.
+9. **Typed passwords pass through the GUI toolkit.** egui's text field and
+   its undo history hold the text while it is typed; Apex wipes its own
+   buffer and drops the undo state afterwards, but transient copies made
+   inside egui are freed without being zeroed. Memory locking can fail
+   under a low `RLIMIT_MEMLOCK`; the secret is still wiped on release.
+10. **Remote host keys are trusted on first use** (`accept-new`).
 
 ## Audit of October 2026
 

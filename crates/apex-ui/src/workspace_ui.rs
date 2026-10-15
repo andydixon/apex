@@ -266,6 +266,7 @@ impl ApexApp {
             repaint = true;
         }
         self.tasks_refresh();
+        self.remote_poll();
         // Recovery snapshots at the configured interval, never faster than 1 s.
         if self.last_recovery.elapsed() >= Duration::from_millis(self.settings.recovery_interval_ms.max(1000)) {
             self.last_recovery = Instant::now();
@@ -297,6 +298,16 @@ impl ApexApp {
             && self.roots.iter().any(|r| p.starts_with(r))
         {
             self.sidebar.reveal(p);
+        }
+        if self.has_remote_folders() {
+            // Remote folders on top; with no local folder they take the whole panel.
+            let local = !self.roots.is_empty();
+            let h = ui.available_height();
+            self.show_remote_folders(ui, if local { h * 0.4 } else { h }, !local);
+            if !local {
+                return;
+            }
+            ui.separator();
         }
         let actions = if self.git_panel_visible() {
             // Folders above, Source Control below, split by a draggable handle.
@@ -1693,6 +1704,21 @@ impl ApexApp {
     /// refocus the editor. `Path` prompts validate the path against what the
     /// stand-in dialog expects (folder, existing file, or a new file in an
     /// existing folder for Save As) before handing it to `file_dialog_result`.
+    /// Show a credential prompt; `back` is restored once it is answered.
+    /// The text buffer is reserved up front so typing never reallocates it
+    /// (which would leave copies of the secret in freed memory).
+    pub(crate) fn open_askpass(
+        &mut self,
+        prompt: String,
+        reply: crossbeam_channel::Sender<Option<apex_project::secret::Secret>>,
+        host: Option<String>,
+        back: Option<Box<Dialog>>,
+    ) {
+        apex_project::secret::wipe_string(&mut self.askpass_text);
+        self.askpass_text.reserve(1024);
+        self.dialog = Some(Dialog::Askpass { prompt, reply, host, back });
+    }
+
     pub(crate) fn prompt_accepted(&mut self, ctx: &egui::Context, kind: PromptKind, text: String) {
         match kind {
             PromptKind::NewFile(dir) => self.create_file(&dir, &text),
@@ -2031,39 +2057,51 @@ impl ApexApp {
                     }
                 }
             }
-            Dialog::Askpass { prompt, mut text, reply } => {
-                // Mask the field when git's prompt looks like it asks for a secret
+            Dialog::Askpass { prompt, reply, host, back } => {
+                // Mask the field when the prompt looks like it asks for a secret
                 // (substring match so "Password"/"password" both hit).
                 let secret = ["assword", "assphrase", "PIN", "token"].iter().any(|k| prompt.contains(k));
-                let mut done: Option<Option<String>> = None;
+                let field = egui::Id::new("askpass-field");
+                let mut done: Option<bool> = None;
                 egui::Modal::new(egui::Id::new("askpass")).show(ctx, |ui| {
                     ui.set_width(440.0);
-                    ui.heading("Git needs a credential");
+                    ui.heading(match &host {
+                        Some(h) => format!("{h} needs a password"),
+                        None => "Git needs a credential".into(),
+                    });
                     ui.label(&prompt);
-                    let r = ui.add(egui::TextEdit::singleline(&mut text).password(secret).desired_width(f32::INFINITY));
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.askpass_text).id(field).password(secret).desired_width(f32::INFINITY));
                     r.request_focus();
-                    ui.label(egui::RichText::new("Sent once to git; Apex does not store it.").color(self.theme.ui.text_muted));
+                    let note = if host.is_some() {
+                        "Kept in locked memory until you close the last file from this server, then wiped."
+                    } else {
+                        "Sent once to git; Apex does not store it."
+                    };
+                    ui.label(egui::RichText::new(note).color(self.theme.ui.text_muted));
                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() || enter {
-                            done = Some(Some(std::mem::take(&mut text)));
+                            done = Some(true);
                         }
                         if ui.button("Cancel").clicked() {
-                            done = Some(None);
+                            done = Some(false);
                         }
                     });
                 });
                 if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    done = Some(None);
+                    done = Some(false);
                 }
                 match done {
-                    Some(answer) => {
-                        // The git helper thread is blocked on this channel; `None`
-                        // tells it the user cancelled.
-                        let _ = reply.send(answer);
-                        self.dialog = None;
+                    Some(ok) => {
+                        // The helper thread is blocked on this channel; `None`
+                        // tells it the user cancelled. `from_string` wipes the typed copy.
+                        let answer = std::mem::take(&mut self.askpass_text);
+                        let _ = reply.send(if ok { Some(apex_project::secret::Secret::from_string(answer)) } else { None });
+                        // Drop the field's undo history, which holds copies of the text.
+                        ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(field));
+                        self.dialog = back.map(|b| *b);
                     }
-                    None => self.dialog = Some(Dialog::Askpass { prompt, text, reply }),
+                    None => self.dialog = Some(Dialog::Askpass { prompt, reply, host, back }),
                 }
             }
             Dialog::Confirm { title, body, button, then } => {

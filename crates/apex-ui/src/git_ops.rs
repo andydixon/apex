@@ -130,7 +130,10 @@ impl ApexApp {
                     if self.dialog.is_some() {
                         let _ = reply.send(None);
                     } else {
-                        self.dialog = Some(Dialog::Askpass { prompt, text: String::new(), reply });
+                        // Inline `open_askpass`: `job` still borrows `self.git`.
+                        apex_project::secret::wipe_string(&mut self.askpass_text);
+                        self.askpass_text.reserve(1024);
+                        self.dialog = Some(Dialog::Askpass { prompt, reply, host: None, back: None });
                     }
                 }
                 JobEvent::Finished(r) => {

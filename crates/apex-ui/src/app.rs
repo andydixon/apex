@@ -119,10 +119,15 @@ pub(crate) enum Dialog {
     /// The Create Pull Request form.
     CreatePr { workdir: PathBuf, branch: String, base: String, title: String, body: String, draft: bool },
     /// A credential prompt from git or ssh (askpass).
-    Askpass { prompt: String, text: String, reply: crossbeam_channel::Sender<Option<String>> },
+    /// The typed text is kept outside the dialog (`askpass_text`) so it is
+    /// not copied every frame; `host` marks an SSH prompt from a remote file,
+    /// and `back` is the dialog to restore once it is answered.
+    Askpass { prompt: String, reply: crossbeam_channel::Sender<Option<apex_project::secret::Secret>>, host: Option<String>, back: Option<Box<Dialog>> },
     /// Confirm a destructive command, then run `then` again (it checks
     /// `git.ops.confirmed`).
     Confirm { title: String, body: String, button: String, then: (Command, Option<String>) },
+    /// Browse a server over SSH to open a file or save one there.
+    RemoteBrowser(Box<crate::remote_ui::Browser>),
 }
 
 /// What `request_close` does once every requested view has been dealt with.
@@ -315,6 +320,10 @@ pub struct ApexApp {
     pub(crate) file_dialog: Option<crate::file_dialogs::PendingFileDialog>,
     /// For waking the UI from worker threads.
     pub(crate) egui_ctx: Option<egui::Context>,
+    /// Documents opened over SSH and their transfers.
+    pub(crate) remote: crate::remote_ui::RemoteState,
+    /// The credential being typed into `Dialog::Askpass`; wiped when it closes.
+    pub(crate) askpass_text: String,
     /// Side-by-side diff tabs, keyed by the tab's (left) view.
     pub(crate) diffs: HashMap<ViewId, crate::diff_ui::DiffState>,
     /// Open requests from the platform or a second process (see `StartupArgs::inbox`).
@@ -423,6 +432,8 @@ impl ApexApp {
             settings_panel: Default::default(),
             file_dialog: None,
             egui_ctx: Some(cc.egui_ctx.clone()),
+            remote: Default::default(),
+            askpass_text: String::new(),
             diffs: HashMap::new(),
             inbox: args.inbox.clone(),
             on_view_closed: args.on_view_closed.clone(),
@@ -852,6 +863,9 @@ impl ApexApp {
     pub(crate) fn save_view(&mut self, vid: ViewId, force: bool) -> bool {
         let Some(view) = self.views.get(&vid) else { return false };
         let did = view.doc;
+        if self.remote.docs.contains_key(&did) {
+            return self.remote_save(vid, None, true);
+        }
         let Some(doc) = self.docs.get(&did) else { return false };
         let Some(path) = doc.path.clone() else {
             // No path yet: the dialog answers asynchronously, so this save is not done yet.
@@ -1188,6 +1202,11 @@ impl ApexApp {
                 let spec = crate::file_dialogs::FileDialogSpec::open_files("Open File").directory(self.current_dir());
                 self.show_file_dialog(spec, crate::file_dialogs::FileDialogKind::OpenFiles);
             }
+            Command::OpenRemote => self.show_remote_browser(None),
+            Command::SaveAsRemote => {
+                let v = view!();
+                self.show_remote_browser(Some((v, None)));
+            }
             Command::OpenRecent => {
                 if let Some(a) = arg {
                     self.open_path(Path::new(&a));
@@ -1231,7 +1250,7 @@ impl ApexApp {
                 let mut seen = std::collections::HashSet::new();
                 for v in ids {
                     let did = self.views[&v].doc;
-                    if seen.insert(did) && self.docs.get(&did).is_some_and(|d| d.is_dirty() && d.path.is_some()) {
+                    if seen.insert(did) && self.docs.get(&did).is_some_and(|d| d.is_dirty() && (d.path.is_some() || self.remote.docs.contains_key(&did))) {
                         self.save_view(v, false);
                     }
                 }
@@ -2139,7 +2158,8 @@ impl ApexApp {
         }
         // The first line is enough for shebang and mode-line detection.
         let first: String = doc.rope().line(0).chars().take(200).collect();
-        apex_syntax::detect(doc.path.as_deref(), &first)
+        let remote = self.remote.docs.get(&d).map(|r| PathBuf::from(&r.path));
+        apex_syntax::detect(doc.path.as_deref().or(remote.as_deref()), &first)
     }
 
     /// Create the syntax state for a document if it does not exist yet.
@@ -2298,6 +2318,9 @@ impl ApexApp {
     pub(crate) fn reload_view(&mut self, vid: ViewId, encoding: Option<Encoding>) {
         let Some(view) = self.views.get(&vid) else { return };
         let did = view.doc;
+        if self.remote.docs.contains_key(&did) {
+            return self.remote_reload(did, true, encoding);
+        }
         let Some(path) = self.docs.get(&did).and_then(|d| d.path.clone()) else { return };
         let fallback = Encoding::from_label(&self.settings.fallback_encoding).unwrap_or(Encoding::Legacy(encoding_rs::WINDOWS_1252));
         match fileio::load(&path, encoding, fallback) {
@@ -2663,7 +2686,7 @@ impl ApexApp {
         });
         egui::MenuBar::new().config(menu_config).ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                for c in [Command::NewFile, Command::OpenFile, Command::OpenFolder, Command::OpenFolderByPath] {
+                for c in [Command::NewFile, Command::OpenFile, Command::OpenFolder, Command::OpenFolderByPath, Command::OpenRemote] {
                     item(ui, &mut q, c);
                 }
                 ui.menu_button("Open Recent", |ui| {
@@ -2679,7 +2702,7 @@ impl ApexApp {
                 });
                 item(ui, &mut q, Command::ReopenClosed);
                 ui.separator();
-                for c in [Command::Save, Command::SaveAs, Command::SaveAll, Command::Revert] {
+                for c in [Command::Save, Command::SaveAs, Command::SaveAsRemote, Command::SaveAll, Command::Revert] {
                     item(ui, &mut q, c);
                 }
                 ui.separator();
@@ -3576,6 +3599,10 @@ impl ApexApp {
             self.show_workspace_dialog(ctx, dialog);
             return;
         }
+        if let Dialog::RemoteBrowser(b) = dialog {
+            self.show_remote_browser_dialog(ctx, *b);
+            return;
+        }
         if matches!(dialog, Dialog::CreatePr { .. }) {
             self.show_create_pr_dialog(ctx, dialog);
             return;
@@ -3630,6 +3657,12 @@ impl ApexApp {
                 });
                 match choice {
                     Some(0) => {
+                        if self.is_remote_view(vid) {
+                            // The close sequence resumes once the server has the file.
+                            self.dialog = None;
+                            self.remote_save(vid, Some(Box::new(Dialog::ConfirmClose { views, then, index: index + 1 })), true);
+                            return;
+                        }
                         let untitled = self.views.get(&vid).and_then(|v| self.docs.get(&v.doc)).is_some_and(|d| d.path.is_none());
                         if untitled {
                             // Ask for a name; the close sequence resumes after the save.
@@ -3794,7 +3827,8 @@ impl ApexApp {
             | Dialog::ConfirmWorkspaceEdit { .. }
             | Dialog::Confirm { .. }
             | Dialog::Askpass { .. }
-            | Dialog::CreatePr { .. } => {}
+            | Dialog::CreatePr { .. }
+            | Dialog::RemoteBrowser(_) => {}
             Dialog::Issues(issues) => {
                 let r = egui::Modal::new(egui::Id::new("issues")).show(ctx, |ui| {
                     ui.set_width(520.0);
